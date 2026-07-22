@@ -45,18 +45,11 @@ static unsigned getIDDependencies(Value *V,
     return DependsOnNone;
 
   if (auto *II = dyn_cast<IntrinsicInst>(V)) {
-    switch (II->getIntrinsicID()) {
-    case Intrinsic::amdgcn_workgroup_id_x:
-    case Intrinsic::amdgcn_workgroup_id_y:
-    case Intrinsic::amdgcn_workgroup_id_z:
+    StringRef Name = II->getCalledFunction()->getName();
+    if (Name.starts_with("llvm.amdgcn.workgroup.id."))
       return DependsOnWorkgroupID;
-    case Intrinsic::amdgcn_workitem_id_x:
-    case Intrinsic::amdgcn_workitem_id_y:
-    case Intrinsic::amdgcn_workitem_id_z:
+    if (Name.starts_with("llvm.amdgcn.workitem.id."))
       return DependsOnWorkitemID;
-    default:
-      break;
-    }
   }
 
   auto *I = dyn_cast<Instruction>(V);
