@@ -365,7 +365,7 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   // Cloning incoming values into a PHI in the shared barrier would require
   // proving the corresponding values are valid on both paths.  Reject that
   // shape rather than manufacture a potentially invalid incoming value.
-  if (Barrier->hasPHINodes())
+  if (isa<PHINode>(&Barrier->front()))
     return false;
 
   bool HasRemovableSafetyBranch = false;
