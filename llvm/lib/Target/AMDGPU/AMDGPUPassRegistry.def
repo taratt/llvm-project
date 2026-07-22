@@ -57,6 +57,8 @@ FUNCTION_PASS("amdgpu-annotate-uniform", AMDGPUAnnotateUniformValuesPass())
 FUNCTION_PASS("amdgpu-codegenprepare", AMDGPUCodeGenPreparePass(*this))
 FUNCTION_PASS("amdgpu-image-intrinsic-opt",
               AMDGPUImageIntrinsicOptimizerPass(*this))
+FUNCTION_PASS("amdgpu-interior-tile-split",
+              AMDGPUInteriorTileSplitPass())
 FUNCTION_PASS("amdgpu-late-codegenprepare",
               AMDGPULateCodeGenPreparePass(
                 *static_cast<const GCNTargetMachine *>(this)))

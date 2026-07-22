@@ -644,6 +644,11 @@ static cl::opt<bool> EnableUniformIntrinsicCombine(
     cl::desc("Enable/Disable the Uniform Intrinsic Combine Pass"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> EnableInteriorTileSplit(
+    "amdgpu-interior-tile-split",
+    cl::desc("Identify and specialize AMDGPU interior tile regions"),
+    cl::init(false), cl::Hidden);
+
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   // Register the target
   RegisterTargetMachine<R600TargetMachine> X(getTheR600Target());
@@ -685,6 +690,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPULowerExecSyncLegacyPass(*PR);
   initializeAMDGPUSwLowerLDSLegacyPass(*PR);
   initializeAMDGPUAnnotateUniformValuesLegacyPass(*PR);
+  initializeAMDGPUInteriorTileSplitLegacyPass(*PR);
   initializeAMDGPUAtomicOptimizerPass(*PR);
   initializeAMDGPULowerKernelArgumentsPass(*PR);
   initializeAMDGPUPromoteKernelArgumentsPass(*PR);
@@ -1690,6 +1696,8 @@ bool GCNPassConfig::addPreISel() {
   addPass(createUnifyLoopExitsPass());
   addPass(createStructurizeCFGPass(false)); // true -> SkipUniformRegions
 
+  if (EnableInteriorTileSplit)
+    addPass(createAMDGPUInteriorTileSplitLegacy());
   addPass(createAMDGPUAnnotateUniformValuesLegacy());
   addPass(createSIAnnotateControlFlowLegacyPass());
   // TODO: Move this right after structurizeCFG to avoid extra divergence
@@ -2451,6 +2459,8 @@ void AMDGPUCodeGenPassBuilder::addPreISel(PassManagerWrapper &PMW) const {
   addFunctionPass(UnifyLoopExitsPass(), PMW);
   addFunctionPass(StructurizeCFGPass(/*SkipUniformRegions=*/false), PMW);
 
+  if (EnableInteriorTileSplit)
+    addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
   addFunctionPass(AMDGPUAnnotateUniformValuesPass(), PMW);
 
   addFunctionPass(SIAnnotateControlFlowPass(TM), PMW);

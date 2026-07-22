@@ -411,6 +411,16 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
+/// Finds divergent tile-boundary checks whose expressions combine workgroup
+/// and workitem IDs. This is the analysis foundation for splitting an
+/// unconditional interior-tile path from a guarded edge-tile path.
+class AMDGPUInteriorTileSplitPass
+    : public OptionalPassInfoMixin<AMDGPUInteriorTileSplitPass> {
+public:
+  AMDGPUInteriorTileSplitPass() = default;
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 class SIModeRegisterPass : public RequiredPassInfoMixin<SIModeRegisterPass> {
 public:
   SIModeRegisterPass() = default;
@@ -473,6 +483,7 @@ public:
 };
 
 FunctionPass *createAMDGPUAnnotateUniformValuesLegacy();
+FunctionPass *createAMDGPUInteriorTileSplitLegacy();
 
 ModulePass *createAMDGPUPrintfRuntimeBinding();
 void initializeAMDGPUPrintfRuntimeBindingPass(PassRegistry&);
@@ -494,6 +505,8 @@ extern char &SIOptimizeVGPRLiveRangeLegacyID;
 
 void initializeAMDGPUAnnotateUniformValuesLegacyPass(PassRegistry &);
 extern char &AMDGPUAnnotateUniformValuesLegacyPassID;
+void initializeAMDGPUInteriorTileSplitLegacyPass(PassRegistry &);
+extern char &AMDGPUInteriorTileSplitLegacyPassID;
 
 void initializeAMDGPUCodeGenPreparePass(PassRegistry&);
 extern char &AMDGPUCodeGenPrepareID;
