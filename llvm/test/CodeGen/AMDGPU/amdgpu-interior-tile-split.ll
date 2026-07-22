@@ -87,9 +87,9 @@ exit:
   ret void
 }
 
-; The K loop is already in LoopSimplify and LCSSA form.  Its preheader has a
-; canonical, CTA-uniform selector, but does not yet branch on it.  Versioning
-; must clone the barrier-containing loop and merge the LCSSA live-out.
+; The dynamic K loop is already in LoopSimplify and LCSSA form.  Its preheader
+; has a canonical, CTA-uniform M/N/alignment proof.  The pass must run a
+; 32-element prefix and enter the original guarded tail only for K % 32.
 define amdgpu_kernel void @canonical_k_loop(ptr addrspace(1) %out, i32 %m,
                                             i32 %n, i32 %k) {
 entry:
@@ -126,6 +126,62 @@ k.preheader:
 
 k.header:
   %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  %acc = phi i32 [ 0, %k.preheader ], [ %acc.next, %k.latch ]
+  br label %k.body
+
+k.body:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %acc.next = add i32 %acc, 1
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+; A dynamic bound is essential: a fixed trip count cannot exercise both the
+; full-prefix and guarded-tail paths.
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  %acc.lcssa = phi i32 [ %acc.next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  store i32 %acc.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+; This multi-tile K loop has canonical M/N clamp remainders but deliberately
+; has no full-tile selector.  Synthesizing an M/N-only selector would clone the
+; loop without proving that the clone removes its per-lane M/N boundary checks,
+; and its first K remainder cannot prove every iteration full.  It must remain
+; unsplit.
+define amdgpu_kernel void @canonical_synthesized_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.preheader
+
+k.preheader:
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
   br label %k.body
 
 k.body:
@@ -143,8 +199,56 @@ k.exit:
   ret void
 }
 
+; The equivalent one-K-tile loop is structurally proven to execute once.
+; Synthesis includes all M/N/K/alignment predicates before it versions the
+; loop.
+define amdgpu_kernel void @canonical_synthesized_one_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.preheader
+
+k.preheader:
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %k.body
+
+k.body:
+  call void @llvm.amdgcn.s.barrier()
+  %next = add nuw i32 %i, 1
+  %done = icmp eq i32 %next, 1
+  br i1 %done, label %k.exit, label %k.latch
+
+k.latch:
+  br label %k.header
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.body ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
-; CHECK: Versioned canonical interior K loop in canonical_k_loop at dispatch; interior loop k.header.interior, edge loop k.header, shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header, shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -160,10 +264,24 @@ k.exit:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_k_loop(
 ; CFG-LABEL: dispatch:
-; CFG: br i1 %full, label %k.preheader.interior, label %k.preheader
+; CFG: %interior.k.prefix.bound = and i32 %k, -32
+; CFG: br i1 %interior.k.full, label %k.preheader.interior, label %k.preheader
+; CFG-LABEL: k.preheader:
+; CFG: %i.tail.start = phi i32 [ 0, %dispatch ], [ %next.interior, %k.latch.interior ]
+; CFG: %acc.tail.start = phi i32 [ 0, %dispatch ], [ %acc.next.interior, %k.latch.interior ]
+; CFG: %[[TAIL_REMAINDER:.*]] = icmp ne i32 %interior.k.prefix.bound, %k
+; CFG: %[[NO_PREFIX:.*]] = xor i1 %interior.k.full, true
+; CFG: %[[HAS_TAIL:.*]] = or i1 %[[NO_PREFIX]], %[[TAIL_REMAINDER]]
+; CFG: br i1 %[[HAS_TAIL]], label %k.header, label %k.exit
 ; CFG-LABEL: k.body:
 ; CFG: call void @llvm.amdgcn.s.barrier()
 ; CFG-LABEL: k.body.interior:
 ; CFG: call void @llvm.amdgcn.s.barrier()
 ; CFG-LABEL: k.exit:
-; CFG: %result.lcssa = phi i32 [ %next, %k.body ], [ %next.interior, %k.body.interior ]
+; CFG: %result.lcssa = phi i32 [ %next, %k.latch ], [ %next.interior, %k.preheader ]
+; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.next.interior, %k.preheader ]
+
+; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
+; CFG-LABEL: dispatch:
+; CFG-NOT: %interior.full
+; CFG: br label %k.preheader

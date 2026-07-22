@@ -19,10 +19,13 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/InitializePasses.h"
@@ -300,72 +303,147 @@ static bool containsBarrier(const Loop *L) {
   return false;
 }
 
-/// Clone an innermost K loop into a full-tile and an edge version.  This is
-/// deliberately stricter than the acyclic staging-region transform: the loop
-/// must already be in the forms required by cloneLoopWithPreheader, and its
-/// sole dedicated exit must contain the LCSSA PHIs which merge the live-outs.
-static bool versionInteriorKLoop(Loop *L, BasicBlock *Dispatch,
-                                 Value *DispatchCondition, LoopInfo &LI,
-                                 DominatorTree &DT) {
+/// Clone a canonical full-K prefix before the original guarded tail.
+static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
+                               Value *StaticFullTileCondition, LoopInfo &LI,
+                               DominatorTree &DT, ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
   auto *DispatchBranch = dyn_cast<BranchInst>(Dispatch->getTerminator());
   if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
-      !Preheader || !Exit || !Exiting || !containsBarrier(L) ||
+      !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
+      Exiting != L->getLoopLatch() || !containsBarrier(L) ||
       Preheader->getSinglePredecessor() != Dispatch ||
       Exit->getSinglePredecessor() != Exiting || !DispatchBranch ||
       !DispatchBranch->isUnconditional() ||
       DispatchBranch->getSuccessor(0) != Preheader ||
-      DispatchCondition->getType() !=
+      StaticFullTileCondition->getType() !=
           Type::getInt1Ty(L->getHeader()->getContext()))
     return false;
 
-  // The dedicated exit is intentionally required to have only the LCSSA
-  // incoming edge.  This lets the existing PHIs merge the cloned live-outs
-  // without trying to reconstruct arbitrary exit CFG.
-  SmallVector<Instruction *, 8> DefsUsedOutside =
-      findDefsUsedOutsideOfLoop(L);
-  for (Instruction *Def : DefsUsedOutside)
-    for (User *U : Def->users()) {
-      auto *Use = dyn_cast<Instruction>(U);
-      if (!Use || L->contains(Use->getParent()))
-        continue;
-      auto *PN = dyn_cast<PHINode>(Use);
-      if (!PN || PN->getParent() != Exit ||
-          PN->getIncomingValueForBlock(Exiting) != Def)
-        return false;
-    }
+  // This deliberately accepts only the canonical unsigned K recurrence:
+  //   %k = phi [ 0, %preheader ], [ %k.next, %latch ]
+  //   %k.next = add %k, 32
+  //   br i1 (%k.next < %K), header, exit
+  // A loop-entry available bound and a SCEV step of exactly 32 make
+  // `%K & -32` a safe sequential prefix bound.
+  auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
+  if (!ExitBranch || !ExitBranch->isConditional())
+    return false;
+  auto *ExitCmp = dyn_cast<ICmpInst>(ExitBranch->getCondition());
+  if (!ExitCmp)
+    return false;
+  BasicBlock *Continue = ExitBranch->getSuccessor(0) == L->getHeader()
+                             ? ExitBranch->getSuccessor(0)
+                             : ExitBranch->getSuccessor(1) == L->getHeader()
+                                   ? ExitBranch->getSuccessor(1)
+                                   : nullptr;
+  if (!Continue)
+    return false;
+  ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
+                                  ? ExitCmp->getPredicate()
+                                  : ExitCmp->getInversePredicate();
+  if (Pred != ICmpInst::ICMP_ULT)
+    return false;
+
+  Value *IVValue = ExitCmp->getOperand(0);
+  Value *Bound = ExitCmp->getOperand(1);
+  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVValue));
+  if (!AR) {
+    std::swap(IVValue, Bound);
+    AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVValue));
+    if (!AR)
+      return false;
+  }
+  auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+  if (!Step || !Step->getAPInt().equalsInt(32) || !L->isLoopInvariant(Bound) ||
+      AR->getLoop() != L || !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
+      !Bound->getType()->isIntegerTy())
+    return false;
+  auto *IV = dyn_cast<PHINode>(&L->getHeader()->front());
+  if (!IV || IV->getParent() != L->getHeader() ||
+      !isa<ConstantInt>(IV->getIncomingValueForBlock(Preheader)) ||
+      !cast<ConstantInt>(IV->getIncomingValueForBlock(Preheader))->isZero() ||
+      IV->getIncomingValueForBlock(Exiting) != IVValue)
+    return false;
+  auto *Inc = dyn_cast<BinaryOperator>(IVValue);
+  if (!Inc || Inc->getOpcode() != Instruction::Add)
+    return false;
+
+  IRBuilder<> Builder(DispatchBranch);
+  Value *PrefixBound =
+      Builder.CreateAnd(Bound, ConstantInt::getSigned(Bound->getType(), -32),
+                        "interior.k.prefix.bound");
+  Value *HasPrefix = Builder.CreateICmpNE(
+      PrefixBound, ConstantInt::getNullValue(Bound->getType()),
+      "interior.k.has.prefix");
+  Value *RunPrefix =
+      Builder.CreateAnd(StaticFullTileCondition, HasPrefix, "interior.k.full");
 
   ValueToValueMapTy VMap;
   SmallVector<BasicBlock *, 8> ClonedBlocks;
-  Loop *InteriorLoop =
+  Loop *PrefixLoop =
       cloneLoopWithPreheader(Exit, Dispatch, L, VMap, ".interior", &LI, &DT,
                              ClonedBlocks);
   remapInstructionsInBlocks(ClonedBlocks, VMap);
 
-  BasicBlock *InteriorPreheader = InteriorLoop->getLoopPreheader();
-  BasicBlock *InteriorExiting = cast<BasicBlock>(VMap[Exiting]);
-  BranchInst::Create(InteriorPreheader, Preheader, DispatchCondition,
+  BasicBlock *PrefixPreheader = PrefixLoop->getLoopPreheader();
+  BasicBlock *PrefixExiting = cast<BasicBlock>(VMap[Exiting]);
+  auto *PrefixCmp = cast<ICmpInst>(VMap[ExitCmp]);
+  if (PrefixCmp->getOperand(0) == VMap.lookup(IVValue))
+    PrefixCmp->setOperand(1, PrefixBound);
+  else if (PrefixCmp->getOperand(1) == VMap.lookup(IVValue))
+    PrefixCmp->setOperand(0, PrefixBound);
+  else
+    llvm_unreachable("cloned K exit compare must use cloned induction");
+  BranchInst::Create(PrefixPreheader, Preheader, RunPrefix,
                      DispatchBranch);
   DispatchBranch->eraseFromParent();
 
+  // The original loop is the guarded tail.  It receives either zero (when no
+  // prefix ran) or every corresponding cloned backedge value.  Carry every
+  // header PHI, not only the induction, before entering the guarded tail.
+  IRBuilder<> TailBuilder(Preheader->getTerminator());
+  for (PHINode &PN : L->getHeader()->phis()) {
+    PHINode *PrefixPN = cast<PHINode>(VMap[&PN]);
+    Value *Initial = PN.getIncomingValueForBlock(Preheader);
+    Value *PrefixFinal = PrefixPN->getIncomingValueForBlock(PrefixExiting);
+    PHINode *TailStart =
+        TailBuilder.CreatePHI(PN.getType(), 2, PN.getName() + ".tail.start");
+    TailStart->addIncoming(Initial, Dispatch);
+    TailStart->addIncoming(PrefixFinal, PrefixExiting);
+    PN.setIncomingValueForBlock(Preheader, TailStart);
+  }
+  PrefixExiting->getTerminator()->replaceSuccessorWith(Exit, Preheader);
+  Value *PrefixLeavesTail =
+      TailBuilder.CreateICmpNE(PrefixBound, Bound, "interior.k.has.tail");
+  // If the CTA cannot take the full-tile prefix, the original guarded loop
+  // must execute from zero even when K is an exact multiple of 32.
+  Value *HasTail = TailBuilder.CreateOr(
+      TailBuilder.CreateNot(RunPrefix), PrefixLeavesTail, "interior.k.has.tail");
+  BranchInst::Create(L->getHeader(), Exit, HasTail, Preheader->getTerminator());
+  Preheader->getTerminator()->eraseFromParent();
+
+  // Preserve the existing LCSSA merge: skipping the tail contributes the
+  // cloned prefix live-out; executing it contributes the original live-out.
   for (PHINode &PN : Exit->phis()) {
     Value *Incoming = PN.getIncomingValueForBlock(Exiting);
     if (auto It = VMap.find(Incoming); It != VMap.end())
       Incoming = It->second;
-    PN.addIncoming(Incoming, InteriorExiting);
+    PN.addIncoming(Incoming, Preheader);
   }
 
-  // Both loop exits are now reached from the dispatch block.  This matches the
-  // LoopVersioning update and keeps the cloned LoopInfo/DT state consistent.
-  DT.changeImmediateDominator(Exit, Dispatch);
+  DT.changeImmediateDominator(Preheader, Dispatch);
+  DT.changeImmediateDominator(Exit, Preheader);
+  SE.forgetLoop(L);
+  SE.forgetLoop(PrefixLoop);
   ++NumPreparedInteriorKLoopSplits;
-  LLVM_DEBUG(dbgs() << "Versioned canonical interior K loop in "
+  LLVM_DEBUG(dbgs() << "Split canonical interior K loop in "
                     << L->getHeader()->getParent()->getName() << " at "
                     << Dispatch->getName()
-                    << "; interior loop " << InteriorLoop->getHeader()->getName()
-                    << ", edge loop " << L->getHeader()->getName()
+                    << "; prefix loop " << PrefixLoop->getHeader()->getName()
+                    << ", guarded tail " << L->getHeader()->getName()
                     << ", shared live-out exit " << Exit->getName() << '\n');
   return true;
 }
@@ -509,7 +587,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
 }
 
 static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
-                                       LoopInfo &LI, DominatorTree &DT) {
+                                       LoopInfo &LI, DominatorTree &DT,
+                                       ScalarEvolution &SE) {
   bool HasMClamp = false, HasNClamp = false, HasKClamp = false;
   bool HasCanonicalAlignment = false;
   for (BasicBlock &BB : F)
@@ -552,10 +631,9 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     return HasM && HasN && HasK && HasAlignment;
   };
 
-  // A loop version is only introduced when a canonical CTA-uniform selector
-  // has already been materialized in its preheader's dispatch block.  The
-  // selector need not yet be the terminator: versioning makes it the choice
-  // between the cloned interior loop and the original edge loop.
+  // A loop version is introduced for an existing canonical CTA-uniform
+  // selector.  The selector need not yet be the terminator: versioning makes
+  // it the choice between the cloned interior loop and the original edge loop.
   SmallVector<Loop *, 4> Loops = LI.getLoopsInPreorder();
   for (Loop *L : Loops) {
     BasicBlock *Preheader = L->getLoopPreheader();
@@ -568,7 +646,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
       SmallVector<FullTileBoundCheck, 2> FullChecks;
       if (GetFullChecks(&I, FullChecks) &&
-          versionInteriorKLoop(L, Dispatch, &I, LI, DT))
+          splitInteriorKLoop(L, Dispatch, &I, LI, DT, SE))
         return true;
     }
   }
@@ -605,11 +683,12 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 }
 
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
-                                       LoopInfo &LI, DominatorTree &DT) {
+                                       LoopInfo &LI, DominatorTree &DT,
+                                       ScalarEvolution &SE) {
   if (!AMDGPU::isEntryFunctionCC(F.getCallingConv()))
     return false;
 
-  const bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT);
+  const bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT, SE);
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
@@ -650,13 +729,16 @@ public:
         getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
     LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
     DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-    return findInteriorTileCandidates(F, UI, LI, DT);
+    ScalarEvolution &SE =
+        getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    return findInteriorTileCandidates(F, UI, LI, DT, SE);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<UniformityInfoWrapperPass>();
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
   }
 };
 
@@ -667,7 +749,8 @@ AMDGPUInteriorTileSplitPass::run(Function &F, FunctionAnalysisManager &FAM) {
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
   LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-  if (!findInteriorTileCandidates(F, UI, LI, DT))
+  ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  if (!findInteriorTileCandidates(F, UI, LI, DT, SE))
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }
@@ -678,6 +761,7 @@ INITIALIZE_PASS_BEGIN(AMDGPUInteriorTileSplitLegacy, DEBUG_TYPE,
 INITIALIZE_PASS_DEPENDENCY(UniformityInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_END(AMDGPUInteriorTileSplitLegacy, DEBUG_TYPE,
                     "Find AMDGPU interior tile split candidates", false, true)
 
