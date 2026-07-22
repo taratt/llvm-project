@@ -1601,6 +1601,9 @@ void AMDGPUPassConfig::addIRPasses() {
     }
 
     if (TM.getTargetTriple().isAMDGCN()) {
+      if (EnableInteriorTileSplit)
+        addPass(createAMDGPUInteriorTileSplitLegacy());
+
       // TODO: May want to move later or split into an early and late one.
       addPass(createAMDGPUCodeGenPreparePass());
     }
@@ -1638,9 +1641,6 @@ void AMDGPUPassConfig::addCodeGenPrepare() {
     addPass(createAMDGPULowerKernelArgumentsPass());
 
   TargetPassConfig::addCodeGenPrepare();
-
-  if (TM->getTargetTriple().isAMDGCN() && EnableInteriorTileSplit)
-    addPass(createAMDGPUInteriorTileSplitLegacy());
 
   if (isPassEnabled(EnableLoadStoreVectorizer))
     addPass(createLoadStoreVectorizerPass());
@@ -2378,6 +2378,9 @@ void AMDGPUCodeGenPassBuilder::addIRPasses(PassManagerWrapper &PMW) const {
 
     // TODO: Handle EnableAMDGPUAliasAnalysis
 
+    if (EnableInteriorTileSplit)
+      addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
+
     // TODO: May want to move later or split into an early and late one.
     addFunctionPass(AMDGPUCodeGenPreparePass(TM), PMW);
 
@@ -2419,9 +2422,6 @@ void AMDGPUCodeGenPassBuilder::addCodeGenPrepare(
     addFunctionPass(AMDGPULowerKernelArgumentsPass(TM), PMW);
 
   Base::addCodeGenPrepare(PMW);
-
-  if (EnableInteriorTileSplit)
-    addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
 
   if (isPassEnabled(EnableLoadStoreVectorizer))
     addFunctionPass(LoadStoreVectorizerPass(), PMW);
