@@ -116,6 +116,66 @@ static bool isFullTileBoundCheck(Value *V, unsigned Dimension) {
   return getIDDependencies(Cmp->getOperand(1), Visited) == DependsOnNone;
 }
 
+static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
+  if (isWorkgroupShiftBy7(V, Dimension))
+    return true;
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return isWorkgroupShiftBy7(Cast->getOperand(0), Dimension);
+  return false;
+}
+
+static bool isNamedCall(Value *V, StringRef Name) {
+  auto *Call = dyn_cast<CallBase>(V);
+  return Call && Call->getCalledFunction() &&
+         Call->getCalledFunction()->getName().starts_with(Name);
+}
+
+/// Match min(max(Bound - (workgroup.id << 7), 0), 128), which is the
+/// clamp form emitted by Clang for a 128-row or 128-column tile extent.
+static bool isClampedTileExtent(Value *V, unsigned Dimension) {
+  if (!isNamedCall(V, "llvm.smin."))
+    return false;
+
+  auto *Min = cast<CallBase>(V);
+  Value *Extent = nullptr;
+  for (Value *Operand : Min->args()) {
+    if (auto *C = dyn_cast<ConstantInt>(Operand)) {
+      if (!C->equalsInt(128))
+        return false;
+    } else {
+      Extent = Operand;
+    }
+  }
+  if (!Extent || !isNamedCall(Extent, "llvm.smax."))
+    return false;
+
+  auto *Max = cast<CallBase>(Extent);
+  Value *Difference = nullptr;
+  for (Value *Operand : Max->args()) {
+    if (auto *C = dyn_cast<ConstantInt>(Operand)) {
+      if (!C->isZero())
+        return false;
+    } else {
+      Difference = Operand;
+    }
+  }
+  auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
+  return Sub && Sub->getOpcode() == Instruction::Sub &&
+         isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension);
+}
+
+/// Match min(K - k0, 32), the full-K-tile extent form emitted by Clang.
+static bool isClampedKTileExtent(Value *V) {
+  if (!isNamedCall(V, "llvm.smin."))
+    return false;
+  auto *Min = cast<CallBase>(V);
+  for (Value *Operand : Min->args())
+    if (auto *C = dyn_cast<ConstantInt>(Operand))
+      if (C->equalsInt(32))
+        return true;
+  return false;
+}
+
 static bool isKTileCheck(Value *V) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp)
@@ -237,6 +297,23 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
 }
 
 static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
+  bool HasMClamp = false, HasNClamp = false, HasKClamp = false;
+  bool HasAlignment = false;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      HasMClamp |= isClampedTileExtent(&I, 1);
+      HasNClamp |= isClampedTileExtent(&I, 0);
+      HasKClamp |= isClampedKTileExtent(&I);
+      HasAlignment |= isAlignmentCheck(&I, UI);
+    }
+
+  if (HasMClamp && HasNClamp && HasKClamp && HasAlignment) {
+    ++NumPreparedInteriorTileSplits;
+    LLVM_DEBUG(dbgs() << "Recognized canonical 128x128x32 tile extents in "
+                      << F.getName() << '\n');
+    return true;
+  }
+
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
     if (!Branch || !UI.isUniformTerminator(Branch))
