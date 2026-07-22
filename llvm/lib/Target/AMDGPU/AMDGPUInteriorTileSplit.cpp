@@ -1,4 +1,4 @@
-//===-- AMDGPUInteriorTileSplit.cpp - Prepare tiled boundary splits -------===//
+//===-- AMDGPUInteriorTileSplit.cpp - Split tiled boundary paths ----------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,10 +7,9 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// Identifies the deliberately narrow GEMM staging shape for which a later
-/// transform can create a workgroup-uniform interior path.  Keeping the proof
-/// here, separate from the CFG mutation, makes it possible to reject shapes
-/// which would accidentally clone an outer loop or a barrier.
+/// Clones a deliberately narrow GEMM staging shape behind a workgroup-uniform
+/// interior dispatch.  The proof rejects shapes which could accidentally clone
+/// an outer loop or a barrier.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -26,6 +25,8 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 #define DEBUG_TYPE "amdgpu-interior-tile-split"
 
@@ -34,7 +35,7 @@ using namespace llvm;
 STATISTIC(NumInteriorTileCandidates,
           "Number of divergent tile-boundary checks found");
 STATISTIC(NumPreparedInteriorTileSplits,
-          "Number of canonical interior-tile splits prepared");
+          "Number of canonical interior-tile splits cloned");
 
 namespace {
 
@@ -77,6 +78,13 @@ static bool isWorkgroupID(Value *V, unsigned Dimension) {
          (Dimension == 1 && Name == "llvm.amdgcn.workgroup.id.y");
 }
 
+static bool isWorkitemID(Value *V) {
+  auto *II = dyn_cast<IntrinsicInst>(V);
+  return II &&
+         II->getCalledFunction()->getName().starts_with(
+             "llvm.amdgcn.workitem.id.");
+}
+
 static bool isWorkgroupShiftBy7(Value *V, unsigned Dimension) {
   auto *Shift = dyn_cast<BinaryOperator>(V);
   if (!Shift || Shift->getOpcode() != Instruction::Shl ||
@@ -106,14 +114,55 @@ static bool isShiftPlusLastLane(Value *V, unsigned Dimension) {
   return isWorkgroupShiftBy7(LHS, Dimension);
 }
 
-static bool isFullTileBoundCheck(Value *V, unsigned Dimension) {
+static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension);
+
+struct FullTileBoundCheck {
+  unsigned Dimension;
+  Value *Bound;
+};
+
+static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
+                                  FullTileBoundCheck &Check) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT ||
       !isShiftPlusLastLane(Cmp->getOperand(0), Dimension))
     return false;
 
   SmallPtrSet<Value *, 16> Visited;
-  return getIDDependencies(Cmp->getOperand(1), Visited) == DependsOnNone;
+  if (getIDDependencies(Cmp->getOperand(1), Visited) != DependsOnNone)
+    return false;
+  Check = {Dimension, Cmp->getOperand(1)};
+  return true;
+}
+
+/// Match the lane-varying form `workgroup.id * 128 + workitem.id < Bound`.
+/// A matching full-tile check proves this condition true for every lane.
+static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT ||
+      Cmp->getOperand(1) != Full.Bound)
+    return false;
+
+  auto *Add = dyn_cast<BinaryOperator>(Cmp->getOperand(0));
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+
+  Value *LHS = Add->getOperand(0);
+  Value *RHS = Add->getOperand(1);
+  return (isWorkgroupShiftBy7OrExtend(LHS, Full.Dimension) &&
+          isWorkitemID(RHS)) ||
+         (isWorkitemID(LHS) &&
+          isWorkgroupShiftBy7OrExtend(RHS, Full.Dimension));
+}
+
+static bool isRemovableSafetyBranch(
+    const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks) {
+  if (!Branch->isConditional())
+    return false;
+  for (const FullTileBoundCheck &Full : FullChecks)
+    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full))
+      return true;
+  return false;
 }
 
 static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
@@ -245,7 +294,7 @@ static bool isBarrierBlock(const BasicBlock *BB) {
 static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
                                     SmallPtrSetImpl<BasicBlock *> &Region,
                                     BasicBlock *&Barrier) {
-  if (Entry->getSinglePredecessor() != Dispatch)
+  if (isBarrierBlock(Entry) || Entry->getSinglePredecessor() != Dispatch)
     return false;
 
   SmallVector<BasicBlock *, 8> Worklist{Entry};
@@ -269,6 +318,9 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
 
   bool HasSafetyBranch = false;
   for (BasicBlock *BB : Region) {
+    if (isBarrierBlock(BB) || !isa<BranchInst>(BB->getTerminator()))
+      return false;
+
     for (BasicBlock *Predecessor : predecessors(BB))
       if (Predecessor != Dispatch && !Region.contains(Predecessor))
         return false;
@@ -302,9 +354,79 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
   return HasSafetyBranch && !HasCycle(HasCycle, Entry);
 }
 
-static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
+/// Clone a staging region behind a CTA-uniform dispatch.  The original entry
+/// remains reachable through the other dispatch edge and is therefore the
+/// fallback path.  The shared barrier is not cloned.
+static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
+                               BasicBlock *Entry,
+                               const SmallPtrSetImpl<BasicBlock *> &Region,
+                               BasicBlock *Barrier,
+                               ArrayRef<FullTileBoundCheck> FullChecks) {
+  // Cloning incoming values into a PHI in the shared barrier would require
+  // proving the corresponding values are valid on both paths.  Reject that
+  // shape rather than manufacture a potentially invalid incoming value.
+  if (Barrier->hasPHINodes())
+    return false;
+
+  bool HasRemovableSafetyBranch = false;
+  for (BasicBlock *BB : Region)
+    HasRemovableSafetyBranch |= isRemovableSafetyBranch(
+        cast<BranchInst>(BB->getTerminator()), FullChecks);
+  if (!HasRemovableSafetyBranch)
+    return false;
+
+  unsigned EntrySuccessor = 0;
+  while (Dispatch->getSuccessor(EntrySuccessor) != Entry)
+    if (++EntrySuccessor == Dispatch->getNumSuccessors())
+      return false;
+
+  SmallVector<BasicBlock *, 8> RegionBlocks;
+  for (BasicBlock &BB : F)
+    if (Region.contains(&BB))
+      RegionBlocks.push_back(&BB);
+
+  ValueToValueMapTy VMap;
+  for (BasicBlock *BB : RegionBlocks) {
+    BasicBlock *Clone = CloneBasicBlock(BB, VMap, ".interior", &F);
+    VMap[BB] = Clone;
+  }
+
+  for (BasicBlock *BB : RegionBlocks) {
+    BasicBlock *Clone = cast<BasicBlock>(VMap[BB]);
+    for (Instruction &I : *Clone)
+      RemapInstruction(&I, VMap);
+  }
+
+  unsigned RemovedSafetyBranches = 0;
+  for (BasicBlock *BB : RegionBlocks) {
+    auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
+    if (!isRemovableSafetyBranch(OriginalBranch, FullChecks))
+      continue;
+
+    auto *ClonedBranch =
+        cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
+    BranchInst::Create(ClonedBranch->getSuccessor(0), ClonedBranch);
+    ClonedBranch->eraseFromParent();
+    ++RemovedSafetyBranches;
+  }
+
+  Dispatch->setSuccessor(EntrySuccessor, cast<BasicBlock>(VMap[Entry]));
+  ++NumPreparedInteriorTileSplits;
+  LLVM_DEBUG(dbgs() << "Cloned canonical interior-tile staging region in "
+                    << F.getName() << " at "
+                    << Dispatch->getParent()->getName()
+                    << "; removed " << RemovedSafetyBranches
+                    << " proven lane bounds branch(es)"
+                    << "; fast staging entry "
+                    << cast<BasicBlock>(VMap[Entry])->getName()
+                    << ", fallback " << Entry->getName() << ", shared barrier "
+                    << Barrier->getName() << '\n');
+  return true;
+}
+
+static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI) {
   bool HasMClamp = false, HasNClamp = false, HasKClamp = false;
-  bool HasAlignment = false;
+  bool HasCanonicalAlignment = false;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
       HasMClamp |= isClampedTileExtent(&I, 1) ||
@@ -312,37 +434,47 @@ static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
       HasNClamp |= isClampedTileExtent(&I, 0) ||
                    isTileRelativeDifference(&I, 0);
       HasKClamp |= isClampedKTileExtent(&I);
-      HasAlignment |= isAlignmentCheck(&I, UI);
+      HasCanonicalAlignment |= isAlignmentCheck(&I, UI);
     }
 
   LLVM_DEBUG(dbgs() << "Interior-tile proof for " << F.getName()
                     << ": M-clamp=" << HasMClamp
                     << " N-clamp=" << HasNClamp
                     << " K-clamp=" << HasKClamp
-                    << " alignment=" << HasAlignment << '\n');
-
-  if (HasMClamp && HasNClamp && HasKClamp && HasAlignment) {
-    ++NumPreparedInteriorTileSplits;
-    LLVM_DEBUG(dbgs() << "Recognized canonical 128x128x32 tile extents in "
-                      << F.getName() << '\n');
-    return true;
-  }
+                    << " alignment=" << HasCanonicalAlignment << '\n');
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
     if (!Branch || !UI.isUniformTerminator(Branch))
       continue;
 
+    SmallPtrSet<Value *, 16> Visited;
+    if (getIDDependencies(Branch->getCondition(), Visited) &
+        DependsOnWorkitemID)
+      continue;
+
     SmallVector<Value *, 8> Conjuncts;
     collectConjuncts(Branch->getCondition(), Conjuncts);
     bool HasM = false, HasN = false, HasK = false, HasAlignment = false;
+    SmallVector<FullTileBoundCheck, 2> FullChecks;
     for (Value *Conjunct : Conjuncts) {
-      HasM |= isFullTileBoundCheck(Conjunct, 1);
-      HasN |= isFullTileBoundCheck(Conjunct, 0);
+      FullTileBoundCheck MCheck, NCheck;
+      if (getFullTileBoundCheck(Conjunct, 1, MCheck)) {
+        HasM = true;
+        FullChecks.push_back(MCheck);
+      }
+      if (getFullTileBoundCheck(Conjunct, 0, NCheck)) {
+        HasN = true;
+        FullChecks.push_back(NCheck);
+      }
       HasK |= isKTileCheck(Conjunct);
       HasAlignment |= isAlignmentCheck(Conjunct, UI);
     }
-    if (!HasM || !HasN || !HasK || !HasAlignment)
+    // Require both the canonical clamped extents and a full-tile dispatch.
+    // The former proves the staging shape; the latter is the CTA-uniform
+    // condition which selects the cloned interior path.
+    if (!HasMClamp || !HasNClamp || !HasKClamp ||
+        !HasCanonicalAlignment || !HasM || !HasN || !HasK || !HasAlignment)
       continue;
 
     for (BasicBlock *Successor : successors(&BB)) {
@@ -351,12 +483,9 @@ static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
       if (!findClosedStagingRegion(Successor, &BB, Region, Barrier))
         continue;
 
-      ++NumPreparedInteriorTileSplits;
-      LLVM_DEBUG(dbgs() << "Prepared canonical interior-tile split in "
-                        << F.getName() << " at " << BB.getName()
-                        << "; staging entry " << Successor->getName()
-                        << ", shared barrier " << Barrier->getName() << '\n');
-      return true;
+      if (cloneStagingRegion(F, Branch, Successor, Region, Barrier,
+                             FullChecks))
+        return true;
     }
   }
   return false;
@@ -366,10 +495,7 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI) {
   if (!AMDGPU::isEntryFunctionCC(F.getCallingConv()))
     return false;
 
-  // This discovery is the gate for the eventual CFG mutation.  It deliberately
-  // does not alter the CFG until the clone can also remove the individually
-  // proven safety branches in the fast copy.
-  prepareCanonicalInteriorTileSplit(F, UI);
+  const bool Changed = splitCanonicalInteriorTile(F, UI);
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
@@ -391,7 +517,7 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI) {
 
   // The existing broad candidate diagnostic remains useful for kernels that
   // are close to, but do not yet meet, the canonical shape above.
-  return false;
+  return Changed;
 }
 
 class AMDGPUInteriorTileSplitLegacy : public FunctionPass {
@@ -413,7 +539,6 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<UniformityInfoWrapperPass>();
-    AU.setPreservesAll();
   }
 };
 
@@ -422,8 +547,9 @@ public:
 PreservedAnalyses
 AMDGPUInteriorTileSplitPass::run(Function &F, FunctionAnalysisManager &FAM) {
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
-  findInteriorTileCandidates(F, UI);
-  return PreservedAnalyses::all();
+  if (!findInteriorTileCandidates(F, UI))
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 
 INITIALIZE_PASS_BEGIN(AMDGPUInteriorTileSplitLegacy, DEBUG_TYPE,

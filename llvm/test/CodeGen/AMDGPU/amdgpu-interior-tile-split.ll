@@ -1,10 +1,12 @@
 ; REQUIRES: asserts
 ; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes=amdgpu-interior-tile-split \
 ; RUN:   -debug-only=amdgpu-interior-tile-split -disable-output %s 2>&1 | FileCheck %s
+; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes=amdgpu-interior-tile-split \
+; RUN:   -S %s | FileCheck %s --check-prefix=CFG
 
 ; The broad candidate diagnostic is retained for non-canonical boundary
-; checks.  The second kernel is the deliberately narrow shape prepared for
-; the future CFG cloning transform.
+; checks.  The second kernel has a closed staging region, which is cloned
+; behind the uniform full-tile dispatch while its barrier remains shared.
 
 declare i32 @llvm.amdgcn.workgroup.id.x()
 declare i32 @llvm.amdgcn.workitem.id.x()
@@ -29,6 +31,8 @@ exit:
 
 declare i32 @llvm.amdgcn.workgroup.id.y()
 declare void @llvm.amdgcn.s.barrier()
+declare i32 @llvm.smax.i32(i32, i32)
+declare i32 @llvm.smin.i32(i32, i32)
 
 define amdgpu_kernel void @canonical_staging(ptr addrspace(1) %out, i32 %m,
                                              i32 %n, i32 %k) {
@@ -40,6 +44,14 @@ entry:
   %y.base = shl i32 %workgroup.y, 7
   %x.last = add i32 %x.base, 127
   %y.last = add i32 %y.base, 127
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
   %full.n = icmp ult i32 %x.last, %n
   %full.m = icmp ult i32 %y.last, %m
   %full.k = icmp uge i32 %k, 32
@@ -75,5 +87,16 @@ exit:
   ret void
 }
 
-; CHECK: Prepared canonical interior-tile split in canonical_staging at entry; staging entry staging, shared barrier barrier
+; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
 ; CHECK: Potential interior-tile boundary check in candidate:
+
+; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
+; CFG: br i1 %full, label %staging.interior, label %edge
+; CFG-LABEL: staging:
+; CFG: br i1 %in.bounds, label %stage.store, label %stage.skip
+; CFG-LABEL: barrier:
+; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
+; CFG-LABEL: staging.interior:
+; CFG: br label %stage.store.interior
+; CFG-LABEL: stage.store.interior:
+; CFG: br label %barrier
