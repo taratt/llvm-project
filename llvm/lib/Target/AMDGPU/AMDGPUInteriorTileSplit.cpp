@@ -558,7 +558,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   // Isolate the loop edge before cloning so prefix/tail live-outs meet at a
   // dedicated exit block.
   if (Exit->getSinglePredecessor() != Exiting) {
-    formDedicatedExitBlocks(L, DT, LI, nullptr, true);
+    formDedicatedExitBlocks(L, &DT, &LI, nullptr, true);
     Exit = L->getUniqueExitBlock();
     if (!Exit || Exit->getSinglePredecessor() != Exiting)
       return false;
