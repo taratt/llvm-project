@@ -394,7 +394,9 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   for (BasicBlock *BB : RegionBlocks) {
     BasicBlock *Clone = cast<BasicBlock>(VMap[BB]);
     for (Instruction &I : *Clone)
-      RemapInstruction(&I, VMap);
+      // Definitions outside the staging region (workgroup/workitem IDs and
+      // tile bases) deliberately remain shared with the clone.
+      RemapInstruction(&I, VMap, RF_IgnoreMissingLocals);
   }
 
   unsigned RemovedSafetyBranches = 0;
