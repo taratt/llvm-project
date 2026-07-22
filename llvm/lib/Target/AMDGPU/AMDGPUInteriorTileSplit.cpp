@@ -492,8 +492,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
       !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
       Exiting != L->getLoopLatch() || !containsBarrier(L) ||
       Preheader->getSinglePredecessor() != Dispatch ||
-      Exit->getSinglePredecessor() != Exiting || !DispatchBranch ||
-      !DispatchBranch->isUnconditional() ||
+      !DispatchBranch || !DispatchBranch->isUnconditional() ||
       DispatchBranch->getSuccessor(0) != Preheader ||
       StaticFullTileCondition->getType() !=
           Type::getInt1Ty(L->getHeader()->getContext()))
@@ -554,6 +553,16 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   auto *Inc = dyn_cast<BinaryOperator>(IVValue);
   if (!Inc || Inc->getOpcode() != Instruction::Add)
     return false;
+
+  // The zero-K path in the real kernel can enter the postlude directly.
+  // Isolate the loop edge before cloning so prefix/tail live-outs meet at a
+  // dedicated exit block.
+  if (Exit->getSinglePredecessor() != Exiting) {
+    formDedicatedExitBlocks(L, DT, LI, nullptr, true);
+    Exit = L->getUniqueExitBlock();
+    if (!Exit || Exit->getSinglePredecessor() != Exiting)
+      return false;
+  }
 
   // Do not version a loop unless the cloned prefix will actually become less
   // guarded.  Both predicates are proven against the original loop here and
