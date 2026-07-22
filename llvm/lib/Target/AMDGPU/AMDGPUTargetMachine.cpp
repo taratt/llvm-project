@@ -1639,6 +1639,9 @@ void AMDGPUPassConfig::addCodeGenPrepare() {
 
   TargetPassConfig::addCodeGenPrepare();
 
+  if (TM->getTargetTriple().isAMDGCN() && EnableInteriorTileSplit)
+    addPass(createAMDGPUInteriorTileSplitLegacy());
+
   if (isPassEnabled(EnableLoadStoreVectorizer))
     addPass(createLoadStoreVectorizerPass());
 
@@ -1696,8 +1699,6 @@ bool GCNPassConfig::addPreISel() {
   addPass(createUnifyLoopExitsPass());
   addPass(createStructurizeCFGPass(false)); // true -> SkipUniformRegions
 
-  if (EnableInteriorTileSplit)
-    addPass(createAMDGPUInteriorTileSplitLegacy());
   addPass(createAMDGPUAnnotateUniformValuesLegacy());
   addPass(createSIAnnotateControlFlowLegacyPass());
   // TODO: Move this right after structurizeCFG to avoid extra divergence
@@ -2419,6 +2420,9 @@ void AMDGPUCodeGenPassBuilder::addCodeGenPrepare(
 
   Base::addCodeGenPrepare(PMW);
 
+  if (EnableInteriorTileSplit)
+    addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
+
   if (isPassEnabled(EnableLoadStoreVectorizer))
     addFunctionPass(LoadStoreVectorizerPass(), PMW);
 
@@ -2459,8 +2463,6 @@ void AMDGPUCodeGenPassBuilder::addPreISel(PassManagerWrapper &PMW) const {
   addFunctionPass(UnifyLoopExitsPass(), PMW);
   addFunctionPass(StructurizeCFGPass(/*SkipUniformRegions=*/false), PMW);
 
-  if (EnableInteriorTileSplit)
-    addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
   addFunctionPass(AMDGPUAnnotateUniformValuesPass(), PMW);
 
   addFunctionPass(SIAnnotateControlFlowPass(TM), PMW);
