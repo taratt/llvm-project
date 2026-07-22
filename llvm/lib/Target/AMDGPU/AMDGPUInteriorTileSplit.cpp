@@ -124,6 +124,14 @@ static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
   return false;
 }
 
+/// Generic scalar optimization can lower min/max to selects, but the
+/// tile-relative subtraction itself remains available.
+static bool isTileRelativeDifference(Value *V, unsigned Dimension) {
+  auto *Sub = dyn_cast<BinaryOperator>(V);
+  return Sub && Sub->getOpcode() == Instruction::Sub &&
+         isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension);
+}
+
 static bool isNamedCall(Value *V, StringRef Name) {
   auto *Call = dyn_cast<CallBase>(V);
   return Call && Call->getCalledFunction() &&
@@ -159,9 +167,7 @@ static bool isClampedTileExtent(Value *V, unsigned Dimension) {
       Difference = Operand;
     }
   }
-  auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
-  return Sub && Sub->getOpcode() == Instruction::Sub &&
-         isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension);
+  return isTileRelativeDifference(Difference, Dimension);
 }
 
 /// Match min(K - k0, 32), the full-K-tile extent form emitted by Clang.
@@ -301,8 +307,10 @@ static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
   bool HasAlignment = false;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
-      HasMClamp |= isClampedTileExtent(&I, 1);
-      HasNClamp |= isClampedTileExtent(&I, 0);
+      HasMClamp |= isClampedTileExtent(&I, 1) ||
+                   isTileRelativeDifference(&I, 1);
+      HasNClamp |= isClampedTileExtent(&I, 0) ||
+                   isTileRelativeDifference(&I, 0);
       HasKClamp |= isClampedKTileExtent(&I);
       HasAlignment |= isAlignmentCheck(&I, UI);
     }
