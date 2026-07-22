@@ -357,7 +357,8 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
       return false;
   }
   auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
-  if (!Step || !Step->getAPInt().equalsInt(32) || !L->isLoopInvariant(Bound) ||
+  if (!Step || Step->getAPInt().getZExtValue() != 32 ||
+      !L->isLoopInvariant(Bound) ||
       AR->getLoop() != L || !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
       !Bound->getType()->isIntegerTy())
     return false;
