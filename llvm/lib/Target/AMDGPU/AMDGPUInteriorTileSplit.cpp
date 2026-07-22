@@ -34,6 +34,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <cstdint>
 
 #define DEBUG_TYPE "amdgpu-interior-tile-split"
 
@@ -87,13 +88,6 @@ static bool isWorkgroupID(Value *V, unsigned Dimension) {
          (Dimension == 1 && Name == "llvm.amdgcn.workgroup.id.y");
 }
 
-static bool isWorkitemID(Value *V) {
-  auto *II = dyn_cast<IntrinsicInst>(V);
-  return II &&
-         II->getCalledFunction()->getName().starts_with(
-             "llvm.amdgcn.workitem.id.");
-}
-
 static bool isWorkgroupShiftBy7(Value *V, unsigned Dimension) {
   auto *Shift = dyn_cast<BinaryOperator>(V);
   if (!Shift || Shift->getOpcode() != Instruction::Shl ||
@@ -104,30 +98,39 @@ static bool isWorkgroupShiftBy7(Value *V, unsigned Dimension) {
   return Amount && Amount->equalsInt(7);
 }
 
-static bool isShiftPlusLastLane(Value *V, unsigned Dimension) {
+static Value *getWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
+  if (isWorkgroupShiftBy7(V, Dimension))
+    return V;
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    if (isWorkgroupShiftBy7(Cast->getOperand(0), Dimension))
+      return V;
+  return nullptr;
+}
+
+static Value *getShiftPlusLastLaneBase(Value *V, unsigned Dimension) {
   auto *Add = dyn_cast<BinaryOperator>(V);
   if (!Add || Add->getOpcode() != Instruction::Add)
-    return false;
+    return nullptr;
 
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
   if (auto *C = dyn_cast<ConstantInt>(LHS)) {
     if (!C->equalsInt(127))
-      return false;
+      return nullptr;
     LHS = RHS;
   } else {
     auto *LastLane = dyn_cast<ConstantInt>(RHS);
     if (!LastLane || !LastLane->equalsInt(127))
-      return false;
+      return nullptr;
   }
-  return isWorkgroupShiftBy7(LHS, Dimension);
+  return getWorkgroupShiftBy7OrExtend(LHS, Dimension);
 }
-
-static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension);
 
 struct FullTileBoundCheck {
   unsigned Dimension;
   Value *Bound;
+  Value *Base;
+  bool IsSigned;
 };
 
 struct CanonicalTileRemainder {
@@ -140,35 +143,122 @@ struct CanonicalTileRemainder {
 static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
                                   FullTileBoundCheck &Check) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
-  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT ||
-      !isShiftPlusLastLane(Cmp->getOperand(0), Dimension))
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false;
+  Value *Base = getShiftPlusLastLaneBase(Cmp->getOperand(0), Dimension);
+  if (!Base)
     return false;
 
   SmallPtrSet<Value *, 16> Visited;
   if (getIDDependencies(Cmp->getOperand(1), Visited) != DependsOnNone)
     return false;
-  Check = {Dimension, Cmp->getOperand(1)};
+  Check = {Dimension, Cmp->getOperand(1), Base, false};
   return true;
 }
 
-/// Match the lane-varying form `workgroup.id * 128 + workitem.id < Bound`.
-/// A matching full-tile check proves this condition true for every lane.
+/// Return a conservative maximum for a lane-only expression.  A workitem
+/// intrinsic has no sufficiently small architectural maximum by itself, so it
+/// must first be narrowed or masked.
+static bool getAffineLaneMaximum(Value *V, uint64_t &Maximum) {
+  if (auto *C = dyn_cast<ConstantInt>(V)) {
+    if (C->isNegative())
+      return false;
+    Maximum = C->getZExtValue();
+    return Maximum < 128;
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V)) {
+    uint64_t OperandMaximum;
+    if (!getAffineLaneMaximum(Cast->getOperand(0), OperandMaximum))
+      return false;
+    unsigned Width = Cast->getOperand(0)->getType()->getIntegerBitWidth();
+    if (Cast->getOpcode() == Instruction::SExt &&
+        (Width > 64 || OperandMaximum >= (uint64_t(1) << (Width - 1))))
+      return false;
+    Maximum = OperandMaximum;
+    return Maximum < 128;
+  }
+
+  auto *I = dyn_cast<BinaryOperator>(V);
+  if (!I)
+    return false;
+  if (I->getOpcode() == Instruction::And) {
+    Value *Other = I->getOperand(0);
+    auto *Mask = dyn_cast<ConstantInt>(I->getOperand(1));
+    if (!Mask) {
+      Other = I->getOperand(1);
+      Mask = dyn_cast<ConstantInt>(I->getOperand(0));
+    }
+    SmallPtrSet<Value *, 8> Visited;
+    if (!Mask || Mask->getZExtValue() >= 128 ||
+        !(getIDDependencies(Other, Visited) & DependsOnWorkitemID))
+      return false;
+    Maximum = Mask->getZExtValue();
+    return true;
+  }
+
+  uint64_t LHSMaximum, RHSMaximum;
+  if (I->getOpcode() == Instruction::Add) {
+    if (!getAffineLaneMaximum(I->getOperand(0), LHSMaximum) ||
+        !getAffineLaneMaximum(I->getOperand(1), RHSMaximum) ||
+        LHSMaximum > 127 - RHSMaximum)
+      return false;
+    Maximum = LHSMaximum + RHSMaximum;
+    return true;
+  }
+
+  Value *Variable = I->getOperand(0);
+  auto *Scale = dyn_cast<ConstantInt>(I->getOperand(1));
+  if (!Scale) {
+    Variable = I->getOperand(1);
+    Scale = dyn_cast<ConstantInt>(I->getOperand(0));
+  }
+  if (!Scale || Scale->isNegative() ||
+      !getAffineLaneMaximum(Variable, LHSMaximum))
+    return false;
+  uint64_t Factor = Scale->getZExtValue();
+  if (I->getOpcode() == Instruction::Shl) {
+    if (Factor >= 7 || LHSMaximum > (127 >> Factor))
+      return false;
+    Maximum = LHSMaximum << Factor;
+    return true;
+  }
+  if (I->getOpcode() == Instruction::Mul) {
+    if (Factor > 127 || (Factor && LHSMaximum > 127 / Factor))
+      return false;
+    Maximum = LHSMaximum * Factor;
+    return true;
+  }
+  return false;
+}
+
+/// Match a signed or unsigned `Base + LaneOffset < Bound`.  The static M/N
+/// selector is built from the same Base/Bound pair and proves a 128-wide tile.
 static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
-  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT ||
-      Cmp->getOperand(1) != Full.Bound)
+  if (!Cmp)
+    return false;
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *Index = Cmp->getOperand(0);
+  Value *Bound = Cmp->getOperand(1);
+  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT) {
+    Pred = ICmpInst::getSwappedPredicate(Pred);
+    std::swap(Index, Bound);
+  }
+  if (Bound != Full.Bound ||
+      (Full.IsSigned ? Pred != ICmpInst::ICMP_SLT
+                     : Pred != ICmpInst::ICMP_ULT))
     return false;
 
-  auto *Add = dyn_cast<BinaryOperator>(Cmp->getOperand(0));
+  auto *Add = dyn_cast<BinaryOperator>(Index);
   if (!Add || Add->getOpcode() != Instruction::Add)
     return false;
 
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
-  return (isWorkgroupShiftBy7OrExtend(LHS, Full.Dimension) &&
-          isWorkitemID(RHS)) ||
-         (isWorkitemID(LHS) &&
-          isWorkgroupShiftBy7OrExtend(RHS, Full.Dimension));
+  uint64_t Maximum;
+  return ((LHS == Full.Base && getAffineLaneMaximum(RHS, Maximum)) ||
+          (RHS == Full.Base && getAffineLaneMaximum(LHS, Maximum))) &&
+         Maximum < 128;
 }
 
 static bool isRemovableSafetyBranch(
@@ -182,11 +272,7 @@ static bool isRemovableSafetyBranch(
 }
 
 static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
-  if (isWorkgroupShiftBy7(V, Dimension))
-    return true;
-  if (auto *Cast = dyn_cast<CastInst>(V))
-    return isWorkgroupShiftBy7(Cast->getOperand(0), Dimension);
-  return false;
+  return getWorkgroupShiftBy7OrExtend(V, Dimension);
 }
 
 /// Generic scalar optimization can lower min/max to selects, but the
@@ -289,11 +375,11 @@ static bool isKTileCheck(Value *V) {
          IsK(Cmp->getOperand(1));
 }
 
-/// Match `umin(K - k0, 32) >= 32` (or its equivalent operand order).  The
-/// cloned prefix has an exact multiple-of-32 bound, so this is true on every
-/// cloned iteration only when `k0` is the loop induction value and K is the
-/// recurrence exit bound.  A signed min is intentionally not accepted: the
-/// unsigned loop recurrence does not prove its result for K above INT_MAX.
+/// Match `umin/smin(K - k0, 32) >= 32` (or its equivalent operand order).
+/// The cloned prefix has an exact multiple-of-32 bound, so this is true on
+/// every cloned iteration only when k0 is the loop induction value and K is
+/// the recurrence exit bound.  The prefix dispatch separately requires
+/// K >= 32 signed, making the unsigned recurrence and signed remainder agree.
 static bool isFullKTileGuard(Value *V, Value *IV, Value *Bound) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp)
@@ -316,7 +402,12 @@ static bool isFullKTileGuard(Value *V, Value *IV, Value *Bound) {
     return false;
   }
 
-  if (!isNamedCall(Extent, "llvm.umin."))
+  bool IsUnsignedMin = isNamedCall(Extent, "llvm.umin.");
+  bool IsSignedMin = isNamedCall(Extent, "llvm.smin.");
+  if (!IsUnsignedMin && !IsSignedMin)
+    return false;
+  if (IsSignedMin && Cmp->getPredicate() != ICmpInst::ICMP_SGE &&
+      Cmp->getPredicate() != ICmpInst::ICMP_SLE)
     return false;
   auto *Min = cast<CallBase>(Extent);
   Value *Difference = nullptr;
@@ -482,8 +573,15 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   Value *PrefixBound =
       Builder.CreateAnd(Bound, ConstantInt::getSigned(Bound->getType(), -32),
                         "interior.k.prefix.bound");
-  Value *HasPrefix = Builder.CreateICmpNE(
+  Value *HasPrefixBits = Builder.CreateICmpNE(
       PrefixBound, ConstantInt::getNullValue(Bound->getType()),
+      "interior.k.has.prefix");
+  // Signed K extents are valid only for a nonnegative K.  This also keeps the
+  // existing unsigned recurrence away from values with the sign bit set.
+  Value *HasPrefix = Builder.CreateAnd(
+      HasPrefixBits,
+      Builder.CreateICmpSGE(Bound, ConstantInt::get(Bound->getType(), 32),
+                            "interior.k.nonnegative"),
       "interior.k.has.prefix");
   Value *RunPrefix =
       Builder.CreateAnd(StaticFullTileCondition, HasPrefix, "interior.k.full");
@@ -614,20 +712,26 @@ static Value *synthesizeInteriorTileSelector(
     return nullptr;
 
   IRBuilder<> Builder(Preheader->getTerminator());
-  // The explicit non-underflow checks make the modular subtraction proof
-  // valid even for workgroup IDs near the unsigned addressable limit.
-  Value *MNonNegative =
-      Builder.CreateICmpUGE(M.Bound, M.Base, "interior.m.nonnegative");
-  Value *MExtent = Builder.CreateICmpUGE(
-      M.Difference, ConstantInt::get(M.Difference->getType(), 128),
+  // The source extents use signed min/max.  Do not infer signed arithmetic
+  // facts from their wrapping subtraction: require a nonnegative bound and
+  // prove Base <= Bound - 128 directly.  This makes Base + every matched
+  // nonnegative lane offset below 128 a defined signed in-bounds index.
+  Value *MPositive = Builder.CreateICmpSGE(
+      M.Bound, ConstantInt::get(M.Bound->getType(), 128),
+      "interior.m.nonnegative");
+  Value *MFull = Builder.CreateICmpSLE(
+      M.Base, Builder.CreateSub(M.Bound,
+                                ConstantInt::get(M.Bound->getType(), 128)),
       "interior.m.full");
-  Value *MFull = Builder.CreateAnd(MNonNegative, MExtent, "interior.m.tile");
-  Value *NNonNegative =
-      Builder.CreateICmpUGE(N.Bound, N.Base, "interior.n.nonnegative");
-  Value *NExtent = Builder.CreateICmpUGE(
-      N.Difference, ConstantInt::get(N.Difference->getType(), 128),
+  MFull = Builder.CreateAnd(MPositive, MFull, "interior.m.tile");
+  Value *NPositive = Builder.CreateICmpSGE(
+      N.Bound, ConstantInt::get(N.Bound->getType(), 128),
+      "interior.n.nonnegative");
+  Value *NFull = Builder.CreateICmpSLE(
+      N.Base, Builder.CreateSub(N.Bound,
+                                ConstantInt::get(N.Bound->getType(), 128)),
       "interior.n.full");
-  Value *NFull = Builder.CreateAnd(NNonNegative, NExtent, "interior.n.tile");
+  NFull = Builder.CreateAnd(NPositive, NFull, "interior.n.tile");
   Value *MNFull = Builder.CreateAnd(MFull, NFull, "interior.mn.full");
   return Builder.CreateAnd(MNFull, Alignment, "interior.full");
 }
@@ -921,13 +1025,15 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
       if (getClampedTileExtent(&I, 1, Remainder)) {
         if (HasM)
           break;
-        FullChecks.push_back({1, Remainder.Bound});
+        FullChecks.push_back(
+            {1, Remainder.Bound, Remainder.Base, /*IsSigned=*/true});
         HasM = true;
       }
       if (getClampedTileExtent(&I, 0, Remainder)) {
         if (HasN)
           break;
-        FullChecks.push_back({0, Remainder.Bound});
+        FullChecks.push_back(
+            {0, Remainder.Bound, Remainder.Base, /*IsSigned=*/true});
         HasN = true;
       }
     }

@@ -65,7 +65,8 @@ entry:
   br i1 %full, label %staging, label %edge
 
 staging:
-  %index = add i32 %x.base, %workitem
+  %lane = and i32 %workitem, 127
+  %index = add i32 %x.base, %lane
   %in.bounds = icmp ult i32 %index, %n
   br i1 %in.bounds, label %stage.store, label %stage.skip
 
@@ -194,19 +195,26 @@ k.header:
   br label %k.body
 
 k.body:
-  %m.index = add i32 %y.base, %workitem
-  %m.in.bounds = icmp ult i32 %m.index, %m
+  ; The lane expression is deliberately affine but not the old exact
+  ; workitem-id spelling.  Its largest value is 63, below the 128-wide tile.
+  %lane.masked = and i32 %workitem, 31
+  %lane.narrow = trunc i32 %lane.masked to i8
+  %lane.extended = zext i8 %lane.narrow to i32
+  %lane.scaled = mul i32 %lane.extended, 2
+  %lane = add i32 %lane.scaled, 1
+  %m.index = add i32 %y.base, %lane
+  %m.in.bounds = icmp slt i32 %m.index, %m
   br i1 %m.in.bounds, label %k.n.check, label %k.barrier
 
 k.n.check:
-  %n.index = add i32 %x.base, %workitem
-  %n.in.bounds = icmp ult i32 %n.index, %n
+  %n.index = add i32 %x.base, %lane
+  %n.in.bounds = icmp slt i32 %n.index, %n
   br i1 %n.in.bounds, label %k.k.check, label %k.barrier
 
 k.k.check:
   %k.remaining.loop = sub i32 %k, %i
-  %k.extent.loop = call i32 @llvm.umin.i32(i32 %k.remaining.loop, i32 32)
-  %k.full.loop = icmp uge i32 %k.extent.loop, 32
+  %k.extent.loop = call i32 @llvm.smin.i32(i32 %k.remaining.loop, i32 32)
+  %k.full.loop = icmp sge i32 %k.extent.loop, 32
   br i1 %k.full.loop, label %k.barrier, label %k.skip
 
 k.barrier:
@@ -312,8 +320,8 @@ k.exit:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
 ; CFG-LABEL: k.preheader:
-; CFG: %interior.m.full = icmp uge i32 %m.remaining, 128
-; CFG: %interior.n.full = icmp uge i32 %n.remaining, 128
+; CFG: %interior.m.full = icmp sle i32 %y.base, %{{.*}}
+; CFG: %interior.n.full = icmp sle i32 %x.base, %{{.*}}
 ; CFG: %interior.full = and i1 %interior.mn.full, %out.aligned
 ; CFG: br i1 %interior.k.full, label %k.preheader.split.interior, label %k.preheader.split
 ; CFG-LABEL: k.body.interior:
