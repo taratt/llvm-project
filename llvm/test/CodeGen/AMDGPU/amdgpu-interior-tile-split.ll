@@ -278,8 +278,8 @@ k.exit:
 ; CFG-LABEL: k.body.interior:
 ; CFG: call void @llvm.amdgcn.s.barrier()
 ; CFG-LABEL: k.exit:
-; CFG: %result.lcssa = phi i32 [ %next, %k.latch ], [ %next.interior, %k.preheader ]
-; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.next.interior, %k.preheader ]
+; CFG: %result.lcssa = phi i32 [ %next, %k.latch ], [ %i.tail.start, %k.preheader ]
+; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.tail.start, %k.preheader ]
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
 ; CFG-LABEL: dispatch:

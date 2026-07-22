@@ -372,6 +372,16 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   if (!Inc || Inc->getOpcode() != Instruction::Add)
     return false;
 
+  // The prefix-to-tail merge below carries header PHI backedge values.  An
+  // arbitrary loop live-out would need its own edge PHI and is deliberately
+  // outside this narrow first implementation.
+  SmallPtrSet<Value *, 8> HeaderBackedgeValues;
+  for (PHINode &PN : L->getHeader()->phis())
+    HeaderBackedgeValues.insert(PN.getIncomingValueForBlock(Exiting));
+  for (PHINode &PN : Exit->phis())
+    if (!HeaderBackedgeValues.contains(PN.getIncomingValueForBlock(Exiting)))
+      return false;
+
   IRBuilder<> Builder(DispatchBranch);
   Value *PrefixBound =
       Builder.CreateAnd(Bound, ConstantInt::getSigned(Bound->getType(), -32),
@@ -406,6 +416,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   // prefix ran) or every corresponding cloned backedge value.  Carry every
   // header PHI, not only the induction, before entering the guarded tail.
   IRBuilder<> TailBuilder(Preheader->getTerminator());
+  SmallVector<std::pair<Value *, Value *>, 8> PrefixLiveOutMerges;
   for (PHINode &PN : L->getHeader()->phis()) {
     PHINode *PrefixPN = cast<PHINode>(VMap[&PN]);
     Value *Initial = PN.getIncomingValueForBlock(Preheader);
@@ -415,6 +426,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
     TailStart->addIncoming(Initial, Dispatch);
     TailStart->addIncoming(PrefixFinal, PrefixExiting);
     PN.setIncomingValueForBlock(Preheader, TailStart);
+    PrefixLiveOutMerges.push_back({PrefixFinal, TailStart});
   }
   PrefixExiting->getTerminator()->replaceSuccessorWith(Exit, Preheader);
   Value *PrefixLeavesTail =
@@ -432,6 +444,11 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
     Value *Incoming = PN.getIncomingValueForBlock(Exiting);
     if (auto It = VMap.find(Incoming); It != VMap.end())
       Incoming = It->second;
+    for (const auto &[PrefixValue, MergedValue] : PrefixLiveOutMerges)
+      if (Incoming == PrefixValue) {
+        Incoming = MergedValue;
+        break;
+      }
     PN.addIncoming(Incoming, Preheader);
   }
 
