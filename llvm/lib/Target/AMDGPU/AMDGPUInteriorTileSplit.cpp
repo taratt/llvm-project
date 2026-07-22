@@ -18,14 +18,17 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 #define DEBUG_TYPE "amdgpu-interior-tile-split"
@@ -36,6 +39,8 @@ STATISTIC(NumInteriorTileCandidates,
           "Number of divergent tile-boundary checks found");
 STATISTIC(NumPreparedInteriorTileSplits,
           "Number of canonical interior-tile splits cloned");
+STATISTIC(NumPreparedInteriorKLoopSplits,
+          "Number of canonical interior K loops versioned");
 
 namespace {
 
@@ -288,6 +293,83 @@ static bool isBarrierBlock(const BasicBlock *BB) {
   return false;
 }
 
+static bool containsBarrier(const Loop *L) {
+  for (const BasicBlock *BB : L->blocks())
+    if (isBarrierBlock(BB))
+      return true;
+  return false;
+}
+
+/// Clone an innermost K loop into a full-tile and an edge version.  This is
+/// deliberately stricter than the acyclic staging-region transform: the loop
+/// must already be in the forms required by cloneLoopWithPreheader, and its
+/// sole dedicated exit must contain the LCSSA PHIs which merge the live-outs.
+static bool versionInteriorKLoop(Loop *L, BasicBlock *Dispatch,
+                                 Value *DispatchCondition, LoopInfo &LI,
+                                 DominatorTree &DT) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Exit = L->getUniqueExitBlock();
+  BasicBlock *Exiting = L->getExitingBlock();
+  auto *DispatchBranch = dyn_cast<BranchInst>(Dispatch->getTerminator());
+  if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
+      !Preheader || !Exit || !Exiting || !containsBarrier(L) ||
+      Preheader->getSinglePredecessor() != Dispatch ||
+      Exit->getSinglePredecessor() != Exiting || !DispatchBranch ||
+      !DispatchBranch->isUnconditional() ||
+      DispatchBranch->getSuccessor(0) != Preheader ||
+      DispatchCondition->getType() !=
+          Type::getInt1Ty(L->getHeader()->getContext()))
+    return false;
+
+  // The dedicated exit is intentionally required to have only the LCSSA
+  // incoming edge.  This lets the existing PHIs merge the cloned live-outs
+  // without trying to reconstruct arbitrary exit CFG.
+  SmallVector<Instruction *, 8> DefsUsedOutside =
+      findDefsUsedOutsideOfLoop(L);
+  for (Instruction *Def : DefsUsedOutside)
+    for (User *U : Def->users()) {
+      auto *Use = dyn_cast<Instruction>(U);
+      if (!Use || L->contains(Use->getParent()))
+        continue;
+      auto *PN = dyn_cast<PHINode>(Use);
+      if (!PN || PN->getParent() != Exit ||
+          PN->getIncomingValueForBlock(Exiting) != Def)
+        return false;
+    }
+
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 8> ClonedBlocks;
+  Loop *InteriorLoop =
+      cloneLoopWithPreheader(Exit, Dispatch, L, VMap, ".interior", &LI, &DT,
+                             ClonedBlocks);
+  remapInstructionsInBlocks(ClonedBlocks, VMap);
+
+  BasicBlock *InteriorPreheader = InteriorLoop->getLoopPreheader();
+  BasicBlock *InteriorExiting = cast<BasicBlock>(VMap[Exiting]);
+  BranchInst::Create(InteriorPreheader, Preheader, DispatchCondition,
+                     DispatchBranch);
+  DispatchBranch->eraseFromParent();
+
+  for (PHINode &PN : Exit->phis()) {
+    Value *Incoming = PN.getIncomingValueForBlock(Exiting);
+    if (auto It = VMap.find(Incoming); It != VMap.end())
+      Incoming = It->second;
+    PN.addIncoming(Incoming, InteriorExiting);
+  }
+
+  // Both loop exits are now reached from the dispatch block.  This matches the
+  // LoopVersioning update and keeps the cloned LoopInfo/DT state consistent.
+  DT.changeImmediateDominator(Exit, Dispatch);
+  ++NumPreparedInteriorKLoopSplits;
+  LLVM_DEBUG(dbgs() << "Versioned canonical interior K loop in "
+                    << L->getHeader()->getParent()->getName() << " at "
+                    << Dispatch->getName()
+                    << "; interior loop " << InteriorLoop->getHeader()->getName()
+                    << ", edge loop " << L->getHeader()->getName()
+                    << ", shared live-out exit " << Exit->getName() << '\n');
+  return true;
+}
+
 /// Returns a closed, acyclic, single-entry/single-exit staging region.  The
 /// barrier is intentionally outside the region: it must remain shared by the
 /// fast and edge paths.
@@ -426,7 +508,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   return true;
 }
 
-static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI) {
+static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
+                                       LoopInfo &LI, DominatorTree &DT) {
   bool HasMClamp = false, HasNClamp = false, HasKClamp = false;
   bool HasCanonicalAlignment = false;
   for (BasicBlock &BB : F)
@@ -445,20 +528,14 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI) {
                     << " K-clamp=" << HasKClamp
                     << " alignment=" << HasCanonicalAlignment << '\n');
 
-  for (BasicBlock &BB : F) {
-    auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
-    if (!Branch || !UI.isUniformTerminator(Branch))
-      continue;
-
-    SmallPtrSet<Value *, 16> Visited;
-    if (getIDDependencies(Branch->getCondition(), Visited) &
-        DependsOnWorkitemID)
-      continue;
+  auto GetFullChecks = [&](Value *Condition,
+                           SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
+    if (!HasMClamp || !HasNClamp || !HasKClamp || !HasCanonicalAlignment)
+      return false;
 
     SmallVector<Value *, 8> Conjuncts;
-    collectConjuncts(Branch->getCondition(), Conjuncts);
+    collectConjuncts(Condition, Conjuncts);
     bool HasM = false, HasN = false, HasK = false, HasAlignment = false;
-    SmallVector<FullTileBoundCheck, 2> FullChecks;
     for (Value *Conjunct : Conjuncts) {
       FullTileBoundCheck MCheck, NCheck;
       if (getFullTileBoundCheck(Conjunct, 1, MCheck)) {
@@ -472,11 +549,45 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI) {
       HasK |= isKTileCheck(Conjunct);
       HasAlignment |= isAlignmentCheck(Conjunct, UI);
     }
+    return HasM && HasN && HasK && HasAlignment;
+  };
+
+  // A loop version is only introduced when a canonical CTA-uniform selector
+  // has already been materialized in its preheader's dispatch block.  The
+  // selector need not yet be the terminator: versioning makes it the choice
+  // between the cloned interior loop and the original edge loop.
+  SmallVector<Loop *, 4> Loops = LI.getLoopsInPreorder();
+  for (Loop *L : Loops) {
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Dispatch =
+        Preheader ? Preheader->getSinglePredecessor() : nullptr;
+    if (!Dispatch)
+      continue;
+    for (Instruction &I : *Dispatch) {
+      if (!I.getType()->isIntegerTy(1) || !UI.isUniformAtDef(&I))
+        continue;
+      SmallVector<FullTileBoundCheck, 2> FullChecks;
+      if (GetFullChecks(&I, FullChecks) &&
+          versionInteriorKLoop(L, Dispatch, &I, LI, DT))
+        return true;
+    }
+  }
+
+  for (BasicBlock &BB : F) {
+    auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!Branch || !UI.isUniformTerminator(Branch))
+      continue;
+
+    SmallPtrSet<Value *, 16> Visited;
+    if (getIDDependencies(Branch->getCondition(), Visited) &
+        DependsOnWorkitemID)
+      continue;
+
+    SmallVector<FullTileBoundCheck, 2> FullChecks;
     // Require both the canonical clamped extents and a full-tile dispatch.
     // The former proves the staging shape; the latter is the CTA-uniform
     // condition which selects the cloned interior path.
-    if (!HasMClamp || !HasNClamp || !HasKClamp ||
-        !HasCanonicalAlignment || !HasM || !HasN || !HasK || !HasAlignment)
+    if (!GetFullChecks(Branch->getCondition(), FullChecks))
       continue;
 
     for (BasicBlock *Successor : successors(&BB)) {
@@ -493,11 +604,12 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI) {
   return false;
 }
 
-static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI) {
+static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
+                                       LoopInfo &LI, DominatorTree &DT) {
   if (!AMDGPU::isEntryFunctionCC(F.getCallingConv()))
     return false;
 
-  const bool Changed = splitCanonicalInteriorTile(F, UI);
+  const bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT);
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
@@ -536,11 +648,15 @@ public:
 
     UniformityInfo &UI =
         getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
-    return findInteriorTileCandidates(F, UI);
+    LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+    DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    return findInteriorTileCandidates(F, UI, LI, DT);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<UniformityInfoWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<DominatorTreeWrapperPass>();
   }
 };
 
@@ -549,7 +665,9 @@ public:
 PreservedAnalyses
 AMDGPUInteriorTileSplitPass::run(Function &F, FunctionAnalysisManager &FAM) {
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
-  if (!findInteriorTileCandidates(F, UI))
+  LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+  DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+  if (!findInteriorTileCandidates(F, UI, LI, DT))
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }
@@ -558,6 +676,8 @@ INITIALIZE_PASS_BEGIN(AMDGPUInteriorTileSplitLegacy, DEBUG_TYPE,
                       "Find AMDGPU interior tile split candidates", false,
                       true)
 INITIALIZE_PASS_DEPENDENCY(UniformityInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_END(AMDGPUInteriorTileSplitLegacy, DEBUG_TYPE,
                     "Find AMDGPU interior tile split candidates", false, true)
 
