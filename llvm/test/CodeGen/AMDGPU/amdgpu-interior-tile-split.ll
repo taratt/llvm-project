@@ -2,7 +2,7 @@
 ; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes='loop-simplify,lcssa,amdgpu-interior-tile-split' \
 ; RUN:   -debug-only=amdgpu-interior-tile-split -disable-output %s 2>&1 | FileCheck %s
 ; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes='loop-simplify,lcssa,amdgpu-interior-tile-split' \
-; RUN:   -S %s | FileCheck %s --check-prefix=CFG
+; RUN:   -verify-each -S %s | FileCheck %s --check-prefix=CFG
 
 ; The broad candidate diagnostic is retained for non-canonical boundary
 ; checks.  The second kernel has a closed staging region, which is cloned
@@ -33,6 +33,7 @@ declare i32 @llvm.amdgcn.workgroup.id.y()
 declare void @llvm.amdgcn.s.barrier()
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
+declare i32 @llvm.umin.i32(i32, i32)
 
 define amdgpu_kernel void @canonical_staging(ptr addrspace(1) %out, i32 %m,
                                              i32 %n, i32 %k) {
@@ -130,7 +131,16 @@ k.header:
   br label %k.body
 
 k.body:
+  %k.remaining.loop = sub i32 %k, %i
+  %k.extent.loop = call i32 @llvm.umin.i32(i32 %k.remaining.loop, i32 32)
+  %k.full.loop = icmp uge i32 %k.extent.loop, 32
+  br i1 %k.full.loop, label %k.barrier, label %k.skip
+
+k.barrier:
   call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.skip:
   br label %k.latch
 
 k.latch:
@@ -149,11 +159,9 @@ k.exit:
   ret void
 }
 
-; This multi-tile K loop has canonical M/N clamp remainders but deliberately
-; has no full-tile selector.  Synthesizing an M/N-only selector would clone the
-; loop without proving that the clone removes its per-lane M/N boundary checks,
-; and its first K remainder cannot prove every iteration full.  It must remain
-; unsplit.
+; This multi-tile K loop has its canonical M/N clamp remainders in the actual
+; preheader.  The pass synthesizes its static selector there, then removes the
+; exact M/N lane checks and K tile check from the cloned full-K prefix.
 define amdgpu_kernel void @canonical_synthesized_k_loop(
     ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
 entry:
@@ -162,8 +170,12 @@ entry:
 dispatch:
   %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
   %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %workitem = call i32 @llvm.amdgcn.workitem.id.x()
   %x.base = shl i32 %workgroup.x, 7
   %y.base = shl i32 %workgroup.y, 7
+  br label %k.preheader
+
+k.preheader:
   %n.remaining = sub i32 %n, %x.base
   %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
   %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
@@ -175,9 +187,6 @@ dispatch:
   %out.int = ptrtoint ptr addrspace(1) %out to i64
   %out.mask = and i64 %out.int, 15
   %out.aligned = icmp eq i64 %out.mask, 0
-  br label %k.preheader
-
-k.preheader:
   br label %k.header
 
 k.header:
@@ -185,16 +194,35 @@ k.header:
   br label %k.body
 
 k.body:
+  %m.index = add i32 %y.base, %workitem
+  %m.in.bounds = icmp ult i32 %m.index, %m
+  br i1 %m.in.bounds, label %k.n.check, label %k.barrier
+
+k.n.check:
+  %n.index = add i32 %x.base, %workitem
+  %n.in.bounds = icmp ult i32 %n.index, %n
+  br i1 %n.in.bounds, label %k.k.check, label %k.barrier
+
+k.k.check:
+  %k.remaining.loop = sub i32 %k, %i
+  %k.extent.loop = call i32 @llvm.umin.i32(i32 %k.remaining.loop, i32 32)
+  %k.full.loop = icmp uge i32 %k.extent.loop, 32
+  br i1 %k.full.loop, label %k.barrier, label %k.skip
+
+k.barrier:
   call void @llvm.amdgcn.s.barrier()
-  %next = add nuw i32 %i, 1
-  %done = icmp eq i32 %next, 4
-  br i1 %done, label %k.exit, label %k.latch
+  br label %k.latch
+
+k.skip:
+  br label %k.latch
 
 k.latch:
-  br label %k.header
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
 
 k.exit:
-  %result.lcssa = phi i32 [ %next, %k.body ]
+  %result.lcssa = phi i32 [ %next, %k.latch ]
   store i32 %result.lcssa, ptr addrspace(1) %out, align 4
   ret void
 }
@@ -248,7 +276,8 @@ k.exit:
 }
 
 ; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
-; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header, shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_synthesized_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -282,6 +311,14 @@ k.exit:
 ; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.tail.start, %k.preheader ]
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
-; CFG-LABEL: dispatch:
-; CFG-NOT: %interior.full
-; CFG: br label %k.preheader
+; CFG-LABEL: k.preheader:
+; CFG: %interior.m.full = icmp uge i32 %m.remaining, 128
+; CFG: %interior.n.full = icmp uge i32 %n.remaining, 128
+; CFG: %interior.full = and i1 %interior.mn.full, %out.aligned
+; CFG: br i1 %interior.k.full, label %k.preheader.split.interior, label %k.preheader.split
+; CFG-LABEL: k.body.interior:
+; CFG: br label %k.n.check.interior
+; CFG-LABEL: k.n.check.interior:
+; CFG: br label %k.k.check.interior
+; CFG-LABEL: k.k.check.interior:
+; CFG: br label %k.barrier.interior

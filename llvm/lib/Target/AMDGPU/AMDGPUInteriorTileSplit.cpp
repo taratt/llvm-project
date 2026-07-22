@@ -30,6 +30,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -129,6 +130,13 @@ struct FullTileBoundCheck {
   Value *Bound;
 };
 
+struct CanonicalTileRemainder {
+  unsigned Dimension;
+  Value *Bound;
+  Value *Base;
+  Value *Difference;
+};
+
 static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
                                   FullTileBoundCheck &Check) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
@@ -197,34 +205,54 @@ static bool isNamedCall(Value *V, StringRef Name) {
 
 /// Match min(max(Bound - (workgroup.id << 7), 0), 128), which is the
 /// clamp form emitted by Clang for a 128-row or 128-column tile extent.
-static bool isClampedTileExtent(Value *V, unsigned Dimension) {
+static bool getClampedTileExtent(Value *V, unsigned Dimension,
+                                 CanonicalTileRemainder &Remainder) {
   if (!isNamedCall(V, "llvm.smin."))
     return false;
 
   auto *Min = cast<CallBase>(V);
   Value *Extent = nullptr;
+  bool HasTileSize = false;
   for (Value *Operand : Min->args()) {
     if (auto *C = dyn_cast<ConstantInt>(Operand)) {
-      if (!C->equalsInt(128))
+      if (!C->equalsInt(128) || HasTileSize)
         return false;
+      HasTileSize = true;
     } else {
+      if (Extent)
+        return false;
       Extent = Operand;
     }
   }
-  if (!Extent || !isNamedCall(Extent, "llvm.smax."))
+  if (!HasTileSize || !Extent || !isNamedCall(Extent, "llvm.smax."))
     return false;
 
   auto *Max = cast<CallBase>(Extent);
   Value *Difference = nullptr;
+  bool HasZero = false;
   for (Value *Operand : Max->args()) {
     if (auto *C = dyn_cast<ConstantInt>(Operand)) {
-      if (!C->isZero())
+      if (!C->isZero() || HasZero)
         return false;
+      HasZero = true;
     } else {
+      if (Difference)
+        return false;
       Difference = Operand;
     }
   }
-  return isTileRelativeDifference(Difference, Dimension);
+  auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
+  if (!HasZero || !Sub || Sub->getOpcode() != Instruction::Sub ||
+      !isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension))
+    return false;
+
+  Remainder = {Dimension, Sub->getOperand(0), Sub->getOperand(1), Sub};
+  return true;
+}
+
+static bool isClampedTileExtent(Value *V, unsigned Dimension) {
+  CanonicalTileRemainder Remainder;
+  return getClampedTileExtent(V, Dimension, Remainder);
 }
 
 /// Match min(K - k0, 32), the full-K-tile extent form emitted by Clang.
@@ -259,6 +287,62 @@ static bool isKTileCheck(Value *V) {
          (Cmp->getPredicate() == ICmpInst::ICMP_ULE ||
           Cmp->getPredicate() == ICmpInst::ICMP_SLE) &&
          IsK(Cmp->getOperand(1));
+}
+
+/// Match `umin(K - k0, 32) >= 32` (or its equivalent operand order).  The
+/// cloned prefix has an exact multiple-of-32 bound, so this is true on every
+/// cloned iteration only when `k0` is the loop induction value and K is the
+/// recurrence exit bound.  A signed min is intentionally not accepted: the
+/// unsigned loop recurrence does not prove its result for K above INT_MAX.
+static bool isFullKTileGuard(Value *V, Value *IV, Value *Bound) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return false;
+
+  Value *Extent = nullptr;
+  if (auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
+    if (!C->equalsInt(32) ||
+        (Cmp->getPredicate() != ICmpInst::ICMP_UGE &&
+         Cmp->getPredicate() != ICmpInst::ICMP_SGE))
+      return false;
+    Extent = Cmp->getOperand(0);
+  } else if (auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(0))) {
+    if (!C->equalsInt(32) ||
+        (Cmp->getPredicate() != ICmpInst::ICMP_ULE &&
+         Cmp->getPredicate() != ICmpInst::ICMP_SLE))
+      return false;
+    Extent = Cmp->getOperand(1);
+  } else {
+    return false;
+  }
+
+  if (!isNamedCall(Extent, "llvm.umin."))
+    return false;
+  auto *Min = cast<CallBase>(Extent);
+  Value *Difference = nullptr;
+  bool HasTileSize = false;
+  for (Value *Operand : Min->args()) {
+    if (auto *C = dyn_cast<ConstantInt>(Operand)) {
+      if (!C->equalsInt(32) || HasTileSize)
+        return false;
+      HasTileSize = true;
+    } else {
+      if (Difference)
+        return false;
+      Difference = Operand;
+    }
+  }
+  auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
+  return HasTileSize && Sub && Sub->getOpcode() == Instruction::Sub &&
+         Sub->getOperand(0) == Bound && Sub->getOperand(1) == IV;
+}
+
+static bool isRemovablePrefixGuard(
+    const BranchInst *Branch, Value *IV, Value *Bound,
+    ArrayRef<FullTileBoundCheck> FullChecks) {
+  return Branch->isConditional() &&
+         (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
+          isRemovableSafetyBranch(Branch, FullChecks));
 }
 
 static bool isAlignmentCheck(Value *V, UniformityInfo &UI) {
@@ -305,8 +389,10 @@ static bool containsBarrier(const Loop *L) {
 
 /// Clone a canonical full-K prefix before the original guarded tail.
 static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
-                               Value *StaticFullTileCondition, LoopInfo &LI,
-                               DominatorTree &DT, ScalarEvolution &SE) {
+                               Value *StaticFullTileCondition,
+                               ArrayRef<FullTileBoundCheck> FullChecks,
+                               LoopInfo &LI, DominatorTree &DT,
+                               ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
@@ -372,6 +458,16 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   if (!Inc || Inc->getOpcode() != Instruction::Add)
     return false;
 
+  // Do not version a loop unless the cloned prefix will actually become less
+  // guarded.  Both predicates are proven against the original loop here and
+  // rechecked after remapping below.
+  bool HasRemovableGuard = false;
+  for (BasicBlock *BB : L->blocks())
+    HasRemovableGuard |= isRemovablePrefixGuard(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks);
+  if (!HasRemovableGuard)
+    return false;
+
   // The prefix-to-tail merge below carries header PHI backedge values.  An
   // arbitrary loop live-out would need its own edge PHI and is deliberately
   // outside this narrow first implementation.
@@ -408,6 +504,24 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
     PrefixCmp->setOperand(0, PrefixBound);
   else
     llvm_unreachable("cloned K exit compare must use cloned induction");
+
+  unsigned RemovedSafetyBranches = 0;
+  Value *PrefixIV = VMap.lookup(IV);
+  for (BasicBlock *BB : L->blocks()) {
+    BasicBlock *PrefixBB = cast<BasicBlock>(VMap[BB]);
+    auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
+    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks))
+      continue;
+
+    auto *PrefixBranch = cast<BranchInst>(PrefixBB->getTerminator());
+    if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound,
+                                FullChecks))
+      llvm_unreachable("cloned prefix guard must retain canonical shape");
+    BranchInst::Create(PrefixBranch->getSuccessor(0), PrefixBranch);
+    PrefixBranch->eraseFromParent();
+    ++RemovedSafetyBranches;
+  }
+
   BranchInst::Create(PrefixPreheader, Preheader, RunPrefix,
                      DispatchBranch);
   DispatchBranch->eraseFromParent();
@@ -462,8 +576,131 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
                     << Dispatch->getName()
                     << "; prefix loop " << PrefixLoop->getHeader()->getName()
                     << ", guarded tail " << L->getHeader()->getName()
+                    << "; removed " << RemovedSafetyBranches
+                    << " proven guard(s)"
                     << ", shared live-out exit " << Exit->getName() << '\n');
   return true;
+}
+
+/// Build the CTA-uniform M/N/alignment selector from the canonical clamp
+/// remainders in the K loop's actual preheader.  Keeping this local to the
+/// preheader avoids reusing an unrelated clamp from another tiled region.
+static Value *synthesizeInteriorTileSelector(
+    BasicBlock *Preheader, UniformityInfo &UI) {
+  CanonicalTileRemainder M, N;
+  Value *Alignment = nullptr;
+  bool HasM = false, HasN = false;
+  for (Instruction &I : *Preheader) {
+    CanonicalTileRemainder Remainder;
+    if (getClampedTileExtent(&I, 1, Remainder)) {
+      if (HasM)
+        return nullptr;
+      M = Remainder;
+      HasM = true;
+    }
+    if (getClampedTileExtent(&I, 0, Remainder)) {
+      if (HasN)
+        return nullptr;
+      N = Remainder;
+      HasN = true;
+    }
+    if (isAlignmentCheck(&I, UI)) {
+      if (Alignment)
+        return nullptr;
+      Alignment = &I;
+    }
+  }
+  if (!HasM || !HasN || !Alignment || M.Bound->getType() != N.Bound->getType())
+    return nullptr;
+
+  IRBuilder<> Builder(Preheader->getTerminator());
+  // The explicit non-underflow checks make the modular subtraction proof
+  // valid even for workgroup IDs near the unsigned addressable limit.
+  Value *MNonNegative =
+      Builder.CreateICmpUGE(M.Bound, M.Base, "interior.m.nonnegative");
+  Value *MExtent = Builder.CreateICmpUGE(
+      M.Difference, ConstantInt::get(M.Difference->getType(), 128),
+      "interior.m.full");
+  Value *MFull = Builder.CreateAnd(MNonNegative, MExtent, "interior.m.tile");
+  Value *NNonNegative =
+      Builder.CreateICmpUGE(N.Bound, N.Base, "interior.n.nonnegative");
+  Value *NExtent = Builder.CreateICmpUGE(
+      N.Difference, ConstantInt::get(N.Difference->getType(), 128),
+      "interior.n.full");
+  Value *NFull = Builder.CreateAnd(NNonNegative, NExtent, "interior.n.tile");
+  Value *MNFull = Builder.CreateAnd(MFull, NFull, "interior.mn.full");
+  return Builder.CreateAnd(MNFull, Alignment, "interior.full");
+}
+
+/// Check the pieces that must hold before splitting a preheader.  The
+/// subsequent split only changes its predecessor; the remaining checks in
+/// splitInteriorKLoop are consequently guaranteed by this preflight.
+static bool canSplitInteriorKLoop(Loop *L,
+                                  ArrayRef<FullTileBoundCheck> FullChecks,
+                                  DominatorTree &DT, ScalarEvolution &SE) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Exit = L->getUniqueExitBlock();
+  BasicBlock *Exiting = L->getExitingBlock();
+  if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
+      !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
+      Exiting != L->getLoopLatch() || !containsBarrier(L) ||
+      Exit->getSinglePredecessor() != Exiting)
+    return false;
+
+  auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
+  auto *ExitCmp = ExitBranch && ExitBranch->isConditional()
+                      ? dyn_cast<ICmpInst>(ExitBranch->getCondition())
+                      : nullptr;
+  if (!ExitCmp)
+    return false;
+  BasicBlock *Continue = ExitBranch->getSuccessor(0) == L->getHeader()
+                             ? ExitBranch->getSuccessor(0)
+                             : ExitBranch->getSuccessor(1) == L->getHeader()
+                                   ? ExitBranch->getSuccessor(1)
+                                   : nullptr;
+  if (!Continue)
+    return false;
+  ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
+                                  ? ExitCmp->getPredicate()
+                                  : ExitCmp->getInversePredicate();
+  if (Pred != ICmpInst::ICMP_ULT)
+    return false;
+
+  Value *IVValue = ExitCmp->getOperand(0);
+  Value *Bound = ExitCmp->getOperand(1);
+  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVValue));
+  if (!AR) {
+    std::swap(IVValue, Bound);
+    AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVValue));
+  }
+  auto *Step = AR ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                  : nullptr;
+  if (!Step || Step->getAPInt().getZExtValue() != 32 ||
+      !L->isLoopInvariant(Bound) || AR->getLoop() != L ||
+      !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
+      !Bound->getType()->isIntegerTy())
+    return false;
+  auto *IV = dyn_cast<PHINode>(&L->getHeader()->front());
+  if (!IV || !isa<ConstantInt>(IV->getIncomingValueForBlock(Preheader)) ||
+      !cast<ConstantInt>(IV->getIncomingValueForBlock(Preheader))->isZero() ||
+      IV->getIncomingValueForBlock(Exiting) != IVValue)
+    return false;
+  auto *Inc = dyn_cast<BinaryOperator>(IVValue);
+  if (!Inc || Inc->getOpcode() != Instruction::Add)
+    return false;
+
+  SmallPtrSet<Value *, 8> HeaderBackedgeValues;
+  for (PHINode &PN : L->getHeader()->phis())
+    HeaderBackedgeValues.insert(PN.getIncomingValueForBlock(Exiting));
+  for (PHINode &PN : Exit->phis())
+    if (!HeaderBackedgeValues.contains(PN.getIncomingValueForBlock(Exiting)))
+      return false;
+
+  bool HasRemovableGuard = false;
+  for (BasicBlock *BB : L->blocks())
+    HasRemovableGuard |= isRemovablePrefixGuard(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks);
+  return HasRemovableGuard;
 }
 
 /// Returns a closed, acyclic, single-entry/single-exit staging region.  The
@@ -664,9 +901,46 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
       SmallVector<FullTileBoundCheck, 2> FullChecks;
       if (GetFullChecks(&I, FullChecks) &&
-          splitInteriorKLoop(L, Dispatch, &I, LI, DT, SE))
+          splitInteriorKLoop(L, Dispatch, &I, FullChecks, LI, DT, SE))
         return true;
     }
+  }
+
+  // Real GEMM IR commonly reaches the K loop through an unconditional
+  // preheader.  Materialize the M/N/alignment dispatch immediately there,
+  // then split the preheader so the original block becomes the dispatch.
+  for (Loop *L : Loops) {
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader || !Preheader->getSinglePredecessor())
+      continue;
+
+    SmallVector<FullTileBoundCheck, 2> FullChecks;
+    bool HasM = false, HasN = false;
+    for (Instruction &I : *Preheader) {
+      CanonicalTileRemainder Remainder;
+      if (getClampedTileExtent(&I, 1, Remainder)) {
+        if (HasM)
+          break;
+        FullChecks.push_back({1, Remainder.Bound});
+        HasM = true;
+      }
+      if (getClampedTileExtent(&I, 0, Remainder)) {
+        if (HasN)
+          break;
+        FullChecks.push_back({0, Remainder.Bound});
+        HasN = true;
+      }
+    }
+    if (!HasM || !HasN || !canSplitInteriorKLoop(L, FullChecks, DT, SE))
+      continue;
+
+    Value *Selector = synthesizeInteriorTileSelector(Preheader, UI);
+    if (!Selector)
+      continue;
+    SplitBlock(Preheader, Preheader->getTerminator(), &DT, &LI);
+    if (splitInteriorKLoop(L, Preheader, Selector, FullChecks, LI, DT, SE))
+      return true;
+    llvm_unreachable("preflighted interior K loop must split");
   }
 
   for (BasicBlock &BB : F) {
