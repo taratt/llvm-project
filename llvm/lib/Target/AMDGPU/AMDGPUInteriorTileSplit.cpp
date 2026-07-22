@@ -307,6 +307,12 @@ static bool prepareCanonicalInteriorTileSplit(Function &F, UniformityInfo &UI) {
       HasAlignment |= isAlignmentCheck(&I, UI);
     }
 
+  LLVM_DEBUG(dbgs() << "Interior-tile proof for " << F.getName()
+                    << ": M-clamp=" << HasMClamp
+                    << " N-clamp=" << HasNClamp
+                    << " K-clamp=" << HasKClamp
+                    << " alignment=" << HasAlignment << '\n');
+
   if (HasMClamp && HasNClamp && HasKClamp && HasAlignment) {
     ++NumPreparedInteriorTileSplits;
     LLVM_DEBUG(dbgs() << "Recognized canonical 128x128x32 tile extents in "
