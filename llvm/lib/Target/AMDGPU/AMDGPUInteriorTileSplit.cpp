@@ -72,9 +72,9 @@ static bool isWorkgroupID(Value *V, unsigned Dimension) {
   if (!II)
     return false;
 
-  Intrinsic::ID ID = II->getIntrinsicID();
-  return (Dimension == 0 && ID == Intrinsic::amdgcn_workgroup_id_x) ||
-         (Dimension == 1 && ID == Intrinsic::amdgcn_workgroup_id_y);
+  StringRef Name = II->getCalledFunction()->getName();
+  return (Dimension == 0 && Name == "llvm.amdgcn.workgroup.id.x") ||
+         (Dimension == 1 && Name == "llvm.amdgcn.workgroup.id.y");
 }
 
 static bool isWorkgroupShiftBy7(Value *V, unsigned Dimension) {
@@ -99,8 +99,8 @@ static bool isShiftPlusLastLane(Value *V, unsigned Dimension) {
       return false;
     LHS = RHS;
   } else {
-    auto *C = dyn_cast<ConstantInt>(RHS);
-    if (!C || !C->equalsInt(127))
+    auto *LastLane = dyn_cast<ConstantInt>(RHS);
+    if (!LastLane || !LastLane->equalsInt(127))
       return false;
   }
   return isWorkgroupShiftBy7(LHS, Dimension);
@@ -168,7 +168,7 @@ static void collectConjuncts(Value *V, SmallVectorImpl<Value *> &Conjuncts) {
 static bool isBarrierBlock(const BasicBlock *BB) {
   for (const Instruction &I : *BB)
     if (const auto *II = dyn_cast<IntrinsicInst>(&I))
-      if (II->getIntrinsicID() == Intrinsic::amdgcn_s_barrier)
+      if (II->getCalledFunction()->getName() == "llvm.amdgcn.s.barrier")
         return true;
   return false;
 }
@@ -207,8 +207,8 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
       if (Predecessor != Dispatch && !Region.contains(Predecessor))
         return false;
 
-    if (auto *Branch = dyn_cast<CondBrInst>(BB->getTerminator()))
-      HasSafetyBranch |= !Branch->isUnconditional();
+    if (isa<CondBrInst>(BB->getTerminator()))
+      HasSafetyBranch = true;
 
     for (BasicBlock *Successor : successors(BB)) {
       if (Successor == Barrier)
