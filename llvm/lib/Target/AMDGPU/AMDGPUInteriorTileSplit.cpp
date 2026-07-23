@@ -316,7 +316,7 @@ static bool isNamedCall(Value *V, StringRef Name) {
 /// clamp form emitted by Clang for a 128-row or 128-column tile extent.
 static bool getClampedTileExtent(Value *V, unsigned Dimension,
                                  CanonicalTileRemainder &Remainder) {
-  if (!isNamedCall(V, "llvm.smin."))
+  if (!isNamedCall(V, "llvm.smin.") && !isNamedCall(V, "llvm.umin."))
     return false;
 
   auto *Min = cast<CallBase>(V);
