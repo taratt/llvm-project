@@ -763,7 +763,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
       !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
       Exiting != L->getLoopLatch() || !containsBarrier(L) ||
-      Exit->getSinglePredecessor() != Exiting)
+      !L->getHeader())
     return false;
 
   auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
@@ -799,10 +799,17 @@ static bool canSplitInteriorKLoop(Loop *L,
       !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
       !Bound->getType()->isIntegerTy())
     return false;
-  auto *IV = dyn_cast<PHINode>(&L->getHeader()->front());
-  if (!IV || !isa<ConstantInt>(IV->getIncomingValueForBlock(Preheader)) ||
-      !cast<ConstantInt>(IV->getIncomingValueForBlock(Preheader))->isZero() ||
-      IV->getIncomingValueForBlock(Exiting) != IVValue)
+  PHINode *IV = nullptr;
+  for (PHINode &PN : L->getHeader()->phis()) {
+    if (PN.getIncomingValueForBlock(Exiting) != IVValue)
+      continue;
+    if (!isa<ConstantInt>(PN.getIncomingValueForBlock(Preheader)) ||
+        !cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader))->isZero())
+      return false;
+    IV = &PN;
+    break;
+  }
+  if (!IV)
     return false;
   auto *Inc = dyn_cast<BinaryOperator>(IVValue);
   if (!Inc || Inc->getOpcode() != Instruction::Add)
