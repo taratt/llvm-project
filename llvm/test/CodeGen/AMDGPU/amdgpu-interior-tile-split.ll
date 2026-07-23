@@ -235,6 +235,82 @@ k.exit:
   ret void
 }
 
+; The staging loop is nested inside the 32-wide K loop.  Its offset reaches
+; the M/N/K guards through affine adds, as in real GEMM IR.  SCEV proves the
+; inner induction is in [0, 32), allowing only the cloned prefix guards to be
+; removed.
+define amdgpu_kernel void @canonical_nested_staging_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  br label %k.preheader
+
+k.preheader:
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %k.body
+
+k.body:
+  br label %stage.header
+
+stage.header:
+  %stage.i = phi i32 [ 0, %k.body ], [ %stage.next, %stage.latch ]
+  br label %stage.m.check
+
+stage.m.check:
+  %m.index = add i32 %y.base, %stage.i
+  %m.in.bounds = icmp slt i32 %m.index, %m
+  br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
+
+stage.n.check:
+  %n.index = add i32 %x.base, %stage.i
+  %n.in.bounds = icmp slt i32 %n.index, %n
+  br i1 %n.in.bounds, label %stage.k.check, label %stage.latch
+
+stage.k.check:
+  %k.index = add i32 %i, %stage.i
+  %k.in.bounds = icmp slt i32 %k.index, %k
+  br i1 %k.in.bounds, label %stage.barrier, label %stage.latch
+
+stage.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %stage.latch
+
+stage.latch:
+  %stage.next = add nuw i32 %stage.i, 1
+  %stage.more = icmp ult i32 %stage.next, 32
+  br i1 %stage.more, label %stage.header, label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; The equivalent one-K-tile loop is structurally proven to execute once.
 ; Synthesis includes all M/N/K/alignment predicates before it versions the
 ; loop.
@@ -286,6 +362,7 @@ k.exit:
 ; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
 ; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
 ; CHECK: Split canonical interior K loop in canonical_synthesized_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -330,3 +407,11 @@ k.exit:
 ; CFG: br label %k.k.check.interior
 ; CFG-LABEL: k.k.check.interior:
 ; CFG: br label %k.barrier.interior
+
+; CFG-LABEL: define amdgpu_kernel void @canonical_nested_staging_k_loop(
+; CFG-LABEL: stage.m.check.interior:
+; CFG: br label %stage.n.check.interior
+; CFG-LABEL: stage.n.check.interior:
+; CFG: br label %stage.k.check.interior
+; CFG-LABEL: stage.k.check.interior:
+; CFG: br label %stage.barrier.interior

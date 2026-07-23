@@ -233,7 +233,26 @@ static bool getAffineLaneMaximum(Value *V, uint64_t &Maximum) {
 
 /// Match a signed or unsigned `Base + LaneOffset < Bound`.  The static M/N
 /// selector is built from the same Base/Bound pair and proves a 128-wide tile.
-static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full) {
+/// Prove that Offset is nonnegative and strictly less than Limit.  This uses
+/// SCEV rather than a syntactic loop match so the proof survives the casts and
+/// affine adds that Clang emits for the nested staging loops.  A full range is
+/// deliberately not accepted.
+static bool isUnsignedOffsetBelow(Value *Offset, uint64_t Limit,
+                                  ScalarEvolution &SE) {
+  if (!Offset->getType()->isIntegerTy())
+    return false;
+  APInt Maximum = SE.getUnsignedRangeMax(SE.getSCEV(Offset));
+  if (Maximum.getBitWidth() < 64 &&
+      Limit >= (uint64_t(1) << Maximum.getBitWidth()))
+    return true;
+  return Maximum.ult(APInt(Maximum.getBitWidth(), Limit));
+}
+
+/// Match `Base + Offset < Bound` for the exact Base/Bound pair selected by
+/// Full.  Direct lane forms use the architectural lane proof; nested staging
+/// forms use SCEV's unsigned range for their affine offset.
+static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
+                                    ScalarEvolution &SE) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp)
     return false;
@@ -255,18 +274,22 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full) {
 
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
-  uint64_t Maximum;
-  return ((LHS == Full.Base && getAffineLaneMaximum(RHS, Maximum)) ||
-          (RHS == Full.Base && getAffineLaneMaximum(LHS, Maximum))) &&
-         Maximum < 128;
+  auto IsBoundedOffset = [&](Value *Offset) {
+    uint64_t Maximum;
+    return (getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
+           isUnsignedOffsetBelow(Offset, 128, SE);
+  };
+  return (LHS == Full.Base && IsBoundedOffset(RHS)) ||
+         (RHS == Full.Base && IsBoundedOffset(LHS));
 }
 
 static bool isRemovableSafetyBranch(
-    const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks) {
+    const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks,
+    ScalarEvolution &SE) {
   if (!Branch->isConditional())
     return false;
   for (const FullTileBoundCheck &Full : FullChecks)
-    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full))
+    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE))
       return true;
   return false;
 }
@@ -428,12 +451,37 @@ static bool isFullKTileGuard(Value *V, Value *IV, Value *Bound) {
          Sub->getOperand(0) == Bound && Sub->getOperand(1) == IV;
 }
 
+/// Match the scalar guard emitted in the nested staging loop:
+///   k0 + nested.offset < K
+/// The outer K induction and bound must be exactly the recurrence proven by
+/// splitInteriorKLoop; only the nested offset is discharged through SCEV.
+static bool isNestedKBoundCheck(Value *V, Value *IV, Value *Bound,
+                                ScalarEvolution &SE) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_SLT ||
+      Cmp->getOperand(1) != Bound)
+    return false;
+
+  auto *Add = dyn_cast<BinaryOperator>(Cmp->getOperand(0));
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+
+  Value *LHS = Add->getOperand(0);
+  Value *RHS = Add->getOperand(1);
+  if (LHS == IV)
+    return isUnsignedOffsetBelow(RHS, 32, SE);
+  if (RHS == IV)
+    return isUnsignedOffsetBelow(LHS, 32, SE);
+  return false;
+}
+
 static bool isRemovablePrefixGuard(
     const BranchInst *Branch, Value *IV, Value *Bound,
-    ArrayRef<FullTileBoundCheck> FullChecks) {
+    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE) {
   return Branch->isConditional() &&
          (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
-          isRemovableSafetyBranch(Branch, FullChecks));
+          isNestedKBoundCheck(Branch->getCondition(), IV, Bound, SE) ||
+          isRemovableSafetyBranch(Branch, FullChecks, SE));
 }
 
 static bool isAlignmentCheck(Value *V, UniformityInfo &UI) {
@@ -488,7 +536,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
   auto *DispatchBranch = dyn_cast<BranchInst>(Dispatch->getTerminator());
-  if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
+  if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
       !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
       Exiting != L->getLoopLatch() || !containsBarrier(L) ||
       Preheader->getSinglePredecessor() != Dispatch ||
@@ -570,7 +618,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
   if (!HasRemovableGuard)
     return false;
 
@@ -623,12 +671,12 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   for (BasicBlock *BB : L->blocks()) {
     BasicBlock *PrefixBB = cast<BasicBlock>(VMap[BB]);
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks))
+    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE))
       continue;
 
     auto *PrefixBranch = cast<BranchInst>(PrefixBB->getTerminator());
     if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound,
-                                FullChecks))
+                                FullChecks, SE))
       llvm_unreachable("cloned prefix guard must retain canonical shape");
     BranchInst::Create(PrefixBranch->getSuccessor(0), PrefixBranch);
     PrefixBranch->eraseFromParent();
@@ -762,7 +810,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
-  const bool HasBasicShape = L->isInnermost() && L->isLoopSimplifyForm() &&
+  const bool HasBasicShape = L->isLoopSimplifyForm() &&
                              L->isLCSSAForm(DT) && L->isSafeToClone() &&
                              Preheader && Exit && Exiting &&
                              Exiting == L->getLoopLatch() &&
@@ -770,8 +818,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   if (!HasBasicShape) {
     LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
                       << L->getHeader()->getName()
-                      << ": innermost=" << L->isInnermost()
-                      << " simplify=" << L->isLoopSimplifyForm()
+                      << ": simplify=" << L->isLoopSimplifyForm()
                       << " lcssa=" << L->isLCSSAForm(DT)
                       << " cloneable=" << L->isSafeToClone()
                       << " preheader=" << static_cast<bool>(Preheader)
@@ -840,7 +887,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
   return HasRemovableGuard;
 }
 
@@ -917,7 +964,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
                                BasicBlock *Entry,
                                const SmallPtrSetImpl<BasicBlock *> &Region,
                                BasicBlock *Barrier,
-                               ArrayRef<FullTileBoundCheck> FullChecks) {
+                               ArrayRef<FullTileBoundCheck> FullChecks,
+                               ScalarEvolution &SE) {
   // Cloning incoming values into a PHI in the shared barrier would require
   // proving the corresponding values are valid on both paths.  Reject that
   // shape rather than manufacture a potentially invalid incoming value.
@@ -927,7 +975,7 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   bool HasRemovableSafetyBranch = false;
   for (BasicBlock *BB : Region)
     HasRemovableSafetyBranch |= isRemovableSafetyBranch(
-        cast<BranchInst>(BB->getTerminator()), FullChecks);
+        cast<BranchInst>(BB->getTerminator()), FullChecks, SE);
   if (!HasRemovableSafetyBranch)
     return false;
 
@@ -958,7 +1006,7 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   unsigned RemovedSafetyBranches = 0;
   for (BasicBlock *BB : RegionBlocks) {
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovableSafetyBranch(OriginalBranch, FullChecks))
+    if (!isRemovableSafetyBranch(OriginalBranch, FullChecks, SE))
       continue;
 
     auto *ClonedBranch =
@@ -1110,7 +1158,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
 
       if (cloneStagingRegion(F, Branch, Successor, Region, Barrier,
-                             FullChecks))
+                             FullChecks, SE))
         return true;
     }
   }
