@@ -760,11 +760,24 @@ static bool canSplitInteriorKLoop(Loop *L,
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
-  if (!L->isInnermost() || !L->isLoopSimplifyForm() || !L->isLCSSAForm(DT) ||
-      !L->isSafeToClone() || !Preheader || !Exit || !Exiting ||
-      Exiting != L->getLoopLatch() || !containsBarrier(L) ||
-      !L->getHeader())
+  const bool HasBasicShape = L->isInnermost() && L->isLoopSimplifyForm() &&
+                             L->isLCSSAForm(DT) && L->isSafeToClone() &&
+                             Preheader && Exit && Exiting &&
+                             Exiting == L->getLoopLatch() &&
+                             containsBarrier(L) && L->getHeader();
+  if (!HasBasicShape) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": innermost=" << L->isInnermost()
+                      << " simplify=" << L->isLoopSimplifyForm()
+                      << " lcssa=" << L->isLCSSAForm(DT)
+                      << " cloneable=" << L->isSafeToClone()
+                      << " preheader=" << static_cast<bool>(Preheader)
+                      << " exit=" << static_cast<bool>(Exit)
+                      << " latch=" << (Exiting == L->getLoopLatch())
+                      << " barrier=" << containsBarrier(L) << '\n');
     return false;
+  }
 
   auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
   auto *ExitCmp = ExitBranch && ExitBranch->isConditional()
