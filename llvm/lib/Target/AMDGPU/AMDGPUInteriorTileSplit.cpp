@@ -701,7 +701,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
 static Value *synthesizeInteriorTileSelector(
     BasicBlock *Preheader, UniformityInfo &UI) {
   CanonicalTileRemainder M, N;
-  Value *Alignment = nullptr;
+  SmallVector<Value *, 4> Alignments;
   bool HasM = false, HasN = false;
   for (Instruction &I : *Preheader) {
     CanonicalTileRemainder Remainder;
@@ -717,13 +717,11 @@ static Value *synthesizeInteriorTileSelector(
       N = Remainder;
       HasN = true;
     }
-    if (isAlignmentCheck(&I, UI)) {
-      if (Alignment)
-        return nullptr;
-      Alignment = &I;
-    }
+    if (isAlignmentCheck(&I, UI))
+      Alignments.push_back(&I);
   }
-  if (!HasM || !HasN || !Alignment || M.Bound->getType() != N.Bound->getType())
+  if (!HasM || !HasN || Alignments.empty() ||
+      M.Bound->getType() != N.Bound->getType())
     return nullptr;
 
   IRBuilder<> Builder(Preheader->getTerminator());
@@ -748,6 +746,10 @@ static Value *synthesizeInteriorTileSelector(
       "interior.n.full");
   NFull = Builder.CreateAnd(NPositive, NFull, "interior.n.tile");
   Value *MNFull = Builder.CreateAnd(MFull, NFull, "interior.mn.full");
+  Value *Alignment = Alignments.front();
+  for (unsigned I = 1; I != Alignments.size(); ++I)
+    Alignment = Builder.CreateAnd(Alignment, Alignments[I],
+                                  "interior.aligned");
   return Builder.CreateAnd(MNFull, Alignment, "interior.full");
 }
 
