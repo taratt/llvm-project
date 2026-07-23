@@ -126,6 +126,7 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/FixIrreducible.h"
 #include "llvm/Transforms/Utils/LCSSA.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Utils/SimplifyLibCalls.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
@@ -1601,8 +1602,11 @@ void AMDGPUPassConfig::addIRPasses() {
     }
 
     if (TM.getTargetTriple().isAMDGCN()) {
-      if (EnableInteriorTileSplit)
+      if (EnableInteriorTileSplit) {
+        addPass(createLoopSimplifyPass());
+        addPass(createLCSSAPass());
         addPass(createAMDGPUInteriorTileSplitLegacy());
+      }
 
       // TODO: May want to move later or split into an early and late one.
       addPass(createAMDGPUCodeGenPreparePass());
@@ -2378,8 +2382,11 @@ void AMDGPUCodeGenPassBuilder::addIRPasses(PassManagerWrapper &PMW) const {
 
     // TODO: Handle EnableAMDGPUAliasAnalysis
 
-    if (EnableInteriorTileSplit)
+    if (EnableInteriorTileSplit) {
+      addFunctionPass(LoopSimplifyPass(), PMW);
+      addFunctionPass(LCSSAPass(), PMW);
       addFunctionPass(AMDGPUInteriorTileSplitPass(), PMW);
+    }
 
     // TODO: May want to move later or split into an early and late one.
     addFunctionPass(AMDGPUCodeGenPreparePass(TM), PMW);
