@@ -852,20 +852,32 @@ static bool canSplitInteriorKLoop(Loop *L,
   auto *ExitCmp = ExitBranch && ExitBranch->isConditional()
                       ? dyn_cast<ICmpInst>(ExitBranch->getCondition())
                       : nullptr;
-  if (!ExitCmp)
+  if (!ExitCmp) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": no conditional exit compare\n");
     return false;
+  }
   BasicBlock *Continue = ExitBranch->getSuccessor(0) == L->getHeader()
                              ? ExitBranch->getSuccessor(0)
                              : ExitBranch->getSuccessor(1) == L->getHeader()
                                    ? ExitBranch->getSuccessor(1)
                                    : nullptr;
-  if (!Continue)
+  if (!Continue) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": no loop-header continue successor\n");
     return false;
+  }
   ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
                                   ? ExitCmp->getPredicate()
                                   : ExitCmp->getInversePredicate();
-  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": unsupported continue predicate\n");
     return false;
+  }
 
   Value *IVValue = ExitCmp->getOperand(0);
   Value *Bound = ExitCmp->getOperand(1);
@@ -879,35 +891,59 @@ static bool canSplitInteriorKLoop(Loop *L,
   if (!Step || Step->getAPInt().getZExtValue() != 32 ||
       !L->isLoopInvariant(Bound) || AR->getLoop() != L ||
       !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
-      !Bound->getType()->isIntegerTy())
+      !Bound->getType()->isIntegerTy()) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": unsupported SCEV recurrence, step, or bound\n");
     return false;
+  }
   PHINode *IV = nullptr;
   for (PHINode &PN : L->getHeader()->phis()) {
     if (PN.getIncomingValueForBlock(Exiting) != IVValue)
       continue;
     if (!isa<ConstantInt>(PN.getIncomingValueForBlock(Preheader)) ||
-        !cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader))->isZero())
+        !cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader))->isZero()) {
+      LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                        << L->getHeader()->getName()
+                        << ": unsupported induction PHI\n");
       return false;
+    }
     IV = &PN;
     break;
   }
-  if (!IV)
+  if (!IV) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": no matching induction PHI\n");
     return false;
+  }
   auto *Inc = dyn_cast<BinaryOperator>(IVValue);
-  if (!Inc || Inc->getOpcode() != Instruction::Add)
+  if (!Inc || Inc->getOpcode() != Instruction::Add) {
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": unsupported induction increment\n");
     return false;
+  }
 
   SmallPtrSet<Value *, 8> HeaderBackedgeValues;
   for (PHINode &PN : L->getHeader()->phis())
     HeaderBackedgeValues.insert(PN.getIncomingValueForBlock(Exiting));
   for (PHINode &PN : Exit->phis())
-    if (!HeaderBackedgeValues.contains(PN.getIncomingValueForBlock(Exiting)))
+    if (!HeaderBackedgeValues.contains(PN.getIncomingValueForBlock(Exiting))) {
+      LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                        << L->getHeader()->getName()
+                        << ": non-header LCSSA liveout\n");
       return false;
+    }
 
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
         cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
+  if (!HasRemovableGuard)
+    LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": no removable guard\n");
   return HasRemovableGuard;
 }
 
