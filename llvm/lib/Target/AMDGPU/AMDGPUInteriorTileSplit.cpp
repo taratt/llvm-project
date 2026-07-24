@@ -568,7 +568,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
                                   ? ExitCmp->getPredicate()
                                   : ExitCmp->getInversePredicate();
-  if (Pred != ICmpInst::ICMP_ULT)
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
     return false;
 
   Value *IVValue = ExitCmp->getOperand(0);
@@ -864,7 +864,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
                                   ? ExitCmp->getPredicate()
                                   : ExitCmp->getInversePredicate();
-  if (Pred != ICmpInst::ICMP_ULT)
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
     return false;
 
   Value *IVValue = ExitCmp->getOperand(0);
