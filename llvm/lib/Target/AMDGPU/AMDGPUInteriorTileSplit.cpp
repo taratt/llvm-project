@@ -1500,15 +1500,24 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   BasicBlock *Preheader = L->getLoopPreheader();
   PHINode *IV;
   Value *Bound;
-  if (!getCanonicalOuterKLoop(L, SE, IV, Bound) || !Preheader)
+  if (!getCanonicalOuterKLoop(L, SE, IV, Bound) || !Preheader) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << (L->getHeader() ? L->getHeader()->getName()
+                                         : "<no-header>")
+                      << ": not a canonical outer K loop\n");
     return false;
+  }
 
   CanonicalTileRemainder M, N;
   SmallVector<Value *, 4> Alignments;
   bool HasM = false, HasN = false;
   if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
-      !HasM || !HasN || Alignments.empty())
+      !HasM || !HasN || Alignments.empty()) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": missing M/N extent or alignment setup\n");
     return false;
+  }
   SmallVector<FullTileBoundCheck, 2> FullChecks{
       {1, M.Bound, M.Base, /*IsSigned=*/true},
       {0, N.Bound, N.Base, /*IsSigned=*/true}};
@@ -1544,12 +1553,20 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     HasNestedStagingLoop = CandidateHasLoop;
     break;
   }
-  if (!StagingEntry)
+  if (!StagingEntry) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": no closed pre-barrier staging region\n");
     return false;
+  }
 
   Value *MNFull = synthesizeInteriorTileSelector(Preheader, UI);
-  if (!MNFull)
+  if (!MNFull) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": could not synthesize full M/N selector\n");
     return false;
+  }
 
   // Put a distinct dispatch block on the incoming edge.  Splitting
   // StagingEntry itself would turn it into the dispatch and make its fallback
