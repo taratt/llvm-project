@@ -235,6 +235,75 @@ k.exit:
   ret void
 }
 
+; Clang can lower the M/N clamp setup in the block immediately before the
+; otherwise-empty K preheader.  That predecessor dominates the preheader, so
+; its values are safe selector inputs without looking through arbitrary CFG.
+define amdgpu_kernel void @canonical_predecessor_setup_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %workitem = call i32 @llvm.amdgcn.workitem.id.x()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.preheader
+
+k.preheader:
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %k.body
+
+k.body:
+  %lane = and i32 %workitem, 127
+  %m.index = add i32 %y.base, %lane
+  %m.in.bounds = icmp slt i32 %m.index, %m
+  br i1 %m.in.bounds, label %k.n.check, label %k.barrier
+
+k.n.check:
+  %n.index = add i32 %x.base, %lane
+  %n.in.bounds = icmp slt i32 %n.index, %n
+  br i1 %n.in.bounds, label %k.k.check, label %k.barrier
+
+k.k.check:
+  %k.remaining.loop = sub i32 %k, %i
+  %k.extent.loop = call i32 @llvm.smin.i32(i32 %k.remaining.loop, i32 32)
+  %k.full.loop = icmp sge i32 %k.extent.loop, 32
+  br i1 %k.full.loop, label %k.barrier, label %k.skip
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.skip:
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; The staging loop is nested inside the 32-wide K loop.  Its offset reaches
 ; the M/N/K guards through affine adds, as in real GEMM IR.  SCEV proves the
 ; inner induction is in [0, 32), allowing only the cloned prefix guards to be
@@ -362,6 +431,8 @@ k.exit:
 ; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
 ; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
 ; CHECK: Split canonical interior K loop in canonical_synthesized_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
+; CHECK: Interior K-loop candidate k.header: preheader=k.preheader HasM=1 HasN=1 canSplit=1
+; CHECK: Split canonical interior K loop in canonical_predecessor_setup_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
@@ -396,6 +467,19 @@ k.exit:
 ; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.tail.start, %k.preheader ]
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
+; CFG-LABEL: k.preheader:
+; CFG: %interior.m.full = icmp sle i32 %y.base, %{{.*}}
+; CFG: %interior.n.full = icmp sle i32 %x.base, %{{.*}}
+; CFG: %interior.full = and i1 %interior.mn.full, %out.aligned
+; CFG: br i1 %interior.k.full, label %k.preheader.split.interior, label %k.preheader.split
+; CFG-LABEL: k.body.interior:
+; CFG: br label %k.n.check.interior
+; CFG-LABEL: k.n.check.interior:
+; CFG: br label %k.k.check.interior
+; CFG-LABEL: k.k.check.interior:
+; CFG: br label %k.barrier.interior
+
+; CFG-LABEL: define amdgpu_kernel void @canonical_predecessor_setup_k_loop(
 ; CFG-LABEL: k.preheader:
 ; CFG: %interior.m.full = icmp sle i32 %y.base, %{{.*}}
 ; CFG: %interior.n.full = icmp sle i32 %x.base, %{{.*}}

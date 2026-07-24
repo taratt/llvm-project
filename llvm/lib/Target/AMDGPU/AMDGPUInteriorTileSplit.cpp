@@ -743,32 +743,52 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   return true;
 }
 
-/// Build the CTA-uniform M/N/alignment selector from the canonical clamp
-/// remainders in the K loop's actual preheader.  Keeping this local to the
-/// preheader avoids reusing an unrelated clamp from another tiled region.
-static Value *synthesizeInteriorTileSelector(
-    BasicBlock *Preheader, UniformityInfo &UI) {
+/// Collect the canonical setup values immediately before a K loop.  Clang may
+/// put them in the loop preheader or in its sole predecessor when it splits
+/// the unconditional edge into the loop.  Do not search arbitrary dominators:
+/// an unrelated tiled region could otherwise provide a plausible M/N pair.
+static bool collectInteriorTileSetup(
+    BasicBlock *Preheader, UniformityInfo &UI, CanonicalTileRemainder &M,
+    CanonicalTileRemainder &N, SmallVectorImpl<Value *> &Alignments,
+    bool &HasM, bool &HasN) {
+  if (!Preheader)
+    return false;
+
+  SmallVector<BasicBlock *, 2> SetupBlocks;
+  if (BasicBlock *Setup = Preheader->getSinglePredecessor())
+    SetupBlocks.push_back(Setup);
+  SetupBlocks.push_back(Preheader);
+  for (BasicBlock *BB : SetupBlocks) {
+    for (Instruction &I : *BB) {
+      CanonicalTileRemainder Remainder;
+      if (getClampedTileExtent(&I, 1, Remainder)) {
+        if (HasM)
+          return false;
+        M = Remainder;
+        HasM = true;
+      }
+      if (getClampedTileExtent(&I, 0, Remainder)) {
+        if (HasN)
+          return false;
+        N = Remainder;
+        HasN = true;
+      }
+      if (isAlignmentCheck(&I, UI))
+        Alignments.push_back(&I);
+    }
+  }
+  return true;
+}
+
+/// Build the CTA-uniform M/N/alignment selector from the canonical setup
+/// values for the K loop.
+static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
+                                              UniformityInfo &UI) {
   CanonicalTileRemainder M, N;
   SmallVector<Value *, 4> Alignments;
   bool HasM = false, HasN = false;
-  for (Instruction &I : *Preheader) {
-    CanonicalTileRemainder Remainder;
-    if (getClampedTileExtent(&I, 1, Remainder)) {
-      if (HasM)
-        return nullptr;
-      M = Remainder;
-      HasM = true;
-    }
-    if (getClampedTileExtent(&I, 0, Remainder)) {
-      if (HasN)
-        return nullptr;
-      N = Remainder;
-      HasN = true;
-    }
-    if (isAlignmentCheck(&I, UI))
-      Alignments.push_back(&I);
-  }
-  if (!HasM || !HasN || Alignments.empty() ||
+  if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
+      !HasM || !HasN || Alignments.empty() ||
       M.Bound->getType() != N.Bound->getType())
     return nullptr;
 
@@ -1100,29 +1120,27 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
   // then split the preheader so the original block becomes the dispatch.
   for (Loop *L : Loops) {
     BasicBlock *Preheader = L->getLoopPreheader();
-    if (!Preheader || !Preheader->getSinglePredecessor())
-      continue;
-
     SmallVector<FullTileBoundCheck, 2> FullChecks;
     bool HasM = false, HasN = false;
-    for (Instruction &I : *Preheader) {
-      CanonicalTileRemainder Remainder;
-      if (getClampedTileExtent(&I, 1, Remainder)) {
-        if (HasM)
-          break;
-        FullChecks.push_back(
-            {1, Remainder.Bound, Remainder.Base, /*IsSigned=*/true});
-        HasM = true;
-      }
-      if (getClampedTileExtent(&I, 0, Remainder)) {
-        if (HasN)
-          break;
-        FullChecks.push_back(
-            {0, Remainder.Bound, Remainder.Base, /*IsSigned=*/true});
-        HasN = true;
-      }
+    CanonicalTileRemainder M, N;
+    SmallVector<Value *, 4> Alignments;
+    const bool HasCanonicalSetup =
+        collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN);
+    if (HasCanonicalSetup && HasM && HasN) {
+      FullChecks.push_back({1, M.Bound, M.Base, /*IsSigned=*/true});
+      FullChecks.push_back({0, N.Bound, N.Base, /*IsSigned=*/true});
     }
-    if (!HasM || !HasN || !canSplitInteriorKLoop(L, FullChecks, DT, SE))
+    const bool CanSplit = Preheader && Preheader->getSinglePredecessor() &&
+                          HasCanonicalSetup && HasM && HasN &&
+                          canSplitInteriorKLoop(L, FullChecks, DT, SE);
+    LLVM_DEBUG(dbgs() << "Interior K-loop candidate "
+                      << (L->getHeader() ? L->getHeader()->getName()
+                                         : "<none>")
+                      << ": preheader="
+                      << (Preheader ? Preheader->getName() : "<none>")
+                      << " HasM=" << HasM << " HasN=" << HasN
+                      << " canSplit=" << CanSplit << '\n');
+    if (!CanSplit)
       continue;
 
     Value *Selector = synthesizeInteriorTileSelector(Preheader, UI);
