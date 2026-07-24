@@ -1216,12 +1216,15 @@ canSplitInteriorKLoop(Loop *L, ArrayRef<FullTileBoundCheck> FullChecks,
   return HasRemovableGuard;
 }
 
-/// Returns a closed, acyclic, single-entry/single-exit staging region.  The
-/// barrier is intentionally outside the region: it must remain shared by the
-/// fast and edge paths.
+/// Returns a closed, single-entry/single-exit staging region.  The barrier is
+/// intentionally outside the region: it must remain shared by the fast and
+/// edge paths.  The staging-only outer-K path may opt into nested staging
+/// loops, but never clones the enclosing outer-K loop.
 static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
                                     SmallPtrSetImpl<BasicBlock *> &Region,
-                                    BasicBlock *&Barrier) {
+                                    BasicBlock *&Barrier,
+                                    bool AllowNestedLoops = false,
+                                    bool *ContainsLoop = nullptr) {
   if (isBarrierBlock(Entry) || Entry->getSinglePredecessor() != Dispatch)
     return false;
 
@@ -1264,8 +1267,34 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
     }
   }
 
-  // A cycle would be part of the outer K loop (or another loop) and must not
-  // be cloned by this pass.
+  // Every cloned block must retain a path to the shared barrier.  In
+  // particular, accepting an isolated nested cycle here would make the fast
+  // path fail to reconverge even though the region has no CFG exit besides the
+  // barrier.
+  SmallPtrSet<BasicBlock *, 8> ReachesBarrier;
+  SmallVector<BasicBlock *, 8> ReverseWorklist;
+  for (BasicBlock *Predecessor : predecessors(Barrier))
+    if (Region.contains(Predecessor) &&
+        ReachesBarrier.insert(Predecessor).second)
+      ReverseWorklist.push_back(Predecessor);
+  while (!ReverseWorklist.empty()) {
+    BasicBlock *BB = ReverseWorklist.pop_back_val();
+    for (BasicBlock *Predecessor : predecessors(BB))
+      if (Region.contains(Predecessor) &&
+          ReachesBarrier.insert(Predecessor).second)
+        ReverseWorklist.push_back(Predecessor);
+  }
+  if (ReachesBarrier.size() != Region.size()) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << Entry->getName()
+                      << ": not every staging block reaches the shared barrier\n");
+    return false;
+  }
+
+  // The normal staging path remains acyclic.  The outer-K staging path permits
+  // cycles because real GEMM staging contains nested load loops; the closed
+  // region proof still prevents the enclosing K loop, barrier, compute, and
+  // latch from entering the clone.
   SmallPtrSet<BasicBlock *, 8> Visiting;
   SmallPtrSet<BasicBlock *, 8> Visited;
   auto HasCycle = [&](auto &&Self, BasicBlock *BB) -> bool {
@@ -1279,7 +1308,55 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
     Visiting.erase(BB);
     return false;
   };
-  return HasSafetyBranch && !HasCycle(HasCycle, Entry);
+  bool HasCycleInRegion = HasCycle(HasCycle, Entry);
+  if (ContainsLoop)
+    *ContainsLoop = HasCycleInRegion;
+  return HasSafetyBranch && (AllowNestedLoops || !HasCycleInRegion);
+}
+
+/// Prove that sharing Barrier does not require a merge of a value produced by
+/// the cloned staging graph.  A direct use in the barrier or compute phase
+/// would otherwise refer only to the fallback definition on the cloned path.
+static bool canCloneStagingRegion(
+    BasicBlock *Entry, const SmallPtrSetImpl<BasicBlock *> &Region,
+    BasicBlock *Barrier, ArrayRef<FullTileBoundCheck> FullChecks,
+    ArrayRef<Value *> Alignments, PHINode *IV, Value *Bound,
+    ScalarEvolution &SE) {
+  if (isa<PHINode>(&Barrier->front())) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << Entry->getName()
+                      << ": shared barrier PHI requires a path merge\n");
+    return false;
+  }
+
+  for (BasicBlock *BB : Region) {
+    for (Instruction &I : *BB) {
+      for (User *U : I.users()) {
+        auto *UseI = dyn_cast<Instruction>(U);
+        if (UseI && !Region.contains(UseI->getParent())) {
+          LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                            << Entry->getName() << ": staging live-out "
+                            << I.getName() << " reaches "
+                            << UseI->getParent()->getName()
+                            << " and requires a path merge\n");
+          return false;
+        }
+      }
+    }
+  }
+
+  bool HasRemovableSafetyBranch = false;
+  for (BasicBlock *BB : Region) {
+    GuardOutcome Outcome;
+    HasRemovableSafetyBranch |= getRemovablePrefixGuardOutcome(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
+        Alignments, SE, Outcome);
+  }
+  if (!HasRemovableSafetyBranch)
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << Entry->getName()
+                      << ": no removable staging safety branch\n");
+  return HasRemovableSafetyBranch;
 }
 
 /// Return the induction and bound for the only outer K loop this POC accepts.
@@ -1354,20 +1431,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
                                ArrayRef<FullTileBoundCheck> FullChecks,
                                ArrayRef<Value *> Alignments, PHINode *IV,
                                Value *Bound, ScalarEvolution &SE) {
-  // Cloning incoming values into a PHI in the shared barrier would require
-  // proving the corresponding values are valid on both paths.  Reject that
-  // shape rather than manufacture a potentially invalid incoming value.
-  if (isa<PHINode>(&Barrier->front()))
-    return false;
-
-  bool HasRemovableSafetyBranch = false;
-  for (BasicBlock *BB : Region) {
-    GuardOutcome Outcome;
-    HasRemovableSafetyBranch |= getRemovablePrefixGuardOutcome(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
-        Alignments, SE, Outcome);
-  }
-  if (!HasRemovableSafetyBranch)
+  if (!canCloneStagingRegion(Entry, Region, Barrier, FullChecks, Alignments,
+                             IV, Bound, SE))
     return false;
 
   unsigned EntrySuccessor = 0;
@@ -1453,6 +1518,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   BasicBlock *StagingEntry = nullptr;
   BasicBlock *StagingPredecessor = nullptr;
   BasicBlock *Barrier = nullptr;
+  bool HasNestedStagingLoop = false;
   for (BasicBlock *BB : L->blocks()) {
     if (BB == L->getHeader() || !BB->getFirstNonPHI())
       continue;
@@ -1461,15 +1527,21 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
       continue;
     SmallPtrSet<BasicBlock *, 8> Candidate;
     BasicBlock *CandidateBarrier = nullptr;
-    if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier) ||
+    bool CandidateHasLoop = false;
+    if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
+                                 /*AllowNestedLoops=*/true,
+                                 &CandidateHasLoop) ||
         !L->contains(CandidateBarrier) ||
         CandidateBarrier->getSingleSuccessor() == nullptr ||
         !L->contains(CandidateBarrier->getSingleSuccessor()) ||
-        Candidate.contains(CandidateBarrier->getSingleSuccessor()))
+        Candidate.contains(CandidateBarrier->getSingleSuccessor()) ||
+        !canCloneStagingRegion(BB, Candidate, CandidateBarrier, FullChecks,
+                               Alignments, IV, Bound, SE))
       continue;
     StagingEntry = BB;
     StagingPredecessor = Dispatch;
     Barrier = CandidateBarrier;
+    HasNestedStagingLoop = CandidateHasLoop;
     break;
   }
   if (!StagingEntry)
@@ -1489,7 +1561,8 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
   BasicBlock *SharedBarrier = nullptr;
-  if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier) ||
+  if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier,
+                               /*AllowNestedLoops=*/true) ||
       SharedBarrier != Barrier)
     llvm_unreachable("preflighted staging CFG changed unexpectedly");
 
@@ -1509,9 +1582,13 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   BranchInst::Create(StagingEntry, StagingEntry, RunFast, DispatchBranch);
   DispatchBranch->eraseFromParent();
 
-  return cloneStagingRegion(F, cast<BranchInst>(Dispatch->getTerminator()),
-                            StagingEntry, Region, SharedBarrier, FullChecks,
-                            Alignments, IV, Bound, SE);
+  bool Changed = cloneStagingRegion(
+      F, cast<BranchInst>(Dispatch->getTerminator()), StagingEntry, Region,
+      SharedBarrier, FullChecks, Alignments, IV, Bound, SE);
+  if (Changed && HasNestedStagingLoop)
+    LLVM_DEBUG(dbgs() << "Cloned nested-loop staging region in " << F.getName()
+                      << "; outer K latch and shared barrier were retained\n");
+  return Changed;
 }
 
 static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
@@ -1561,7 +1638,8 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 
   // The staging-only POC deliberately does not clone an outer K loop.  It
   // inserts a CTA-uniform dispatch inside that loop and clones only the
-  // acyclic guarded staging graph up to its first shared barrier.
+  // guarded staging graph (including any nested staging loops) up to its
+  // first shared barrier.
   SmallVector<Loop *, 4> Loops = LI.getLoopsInPreorder();
   for (Loop *L : Loops) {
     if (splitOuterKStaging(F, L, UI, LI, DT, SE))

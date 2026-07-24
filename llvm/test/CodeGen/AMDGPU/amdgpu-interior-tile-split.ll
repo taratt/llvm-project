@@ -528,8 +528,20 @@ edge.fallback:
   br label %k.barrier
 
 stage.full:
-  %stage.work = add i32 %i, 2
-  br label %k.barrier
+  br label %stage.inner.header
+
+stage.inner.header:
+  %stage.j = phi i32 [ 0, %stage.full ], [ %stage.j.next, %stage.inner.latch ]
+  br label %stage.inner.body
+
+stage.inner.body:
+  %stage.work = add i32 %i, %stage.j
+  br label %stage.inner.latch
+
+stage.inner.latch:
+  %stage.j.next = add nuw i32 %stage.j, 1
+  %stage.more = icmp ult i32 %stage.j.next, 2
+  br i1 %stage.more, label %stage.inner.header, label %k.barrier
 
 k.barrier:
   call void @llvm.amdgcn.s.barrier()
@@ -598,6 +610,7 @@ k.exit:
 }
 
 ; CHECK: Potential interior-tile boundary check in candidate:
+; CHECK: Cloned nested-loop staging region in staging_only_outer_k_loop; outer K latch and shared barrier were retained
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
 ; CFG: br i1 %full, label %staging.interior, label %edge
@@ -629,7 +642,16 @@ k.exit:
 ; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked.interior, i32 0
 ; CFG: br label %stage.full.interior
 ; CFG-LABEL: stage.full.interior:
-; CFG: br label %k.barrier
+; CFG: br label %stage.inner.header.interior
+; CFG-LABEL: stage.inner.header.interior:
+; CFG: %stage.j.interior = phi i32 [ 0, %stage.full.interior ], [ %stage.j.next.interior, %stage.inner.latch.interior ]
+; CFG: br label %stage.inner.body.interior
+; CFG-LABEL: stage.inner.body.interior:
+; CFG: br label %stage.inner.latch.interior
+; CFG-LABEL: stage.inner.latch.interior:
+; CFG: br i1 %stage.more.interior, label %stage.inner.header.interior, label %k.barrier
+; The clone contains no barrier; both paths converge at the original one.
+; CFG-NOT: k.barrier.interior
 ; CFG-NOT: compute.interior
 ; CFG-NOT: k.latch.interior
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_one_k_loop(
