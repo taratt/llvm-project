@@ -305,9 +305,10 @@ k.exit:
 }
 
 ; The staging loop is nested inside the 32-wide K loop.  Its offset reaches
-; the M/N/K guards through affine adds, as in real GEMM IR.  SCEV proves the
-; inner induction is in [0, 32), allowing only the cloned prefix guards to be
-; removed.
+; the M/N/K guards through affine adds, as in real GEMM IR.  The combined
+; select is the short-circuit lowering of K-in-bounds && N-in-bounds.  Only
+; the clone's true-path select guard is removed; the original edge stays
+; guarded.
 define amdgpu_kernel void @canonical_nested_staging_k_loop(
     ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
 entry:
@@ -353,12 +354,13 @@ stage.m.check:
 stage.n.check:
   %n.index = add i32 %x.base, %stage.i
   %n.in.bounds = icmp slt i32 %n.index, %n
-  br i1 %n.in.bounds, label %stage.k.check, label %stage.latch
-
-stage.k.check:
   %k.index = add i32 %i, %stage.i
   %k.in.bounds = icmp slt i32 %k.index, %k
-  br i1 %k.in.bounds, label %stage.barrier, label %stage.latch
+  %or.cond = select i1 %k.in.bounds, i1 %n.in.bounds, i1 false
+  br i1 %or.cond, label %stage.k.check, label %stage.latch
+
+stage.k.check:
+  br label %stage.barrier
 
 stage.barrier:
   call void @llvm.amdgcn.s.barrier()
@@ -433,7 +435,7 @@ k.exit:
 ; CHECK: Split canonical interior K loop in canonical_synthesized_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Interior K-loop candidate k.header: preheader=k.preheader HasM=1 HasN=1 canSplit=1
 ; CHECK: Split canonical interior K loop in canonical_predecessor_setup_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
-; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 2 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -499,3 +501,6 @@ k.exit:
 ; CFG: br label %stage.k.check.interior
 ; CFG-LABEL: stage.k.check.interior:
 ; CFG: br label %stage.barrier.interior
+; CFG-LABEL: stage.n.check:
+; CFG: %or.cond = select i1 %k.in.bounds, i1 %n.in.bounds, i1 false
+; CFG: br i1 %or.cond, label %stage.k.check, label %stage.latch

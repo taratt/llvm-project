@@ -475,12 +475,105 @@ static bool isNestedKBoundCheck(Value *V, Value *IV, Value *Bound,
   return false;
 }
 
+/// The real GEMM staging loop can retain a syntactic loop counter range after
+/// SCEV has lost its range (usually through a sign extension).  Accept only a
+/// zero-based, no-wrap induction whose latch continues while its increment is
+/// below Limit.  This proves every value of the PHI is in [0, Limit).
+static bool isKnownZeroBasedOffsetBelow(Value *V, uint64_t Limit,
+                                        LoopInfo &LI) {
+  while (auto *Cast = dyn_cast<CastInst>(V)) {
+    if (Cast->getOpcode() != Instruction::ZExt &&
+        Cast->getOpcode() != Instruction::SExt)
+      return false;
+    V = Cast->getOperand(0);
+  }
+
+  auto *IV = dyn_cast<PHINode>(V);
+  Loop *L = IV ? LI.getLoopFor(IV->getParent()) : nullptr;
+  BasicBlock *Preheader = L ? L->getLoopPreheader() : nullptr;
+  BasicBlock *Latch = L ? L->getLoopLatch() : nullptr;
+  if (!L || !Preheader || !Latch || !L->isLoopSimplifyForm())
+    return false;
+
+  auto *Start = dyn_cast<ConstantInt>(IV->getIncomingValueForBlock(Preheader));
+  auto *Next = dyn_cast<BinaryOperator>(IV->getIncomingValueForBlock(Latch));
+  if (!Start || !Start->isZero() || !Next ||
+      Next->getOpcode() != Instruction::Add || !Next->hasNoUnsignedWrap())
+    return false;
+  Value *StepValue = Next->getOperand(0) == IV ? Next->getOperand(1)
+                                                : Next->getOperand(0);
+  auto *Step = dyn_cast<ConstantInt>(StepValue);
+  if (!Step || Step->isZero() || Step->isNegative())
+    return false;
+
+  auto *LatchBranch = dyn_cast<BranchInst>(Latch->getTerminator());
+  auto *Cmp = LatchBranch && LatchBranch->isConditional()
+                  ? dyn_cast<ICmpInst>(LatchBranch->getCondition())
+                  : nullptr;
+  if (!Cmp)
+    return false;
+  BasicBlock *Continue = LatchBranch->getSuccessor(0) == L->getHeader()
+                             ? LatchBranch->getSuccessor(0)
+                             : LatchBranch->getSuccessor(1) == L->getHeader()
+                                   ? LatchBranch->getSuccessor(1)
+                                   : nullptr;
+  if (!Continue)
+    return false;
+  ICmpInst::Predicate Pred = LatchBranch->getSuccessor(0) == Continue
+                                  ? Cmp->getPredicate()
+                                  : Cmp->getInversePredicate();
+  auto *End = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+  return Pred == ICmpInst::ICMP_ULT && Cmp->getOperand(0) == Next && End &&
+         End->getZExtValue() <= Limit;
+}
+
+/// Match the select form of `nested-k-check && full-n-check` emitted by the
+/// real GEMM staging loop:
+///   select i1 (k0 + offset < K), i1 (NBase + lane < N), i1 false
+/// The select is intentionally accepted only in this polarity, so replacing
+/// its branch with successor zero removes only the proven true-path guard in
+/// the cloned prefix.
+static bool isNestedKAndNBoundCheck(Value *V, Value *IV, Value *Bound,
+                                    ArrayRef<FullTileBoundCheck> FullChecks,
+                                    ScalarEvolution &SE, LoopInfo &LI) {
+  auto *Select = dyn_cast<SelectInst>(V);
+  auto *FalseValue = Select ? dyn_cast<ConstantInt>(Select->getFalseValue())
+                            : nullptr;
+  if (!FalseValue || !FalseValue->isZero())
+    return false;
+
+  auto *KCmp = dyn_cast<ICmpInst>(Select->getCondition());
+  auto *NCmp = dyn_cast<ICmpInst>(Select->getTrueValue());
+  if (!KCmp || !NCmp || KCmp->getPredicate() != ICmpInst::ICMP_SLT ||
+      KCmp->getOperand(1) != Bound)
+    return false;
+  auto *KAdd = dyn_cast<BinaryOperator>(KCmp->getOperand(0));
+  if (!KAdd || KAdd->getOpcode() != Instruction::Add)
+    return false;
+  Value *Offset = KAdd->getOperand(0) == IV
+                      ? KAdd->getOperand(1)
+                      : KAdd->getOperand(1) == IV ? KAdd->getOperand(0)
+                                                   : nullptr;
+  if (!Offset ||
+      (!isUnsignedOffsetBelow(Offset, 32, SE) &&
+       !isKnownZeroBasedOffsetBelow(Offset, 32, LI)))
+    return false;
+
+  for (const FullTileBoundCheck &Full : FullChecks)
+    if (Full.Dimension == 0 && isPerLaneTileBoundCheck(NCmp, Full, SE))
+      return true;
+  return false;
+}
+
 static bool isRemovablePrefixGuard(
     const BranchInst *Branch, Value *IV, Value *Bound,
-    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE) {
+    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE,
+    LoopInfo &LI) {
   return Branch->isConditional() &&
          (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
           isNestedKBoundCheck(Branch->getCondition(), IV, Bound, SE) ||
+          isNestedKAndNBoundCheck(Branch->getCondition(), IV, Bound,
+                                   FullChecks, SE, LI) ||
           isRemovableSafetyBranch(Branch, FullChecks, SE));
 }
 
@@ -618,7 +711,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE, LI);
   if (!HasRemovableGuard)
     return false;
 
@@ -671,12 +764,13 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   for (BasicBlock *BB : L->blocks()) {
     BasicBlock *PrefixBB = cast<BasicBlock>(VMap[BB]);
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE))
+    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE,
+                                LI))
       continue;
 
     auto *PrefixBranch = cast<BranchInst>(PrefixBB->getTerminator());
     if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound,
-                                FullChecks, SE))
+                                FullChecks, SE, LI))
       llvm_unreachable("cloned prefix guard must retain canonical shape");
     BranchInst::Create(PrefixBranch->getSuccessor(0), PrefixBranch);
     PrefixBranch->eraseFromParent();
@@ -939,7 +1033,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE, LI);
   if (!HasRemovableGuard)
     LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
                       << L->getHeader()->getName()
