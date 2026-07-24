@@ -33,6 +33,8 @@ declare i32 @llvm.amdgcn.workgroup.id.y()
 declare void @llvm.amdgcn.s.barrier()
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
+declare i64 @llvm.smax.i64(i64, i64)
+declare i64 @llvm.smin.i64(i64, i64)
 declare i32 @llvm.umin.i32(i32, i32)
 
 define amdgpu_kernel void @canonical_staging(ptr addrspace(1) %out, i32 %m,
@@ -317,17 +319,22 @@ entry:
 dispatch:
   %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
   %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
-  %x.base = shl i32 %workgroup.x, 7
-  %y.base = shl i32 %workgroup.y, 7
+  %workitem = call i32 @llvm.amdgcn.workitem.id.x()
+  %x.base.i32 = shl i32 %workgroup.x, 7
+  %y.base.i32 = shl i32 %workgroup.y, 7
+  %x.base = sext i32 %x.base.i32 to i64
+  %y.base = sext i32 %y.base.i32 to i64
   br label %k.preheader
 
 k.preheader:
-  %n.remaining = sub i32 %n, %x.base
-  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
-  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
-  %m.remaining = sub i32 %m, %y.base
-  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
-  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %n64 = sext i32 %n to i64
+  %m64 = sext i32 %m to i64
+  %n.remaining = sub i64 %n64, %x.base
+  %n.nonnegative = call i64 @llvm.smax.i64(i64 %n.remaining, i64 0)
+  %n.extent = call i64 @llvm.smin.i64(i64 %n.nonnegative, i64 128)
+  %m.remaining = sub i64 %m64, %y.base
+  %m.nonnegative = call i64 @llvm.smax.i64(i64 %m.remaining, i64 0)
+  %m.extent = call i64 @llvm.smin.i64(i64 %m.nonnegative, i64 128)
   %k.remaining = sub i32 %k, 0
   %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
   %out.int = ptrtoint ptr addrspace(1) %out to i64
@@ -347,13 +354,21 @@ stage.header:
   br label %stage.m.check
 
 stage.m.check:
-  %m.index = add i32 %y.base, %stage.i
-  %m.in.bounds = icmp slt i32 %m.index, %m
+  %stage.i64 = sext i32 %stage.i to i64
+  %m.index = add i64 %y.base, %stage.i64
+  %m.in.bounds = icmp slt i64 %m.index, %m64
   br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
 
 stage.n.check:
-  %n.index = add i32 %x.base, %stage.i
-  %n.in.bounds = icmp slt i32 %n.index, %n
+  ; This is the real GEMM N guard shape.  The outer staging offset and
+  ; inner lane offset are summed in i32, then sign-extended to the N index.
+  ; Both have a maximum of 31, so the tile-relative offset is below 128.
+  %cond215 = add nsw i32 %stage.i, 0
+  %conv286 = and i32 %workitem, 31
+  %add288 = add nsw i32 %cond215, %conv286
+  %conv293 = sext i32 %add288 to i64
+  %add294 = add nsw i64 %x.base, %conv293
+  %n.in.bounds = icmp slt i64 %add294, %n64
   %k.index = add i32 %i, %stage.i
   %k.in.bounds = icmp slt i32 %k.index, %k
   %or.cond = select i1 %k.in.bounds, i1 %n.in.bounds, i1 false

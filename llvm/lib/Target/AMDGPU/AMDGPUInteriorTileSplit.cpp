@@ -248,6 +248,61 @@ static bool isUnsignedOffsetBelow(Value *Offset, uint64_t Limit,
   return Maximum.ult(APInt(Maximum.getBitWidth(), Limit));
 }
 
+/// Return a proven unsigned maximum below Limit.  The SCEV range is normally
+/// enough, but the real N staging index is a signed extension of an affine
+/// sum for which SCEV can lose the range.  Reconstruct only that lossless
+/// shape: nonnegative bounded terms, casts preserving their small value, and
+/// additions whose mathematical sum remains below Limit.
+static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
+                                          ScalarEvolution &SE,
+                                          uint64_t &Maximum) {
+  if (!Offset->getType()->isIntegerTy())
+    return false;
+
+  APInt SCEVMaximum = SE.getUnsignedRangeMax(SE.getSCEV(Offset));
+  unsigned Width = SCEVMaximum.getBitWidth();
+  if (Width < 64 && Limit >= (uint64_t(1) << Width)) {
+    Maximum = SCEVMaximum.getZExtValue();
+    return true;
+  }
+  if (Width <= 64 &&
+      SCEVMaximum.ult(APInt(SCEVMaximum.getBitWidth(), Limit))) {
+    Maximum = SCEVMaximum.getZExtValue();
+    return true;
+  }
+
+  if (auto *Cast = dyn_cast<CastInst>(Offset)) {
+    if (Cast->getOpcode() != Instruction::ZExt &&
+        Cast->getOpcode() != Instruction::SExt)
+      return false;
+    uint64_t OperandMaximum;
+    if (!getUnsignedOffsetMaximumBelow(Cast->getOperand(0), Limit, SE,
+                                       OperandMaximum))
+      return false;
+    if (Cast->getOpcode() == Instruction::SExt) {
+      unsigned Width = Cast->getOperand(0)->getType()->getIntegerBitWidth();
+      if (Width > 64 ||
+          OperandMaximum >= (uint64_t(1) << (Width - 1)))
+        return false;
+    }
+    Maximum = OperandMaximum;
+    return true;
+  }
+
+  auto *Add = dyn_cast<BinaryOperator>(Offset);
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+  uint64_t LHSMaximum, RHSMaximum;
+  if (!getUnsignedOffsetMaximumBelow(Add->getOperand(0), Limit, SE,
+                                     LHSMaximum) ||
+      !getUnsignedOffsetMaximumBelow(Add->getOperand(1), Limit, SE,
+                                     RHSMaximum) ||
+      LHSMaximum > Limit - 1 - RHSMaximum)
+    return false;
+  Maximum = LHSMaximum + RHSMaximum;
+  return true;
+}
+
 /// Match `Base + Offset < Bound` for the exact Base/Bound pair selected by
 /// Full.  Direct lane forms use the architectural lane proof; nested staging
 /// forms use SCEV's unsigned range for their affine offset.
@@ -277,7 +332,7 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   auto IsBoundedOffset = [&](Value *Offset) {
     uint64_t Maximum;
     return (getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
-           isUnsignedOffsetBelow(Offset, 128, SE);
+           getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum);
   };
   return (LHS == Full.Base && IsBoundedOffset(RHS)) ||
          (RHS == Full.Base && IsBoundedOffset(LHS));
