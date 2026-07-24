@@ -975,7 +975,8 @@ static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
 /// splitInteriorKLoop are consequently guaranteed by this preflight.
 static bool canSplitInteriorKLoop(Loop *L,
                                   ArrayRef<FullTileBoundCheck> FullChecks,
-                                  DominatorTree &DT, ScalarEvolution &SE) {
+                                  LoopInfo &LI, DominatorTree &DT,
+                                  ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
@@ -1317,7 +1318,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     }
     const bool CanSplit = Preheader && Preheader->getSinglePredecessor() &&
                           HasCanonicalSetup && HasM && HasN &&
-                          canSplitInteriorKLoop(L, FullChecks, DT, SE);
+                          canSplitInteriorKLoop(L, FullChecks, LI, DT, SE);
     LLVM_DEBUG(dbgs() << "Interior K-loop candidate "
                       << (L->getHeader() ? L->getHeader()->getName()
                                          : "<none>")
