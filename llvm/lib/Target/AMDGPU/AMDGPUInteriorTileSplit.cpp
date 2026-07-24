@@ -530,67 +530,111 @@ static bool isNestedKBoundCheck(Value *V, Value *IV, Value *Bound,
   return false;
 }
 
-/// The real GEMM staging loop can retain a syntactic loop counter range after
-/// SCEV has lost its range (usually through a sign extension).  Accept only a
-/// zero-based, no-wrap induction whose latch continues while its increment is
-/// below Limit.  This proves every value of the PHI is in [0, Limit).
-static bool isKnownZeroBasedOffsetBelow(Value *V, uint64_t Limit,
-                                        LoopInfo &LI) {
-  while (auto *Cast = dyn_cast<CastInst>(V)) {
-    if (Cast->getOpcode() != Instruction::ZExt &&
-        Cast->getOpcode() != Instruction::SExt)
-      return false;
-    V = Cast->getOperand(0);
-  }
-
-  auto *IV = dyn_cast<PHINode>(V);
-  Loop *L = IV ? LI.getLoopFor(IV->getParent()) : nullptr;
-  BasicBlock *Preheader = L ? L->getLoopPreheader() : nullptr;
-  BasicBlock *Latch = L ? L->getLoopLatch() : nullptr;
-  if (!L || !Preheader || !Latch || !L->isLoopSimplifyForm())
+/// Match the one quotient/remainder spelling used by gemm_ts_outer:
+///   div = udiv idx, divisor
+///   rem = idx - div * divisor
+///   select (k0 + trunc(div) < K), (NBase + sext(cond + trunc(rem)) < N), 0
+///
+/// This is deliberately not a general div/rem recognizer.  In particular,
+/// the divisor must be a positive constant, the index must be nonnegative and
+/// below divisor * 32, and every reconstructed arithmetic operation must be
+/// marked no-wrap.  Together these local facts prove trunc(div) < 32 and
+/// cond + trunc(rem) < 128.
+static bool getPositiveNoWrapConstantSub(Value *V, uint64_t &Result) {
+  auto *Sub = dyn_cast<BinaryOperator>(V);
+  if (!Sub || Sub->getOpcode() != Instruction::Sub || !Sub->hasNoSignedWrap())
     return false;
-
-  auto *Start = dyn_cast<ConstantInt>(IV->getIncomingValueForBlock(Preheader));
-  auto *Next = dyn_cast<BinaryOperator>(IV->getIncomingValueForBlock(Latch));
-  if (!Start || !Start->isZero() || !Next ||
-      Next->getOpcode() != Instruction::Add || !Next->hasNoUnsignedWrap())
+  auto *LHS = dyn_cast<ConstantInt>(Sub->getOperand(0));
+  auto *RHS = dyn_cast<ConstantInt>(Sub->getOperand(1));
+  if (!LHS || !RHS || LHS->isNegative() || RHS->isNegative() ||
+      LHS->getValue().ule(RHS->getValue()))
     return false;
-  Value *StepValue = Next->getOperand(0) == IV ? Next->getOperand(1)
-                                                : Next->getOperand(0);
-  auto *Step = dyn_cast<ConstantInt>(StepValue);
-  if (!Step || Step->isZero() || Step->isNegative())
-    return false;
-
-  auto *LatchBranch = dyn_cast<BranchInst>(Latch->getTerminator());
-  auto *Cmp = LatchBranch && LatchBranch->isConditional()
-                  ? dyn_cast<ICmpInst>(LatchBranch->getCondition())
-                  : nullptr;
-  if (!Cmp)
-    return false;
-  BasicBlock *Continue = LatchBranch->getSuccessor(0) == L->getHeader()
-                             ? LatchBranch->getSuccessor(0)
-                             : LatchBranch->getSuccessor(1) == L->getHeader()
-                                   ? LatchBranch->getSuccessor(1)
-                                   : nullptr;
-  if (!Continue)
-    return false;
-  ICmpInst::Predicate Pred = LatchBranch->getSuccessor(0) == Continue
-                                  ? Cmp->getPredicate()
-                                  : Cmp->getInversePredicate();
-  auto *End = dyn_cast<ConstantInt>(Cmp->getOperand(1));
-  return Pred == ICmpInst::ICMP_ULT && Cmp->getOperand(0) == Next && End &&
-         End->getZExtValue() <= Limit;
+  Result = LHS->getZExtValue() - RHS->getZExtValue();
+  return Result != 0;
 }
 
-/// Match the select form of `nested-k-check && full-n-check` emitted by the
-/// real GEMM staging loop:
-///   select i1 (k0 + offset < K), i1 (NBase + lane < N), i1 false
-/// The select is intentionally accepted only in this polarity, so replacing
-/// its branch with successor zero removes only the proven true-path guard in
-/// the cloned prefix.
+static bool isGemmTSOuterQuotientRemainderCheck(
+    Value *KOffset, Value *NCheck, ArrayRef<FullTileBoundCheck> FullChecks,
+    ScalarEvolution &SE) {
+  auto *QuotientTrunc = dyn_cast<TruncInst>(KOffset);
+  auto *Div = QuotientTrunc
+                  ? dyn_cast<BinaryOperator>(QuotientTrunc->getOperand(0))
+                  : nullptr;
+  if (!Div || Div->getOpcode() != Instruction::UDiv)
+    return false;
+
+  Value *Index = Div->getOperand(0);
+  Value *Divisor = Div->getOperand(1);
+  uint64_t DivisorValue;
+  if (!getPositiveNoWrapConstantSub(Divisor, DivisorValue) ||
+      !SE.isKnownNonNegative(SE.getSCEV(Index)))
+    return false;
+
+  if (DivisorValue > UINT64_MAX / 32)
+    return false;
+  uint64_t IndexLimit = DivisorValue * 32;
+  if (!isUnsignedOffsetBelow(Index, IndexLimit, SE))
+    return false;
+
+  auto *NComparison = dyn_cast<ICmpInst>(NCheck);
+  if (!NComparison)
+    return false;
+  auto *NIndexAdd = dyn_cast<BinaryOperator>(NComparison->getOperand(0));
+  if (!NIndexAdd || NIndexAdd->getOpcode() != Instruction::Add ||
+      !NIndexAdd->hasNoSignedWrap())
+    return false;
+  Value *NOffset = NIndexAdd->getOperand(0);
+  for (const FullTileBoundCheck &Full : FullChecks) {
+    if (Full.Dimension != 0 || NIndexAdd->getOperand(1) != Full.Base)
+      continue;
+    if (NComparison->getOperand(1) != Full.Bound ||
+        (Full.IsSigned ? NComparison->getPredicate() != ICmpInst::ICMP_SLT
+                       : NComparison->getPredicate() != ICmpInst::ICMP_ULT))
+      continue;
+
+    auto *OffsetSExt = dyn_cast<SExtInst>(NOffset);
+    auto *OffsetAdd =
+        OffsetSExt ? dyn_cast<BinaryOperator>(OffsetSExt->getOperand(0))
+                   : nullptr;
+    if (!OffsetAdd || OffsetAdd->getOpcode() != Instruction::Add ||
+        !OffsetAdd->hasNoSignedWrap())
+      continue;
+
+    Value *Cond = OffsetAdd->getOperand(0);
+    auto *RemainderTrunc =
+        dyn_cast<TruncInst>(OffsetAdd->getOperand(1));
+    if (!RemainderTrunc)
+      continue;
+    if (RemainderTrunc->getType() != QuotientTrunc->getType())
+      continue;
+
+    auto *Remainder =
+        dyn_cast<BinaryOperator>(RemainderTrunc->getOperand(0));
+    if (!Remainder || Remainder->getOpcode() != Instruction::Sub ||
+        !Remainder->hasNoUnsignedWrap() || Remainder->getOperand(0) != Index)
+      continue;
+    auto *Product = dyn_cast<BinaryOperator>(Remainder->getOperand(1));
+    if (!Product || Product->getOpcode() != Instruction::Mul ||
+        !Product->hasNoUnsignedWrap() || Product->getOperand(0) != Div ||
+        Product->getOperand(1) != Divisor)
+      continue;
+
+    uint64_t CondMaximum;
+    if (!getUnsignedOffsetMaximumBelow(Cond, 128, SE, CondMaximum) ||
+        DivisorValue - 1 > 127 - CondMaximum)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+/// Match the select form of the exact gemm_ts_outer nested K/N guard.  The
+/// select is intentionally accepted only in this polarity, so replacing its
+/// branch with successor zero removes only the proven true-path guard in the
+/// cloned prefix.
 static bool isNestedKAndNBoundCheck(Value *V, Value *IV, Value *Bound,
                                     ArrayRef<FullTileBoundCheck> FullChecks,
-                                    ScalarEvolution &SE, LoopInfo &LI) {
+                                    ScalarEvolution &SE) {
   auto *Select = dyn_cast<SelectInst>(V);
   auto *FalseValue = Select ? dyn_cast<ConstantInt>(Select->getFalseValue())
                             : nullptr;
@@ -603,32 +647,24 @@ static bool isNestedKAndNBoundCheck(Value *V, Value *IV, Value *Bound,
       KCmp->getOperand(1) != Bound)
     return false;
   auto *KAdd = dyn_cast<BinaryOperator>(KCmp->getOperand(0));
-  if (!KAdd || KAdd->getOpcode() != Instruction::Add)
+  if (!KAdd || KAdd->getOpcode() != Instruction::Add ||
+      !KAdd->hasNoSignedWrap())
     return false;
-  Value *Offset = KAdd->getOperand(0) == IV
-                      ? KAdd->getOperand(1)
-                      : KAdd->getOperand(1) == IV ? KAdd->getOperand(0)
-                                                   : nullptr;
-  if (!Offset ||
-      (!isUnsignedOffsetBelow(Offset, 32, SE) &&
-       !isKnownZeroBasedOffsetBelow(Offset, 32, LI)))
+  if (KAdd->getOperand(1) != IV)
     return false;
+  Value *Offset = KAdd->getOperand(0);
 
-  for (const FullTileBoundCheck &Full : FullChecks)
-    if (Full.Dimension == 0 && isPerLaneTileBoundCheck(NCmp, Full, SE))
-      return true;
-  return false;
+  return isGemmTSOuterQuotientRemainderCheck(Offset, NCmp, FullChecks, SE);
 }
 
 static bool isRemovablePrefixGuard(
     const BranchInst *Branch, Value *IV, Value *Bound,
-    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE,
-    LoopInfo &LI) {
+    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE) {
   return Branch->isConditional() &&
          (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
           isNestedKBoundCheck(Branch->getCondition(), IV, Bound, SE) ||
           isNestedKAndNBoundCheck(Branch->getCondition(), IV, Bound,
-                                   FullChecks, SE, LI) ||
+                                   FullChecks, SE) ||
           isRemovableSafetyBranch(Branch, FullChecks, SE));
 }
 
@@ -766,7 +802,7 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE, LI);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
   if (!HasRemovableGuard)
     return false;
 
@@ -819,13 +855,12 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   for (BasicBlock *BB : L->blocks()) {
     BasicBlock *PrefixBB = cast<BasicBlock>(VMap[BB]);
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE,
-                                LI))
+    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE))
       continue;
 
     auto *PrefixBranch = cast<BranchInst>(PrefixBB->getTerminator());
-    if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound,
-                                FullChecks, SE, LI))
+    if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound, FullChecks,
+                                SE))
       llvm_unreachable("cloned prefix guard must retain canonical shape");
     BranchInst::Create(PrefixBranch->getSuccessor(0), PrefixBranch);
     PrefixBranch->eraseFromParent();
@@ -1089,7 +1124,7 @@ static bool canSplitInteriorKLoop(Loop *L,
   bool HasRemovableGuard = false;
   for (BasicBlock *BB : L->blocks())
     HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE, LI);
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
   if (!HasRemovableGuard)
     LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
                       << L->getHeader()->getName()

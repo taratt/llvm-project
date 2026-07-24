@@ -360,18 +360,26 @@ stage.m.check:
   br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
 
 stage.n.check:
-  ; This is the real GEMM N guard shape.  The outer staging offset and
-  ; inner lane offset are summed in i32, then sign-extended to the N index.
-  ; Both have a maximum of 31, so the tile-relative offset is below 128.
+  ; This is the exact gemm_ts_outer quotient/remainder guard shape.  A
+  ; nonnegative 7-bit index is divided by a no-wrap constant subtraction;
+  ; the quotient selects K and the reconstructed remainder contributes to N.
   %cond215 = add nsw i32 %stage.i, 0
-  %conv286 = and i32 %workitem, 31
+  %idx273.i32 = and i32 %workitem, 127
+  %idx273 = zext i32 %idx273.i32 to i64
+  %sub270 = sub nsw i64 5, 1
+  %div280 = udiv i64 %idx273, %sub270
+  %conv283 = trunc i64 %div280 to i32
+  %mul284 = mul nuw i64 %div280, %sub270
+  %sub285 = sub nuw i64 %idx273, %mul284
+  %conv286 = trunc i64 %sub285 to i32
   %add288 = add nsw i32 %cond215, %conv286
   %conv293 = sext i32 %add288 to i64
-  %add294 = add nsw i64 %x.base, %conv293
+  %add294 = add nsw i64 %conv293, %x.base
   %n.in.bounds = icmp slt i64 %add294, %n64
-  %k.index = add i32 %i, %stage.i
-  %k.in.bounds = icmp slt i32 %k.index, %k
-  %or.cond = select i1 %k.in.bounds, i1 %n.in.bounds, i1 false
+  %add291 = add nsw i32 %conv283, %i
+  %cmp296 = icmp slt i32 %add291, %k
+  %cmp298 = icmp slt i64 %add294, %n64
+  %or.cond = select i1 %cmp296, i1 %cmp298, i1 false
   br i1 %or.cond, label %stage.k.check, label %stage.latch
 
 stage.k.check:
@@ -517,5 +525,5 @@ k.exit:
 ; CFG-LABEL: stage.k.check.interior:
 ; CFG: br label %stage.barrier.interior
 ; CFG-LABEL: stage.n.check:
-; CFG: %or.cond = select i1 %k.in.bounds, i1 %n.in.bounds, i1 false
+; CFG: %or.cond = select i1 %cmp296, i1 %cmp298, i1 false
 ; CFG: br i1 %or.cond, label %stage.k.check, label %stage.latch
