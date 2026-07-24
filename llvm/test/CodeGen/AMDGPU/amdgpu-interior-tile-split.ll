@@ -405,6 +405,82 @@ k.exit:
   ret void
 }
 
+; This is the real-GEMM N-edge dispatch spelling.  The false edge fallback
+; contains quotient/remainder work, but the split must prove and remove only
+; cmp267: on the synthesized full-N and same-alignment prefix, cond215 is
+; exactly 128, so cmp267 is false.  The quotient/remainder guard is not a
+; target of the proof.
+define amdgpu_kernel void @canonical_n_edge_fallback_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %workitem = call i32 @llvm.amdgcn.workitem.id.x()
+  %x.base.i32 = shl i32 %workgroup.x, 7
+  %y.base.i32 = shl i32 %workgroup.y, 7
+  %x.base = sext i32 %x.base.i32 to i64
+  %y.base = sext i32 %y.base.i32 to i64
+  br label %k.preheader
+
+k.preheader:
+  %n64 = sext i32 %n to i64
+  %m64 = sext i32 %m to i64
+  %n.remaining = sub i64 %n64, %x.base
+  %n.nonnegative = call i64 @llvm.smax.i64(i64 %n.remaining, i64 0)
+  %n.extent = call i64 @llvm.smin.i64(i64 %n.nonnegative, i64 128)
+  %m.remaining = sub i64 %m64, %y.base
+  %m.nonnegative = call i64 @llvm.smax.i64(i64 %m.remaining, i64 0)
+  %m.extent = call i64 @llvm.smin.i64(i64 %m.nonnegative, i64 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %k.body
+
+k.body:
+  %n.extent.i32 = trunc i64 %n.extent to i32
+  %n.masked = and i32 %n.extent.i32, 252
+  %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
+  %cmp267 = icmp ult i32 %cond215, 128
+  br i1 %cmp267, label %if.then268, label %if.end312
+
+if.then268:
+  br label %for.body278
+
+for.body278:
+  ; This fallback-only quotient/remainder guard must not be recognized.
+  %lane = and i32 %workitem, 127
+  %quotient = udiv i32 %lane, 4
+  %remainder = urem i32 %lane, 4
+  %remainder.in.range = icmp ult i32 %remainder, 4
+  br i1 %remainder.in.range, label %k.barrier, label %k.barrier
+
+if.end312:
+  br label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; The equivalent one-K-tile loop is structurally proven to execute once.
 ; Synthesis includes all M/N/K/alignment predicates before it versions the
 ; loop.
@@ -459,6 +535,7 @@ k.exit:
 ; CHECK: Interior K-loop candidate k.header: preheader=k.preheader HasM=1 HasN=1 canSplit=1
 ; CHECK: Split canonical interior K loop in canonical_predecessor_setup_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
 ; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 2 proven guard(s), shared live-out exit k.exit
+; CHECK: Split canonical interior K loop in canonical_n_edge_fallback_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -527,3 +604,13 @@ k.exit:
 ; CFG-LABEL: stage.n.check:
 ; CFG: %or.cond = select i1 %cmp296, i1 %cmp298, i1 false
 ; CFG: br i1 %or.cond, label %stage.k.check, label %stage.latch
+
+; CFG-LABEL: define amdgpu_kernel void @canonical_n_edge_fallback_k_loop(
+; CFG-LABEL: k.body:
+; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
+; CFG: br i1 %cmp267, label %if.then268, label %if.end312
+; CFG-LABEL: k.body.interior:
+; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked, i32 0
+; CFG: br label %if.end312.interior
+; CFG-LABEL: if.then268.interior:
+; CFG: br label %for.body278.interior

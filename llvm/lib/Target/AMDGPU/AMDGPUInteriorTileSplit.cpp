@@ -338,14 +338,25 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
          (RHS == Full.Base && IsBoundedOffset(LHS));
 }
 
-static bool isRemovableSafetyBranch(
+/// The successor selected by a predicate proven in the cloned prefix.  Keep
+/// this distinct from a plain match: some edge predicates are false for a full
+/// tile, while the ordinary lane and K guards are true.
+enum class GuardOutcome : unsigned {
+  True = 0,
+  False = 1,
+};
+
+static bool getRemovableSafetyBranchOutcome(
     const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks,
-    ScalarEvolution &SE) {
+    ScalarEvolution &SE, GuardOutcome &Outcome) {
   if (!Branch->isConditional())
     return false;
-  for (const FullTileBoundCheck &Full : FullChecks)
-    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE))
+  for (const FullTileBoundCheck &Full : FullChecks) {
+    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE)) {
+      Outcome = GuardOutcome::True;
       return true;
+    }
+  }
   return false;
 }
 
@@ -657,17 +668,6 @@ static bool isNestedKAndNBoundCheck(Value *V, Value *IV, Value *Bound,
   return isGemmTSOuterQuotientRemainderCheck(Offset, NCmp, FullChecks, SE);
 }
 
-static bool isRemovablePrefixGuard(
-    const BranchInst *Branch, Value *IV, Value *Bound,
-    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE) {
-  return Branch->isConditional() &&
-         (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
-          isNestedKBoundCheck(Branch->getCondition(), IV, Bound, SE) ||
-          isNestedKAndNBoundCheck(Branch->getCondition(), IV, Bound,
-                                   FullChecks, SE) ||
-          isRemovableSafetyBranch(Branch, FullChecks, SE));
-}
-
 static bool isAlignmentCheck(Value *V, UniformityInfo &UI) {
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_EQ ||
@@ -681,6 +681,76 @@ static bool isAlignmentCheck(Value *V, UniformityInfo &UI) {
       !isa<ConstantInt>(Mask->getOperand(1)))
     return false;
   return !cast<ConstantInt>(Mask->getOperand(1))->isZero();
+}
+
+/// Match the real-GEMM N-edge predicate:
+///   select alignment, (trunc(clamp(N - nbase, 0, 128)) & 252), 0 < 128
+///
+/// The synthesized full-N selector proves the clamp is exactly 128, and the
+/// select's exact alignment input is one of the selector's conjuncts.  Thus
+/// the selected value is 128, not below 128, so the conditional branch takes
+/// its false successor in the cloned prefix.
+static bool isFullNEdgeFallbackCheck(
+    Value *V, ArrayRef<FullTileBoundCheck> FullChecks,
+    ArrayRef<Value *> Alignments) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false;
+  auto *Limit = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+  auto *Select = dyn_cast<SelectInst>(Cmp->getOperand(0));
+  if (!Limit || !Limit->equalsInt(128) || !Select)
+    return false;
+  bool IsSelectorAlignment = false;
+  for (Value *Alignment : Alignments)
+    IsSelectorAlignment |= Alignment == Select->getCondition();
+  if (!IsSelectorAlignment)
+    return false;
+
+  auto *Zero = dyn_cast<ConstantInt>(Select->getFalseValue());
+  auto *Masked = dyn_cast<BinaryOperator>(Select->getTrueValue());
+  if (!Zero || !Zero->isZero() || !Masked ||
+      Masked->getOpcode() != Instruction::And)
+    return false;
+  Value *ExtentTrunc = Masked->getOperand(0);
+  auto *Mask = dyn_cast<ConstantInt>(Masked->getOperand(1));
+  if (!Mask) {
+    ExtentTrunc = Masked->getOperand(1);
+    Mask = dyn_cast<ConstantInt>(Masked->getOperand(0));
+  }
+  auto *Trunc = dyn_cast<TruncInst>(ExtentTrunc);
+  if (!Mask || !Mask->equalsInt(252) || !Trunc)
+    return false;
+
+  for (const FullTileBoundCheck &Full : FullChecks) {
+    if (Full.Dimension != 0)
+      continue;
+    CanonicalTileRemainder NExtent;
+    if (getClampedTileExtent(Trunc->getOperand(0), 0, NExtent) &&
+        NExtent.Bound == Full.Bound && NExtent.Base == Full.Base)
+      return true;
+  }
+  return false;
+}
+
+static bool getRemovablePrefixGuardOutcome(
+    const BranchInst *Branch, Value *IV, Value *Bound,
+    ArrayRef<FullTileBoundCheck> FullChecks, ArrayRef<Value *> Alignments,
+    ScalarEvolution &SE, GuardOutcome &Outcome) {
+  if (!Branch->isConditional())
+    return false;
+  if (isFullKTileGuard(Branch->getCondition(), IV, Bound) ||
+      isNestedKBoundCheck(Branch->getCondition(), IV, Bound, SE) ||
+      isNestedKAndNBoundCheck(Branch->getCondition(), IV, Bound, FullChecks,
+                               SE)) {
+    Outcome = GuardOutcome::True;
+    return true;
+  }
+  if (isFullNEdgeFallbackCheck(Branch->getCondition(), FullChecks,
+                               Alignments)) {
+    Outcome = GuardOutcome::False;
+    return true;
+  }
+  return getRemovableSafetyBranchOutcome(Branch, FullChecks, SE, Outcome);
 }
 
 static void collectConjuncts(Value *V, SmallVectorImpl<Value *> &Conjuncts) {
@@ -714,6 +784,7 @@ static bool containsBarrier(const Loop *L) {
 static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
                                Value *StaticFullTileCondition,
                                ArrayRef<FullTileBoundCheck> FullChecks,
+                               ArrayRef<Value *> Alignments,
                                LoopInfo &LI, DominatorTree &DT,
                                ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
@@ -800,9 +871,12 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   // guarded.  Both predicates are proven against the original loop here and
   // rechecked after remapping below.
   bool HasRemovableGuard = false;
-  for (BasicBlock *BB : L->blocks())
-    HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
+  for (BasicBlock *BB : L->blocks()) {
+    GuardOutcome Outcome;
+    HasRemovableGuard |= getRemovablePrefixGuardOutcome(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
+        Alignments, SE, Outcome);
+  }
   if (!HasRemovableGuard)
     return false;
 
@@ -855,14 +929,21 @@ static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
   for (BasicBlock *BB : L->blocks()) {
     BasicBlock *PrefixBB = cast<BasicBlock>(VMap[BB]);
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovablePrefixGuard(OriginalBranch, IV, Bound, FullChecks, SE))
+    GuardOutcome Outcome;
+    if (!getRemovablePrefixGuardOutcome(OriginalBranch, IV, Bound, FullChecks,
+                                        Alignments, SE, Outcome))
       continue;
 
     auto *PrefixBranch = cast<BranchInst>(PrefixBB->getTerminator());
-    if (!isRemovablePrefixGuard(PrefixBranch, PrefixIV, Bound, FullChecks,
-                                SE))
+    GuardOutcome PrefixOutcome;
+    if (!getRemovablePrefixGuardOutcome(PrefixBranch, PrefixIV, Bound,
+                                        FullChecks, Alignments, SE,
+                                        PrefixOutcome) ||
+        PrefixOutcome != Outcome)
       llvm_unreachable("cloned prefix guard must retain canonical shape");
-    BranchInst::Create(PrefixBranch->getSuccessor(0), PrefixBranch);
+    BranchInst::Create(
+        PrefixBranch->getSuccessor(static_cast<unsigned>(Outcome)),
+        PrefixBranch);
     PrefixBranch->eraseFromParent();
     ++RemovedSafetyBranches;
   }
@@ -1010,6 +1091,7 @@ static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
 /// splitInteriorKLoop are consequently guaranteed by this preflight.
 static bool canSplitInteriorKLoop(Loop *L,
                                   ArrayRef<FullTileBoundCheck> FullChecks,
+                                  ArrayRef<Value *> Alignments,
                                   LoopInfo &LI, DominatorTree &DT,
                                   ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
@@ -1122,9 +1204,12 @@ static bool canSplitInteriorKLoop(Loop *L,
     }
 
   bool HasRemovableGuard = false;
-  for (BasicBlock *BB : L->blocks())
-    HasRemovableGuard |= isRemovablePrefixGuard(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks, SE);
+  for (BasicBlock *BB : L->blocks()) {
+    GuardOutcome Outcome;
+    HasRemovableGuard |= getRemovablePrefixGuardOutcome(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
+        Alignments, SE, Outcome);
+  }
   if (!HasRemovableGuard)
     LLVM_DEBUG(dbgs() << "Interior K-loop preflight rejected "
                       << L->getHeader()->getName()
@@ -1214,9 +1299,11 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
     return false;
 
   bool HasRemovableSafetyBranch = false;
-  for (BasicBlock *BB : Region)
-    HasRemovableSafetyBranch |= isRemovableSafetyBranch(
-        cast<BranchInst>(BB->getTerminator()), FullChecks, SE);
+  for (BasicBlock *BB : Region) {
+    GuardOutcome Outcome;
+    HasRemovableSafetyBranch |= getRemovableSafetyBranchOutcome(
+        cast<BranchInst>(BB->getTerminator()), FullChecks, SE, Outcome);
+  }
   if (!HasRemovableSafetyBranch)
     return false;
 
@@ -1247,12 +1334,16 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   unsigned RemovedSafetyBranches = 0;
   for (BasicBlock *BB : RegionBlocks) {
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
-    if (!isRemovableSafetyBranch(OriginalBranch, FullChecks, SE))
+    GuardOutcome Outcome;
+    if (!getRemovableSafetyBranchOutcome(OriginalBranch, FullChecks, SE,
+                                         Outcome))
       continue;
 
     auto *ClonedBranch =
         cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
-    BranchInst::Create(ClonedBranch->getSuccessor(0), ClonedBranch);
+    BranchInst::Create(
+        ClonedBranch->getSuccessor(static_cast<unsigned>(Outcome)),
+        ClonedBranch);
     ClonedBranch->eraseFromParent();
     ++RemovedSafetyBranches;
   }
@@ -1331,7 +1422,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
       SmallVector<FullTileBoundCheck, 2> FullChecks;
       if (GetFullChecks(&I, FullChecks) &&
-          splitInteriorKLoop(L, Dispatch, &I, FullChecks, LI, DT, SE))
+          splitInteriorKLoop(L, Dispatch, &I, FullChecks, {}, LI, DT, SE))
         return true;
     }
   }
@@ -1353,7 +1444,8 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     }
     const bool CanSplit = Preheader && Preheader->getSinglePredecessor() &&
                           HasCanonicalSetup && HasM && HasN &&
-                          canSplitInteriorKLoop(L, FullChecks, LI, DT, SE);
+                          canSplitInteriorKLoop(L, FullChecks, Alignments, LI,
+                                                DT, SE);
     LLVM_DEBUG(dbgs() << "Interior K-loop candidate "
                       << (L->getHeader() ? L->getHeader()->getName()
                                          : "<none>")
@@ -1368,7 +1460,8 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     if (!Selector)
       continue;
     SplitBlock(Preheader, Preheader->getTerminator(), &DT, &LI);
-    if (splitInteriorKLoop(L, Preheader, Selector, FullChecks, LI, DT, SE))
+    if (splitInteriorKLoop(L, Preheader, Selector, FullChecks, Alignments, LI,
+                           DT, SE))
       return true;
     llvm_unreachable("preflighted interior K loop must split");
   }
