@@ -1454,20 +1454,20 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   BasicBlock *StagingPredecessor = nullptr;
   BasicBlock *Barrier = nullptr;
   for (BasicBlock *BB : L->blocks()) {
-    if (&BB == L->getHeader() || !BB.getFirstNonPHI())
+    if (BB == L->getHeader() || !BB->getFirstNonPHI())
       continue;
-    BasicBlock *Dispatch = BB.getSinglePredecessor();
+    BasicBlock *Dispatch = BB->getSinglePredecessor();
     if (!Dispatch || !L->contains(Dispatch))
       continue;
     SmallPtrSet<BasicBlock *, 8> Candidate;
     BasicBlock *CandidateBarrier = nullptr;
-    if (!findClosedStagingRegion(&BB, Dispatch, Candidate, CandidateBarrier) ||
+    if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier) ||
         !L->contains(CandidateBarrier) ||
         CandidateBarrier->getSingleSuccessor() == nullptr ||
         !L->contains(CandidateBarrier->getSingleSuccessor()) ||
         Candidate.contains(CandidateBarrier->getSingleSuccessor()))
       continue;
-    StagingEntry = &BB;
+    StagingEntry = BB;
     StagingPredecessor = Dispatch;
     Barrier = CandidateBarrier;
     break;
@@ -1592,7 +1592,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
 
       if (cloneStagingRegion(F, Branch, Successor, Region, Barrier,
-                             FullChecks, SE))
+                             FullChecks, {}, nullptr, nullptr, SE))
         return true;
     }
   }
