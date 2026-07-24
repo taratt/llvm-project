@@ -618,11 +618,6 @@ k.exit:
 ; CFG-LABEL: k.body:
 ; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
 ; CFG: br i1 %cmp267, label %edge.fallback, label %stage.full
-; CFG-LABEL: k.body.interior:
-; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked, i32 0
-; CFG: br label %stage.full.interior
-; CFG-LABEL: stage.full.interior:
-; CFG: br label %k.barrier
 ; CFG-LABEL: k.barrier:
 ; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
 ; CFG: br label %compute
@@ -630,6 +625,11 @@ k.exit:
 ; CFG: br label %k.latch
 ; CFG-LABEL: k.latch:
 ; CFG: br i1 %more, label %k.header, label %k.exit
+; CFG-LABEL: k.body.interior:
+; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked.interior, i32 0
+; CFG: br label %stage.full.interior
+; CFG-LABEL: stage.full.interior:
+; CFG: br label %k.barrier
 ; CFG-NOT: compute.interior
 ; CFG-NOT: k.latch.interior
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_one_k_loop(
