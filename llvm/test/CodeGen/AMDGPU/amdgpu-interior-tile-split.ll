@@ -481,9 +481,77 @@ k.exit:
   ret void
 }
 
+; Regression for the staging-only POC: only k.body and its pre-barrier
+; fallback graph may acquire `.interior` blocks.  The compute block and the
+; outer latch remain single shared blocks after the common barrier.
+define amdgpu_kernel void @staging_only_outer_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  br label %dispatch
+
+dispatch:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %x.base.i32 = shl i32 %workgroup.x, 7
+  %y.base.i32 = shl i32 %workgroup.y, 7
+  %x.base = sext i32 %x.base.i32 to i64
+  %y.base = sext i32 %y.base.i32 to i64
+  br label %k.preheader
+
+k.preheader:
+  %n64 = sext i32 %n to i64
+  %m64 = sext i32 %m to i64
+  %n.remaining = sub i64 %n64, %x.base
+  %n.nonnegative = call i64 @llvm.smax.i64(i64 %n.remaining, i64 0)
+  %n.extent = call i64 @llvm.smin.i64(i64 %n.nonnegative, i64 128)
+  %m.remaining = sub i64 %m64, %y.base
+  %m.nonnegative = call i64 @llvm.smax.i64(i64 %m.remaining, i64 0)
+  %m.extent = call i64 @llvm.smin.i64(i64 %m.nonnegative, i64 128)
+  %out.int = ptrtoint ptr addrspace(1) %out to i64
+  %out.mask = and i64 %out.int, 15
+  %out.aligned = icmp eq i64 %out.mask, 0
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %k.body
+
+k.body:
+  %n.extent.i32 = trunc i64 %n.extent to i32
+  %n.masked = and i32 %n.extent.i32, 252
+  %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
+  %cmp267 = icmp ult i32 %cond215, 128
+  br i1 %cmp267, label %edge.fallback, label %stage.full
+
+edge.fallback:
+  %edge.work = add i32 %i, 1
+  br label %k.barrier
+
+stage.full:
+  %stage.work = add i32 %i, 2
+  br label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %compute
+
+compute:
+  %compute.value = add i32 %i, 3
+  store i32 %compute.value, ptr addrspace(1) %out, align 4
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; The equivalent one-K-tile loop is structurally proven to execute once.
-; Synthesis includes all M/N/K/alignment predicates before it versions the
-; loop.
 define amdgpu_kernel void @canonical_synthesized_one_k_loop(
     ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
 entry:
@@ -529,13 +597,6 @@ k.exit:
   ret void
 }
 
-; CHECK: Cloned canonical interior-tile staging region in canonical_staging at entry; removed 1 proven lane bounds branch(es); fast staging entry staging.interior, fallback staging, shared barrier barrier
-; CHECK: Split canonical interior K loop in canonical_k_loop at dispatch; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
-; CHECK: Split canonical interior K loop in canonical_synthesized_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
-; CHECK: Interior K-loop candidate k.header: preheader=k.preheader HasM=1 HasN=1 canSplit=1
-; CHECK: Split canonical interior K loop in canonical_predecessor_setup_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 3 proven guard(s), shared live-out exit k.exit
-; CHECK: Split canonical interior K loop in canonical_nested_staging_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 2 proven guard(s), shared live-out exit k.exit
-; CHECK: Split canonical interior K loop in canonical_n_edge_fallback_k_loop at k.preheader; prefix loop k.header.interior, guarded tail k.header; removed 1 proven guard(s), shared live-out exit k.exit
 ; CHECK: Potential interior-tile boundary check in candidate:
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
@@ -549,68 +610,26 @@ k.exit:
 ; CFG-LABEL: stage.store.interior:
 ; CFG: br label %barrier
 
-; CFG-LABEL: define amdgpu_kernel void @canonical_k_loop(
-; CFG-LABEL: dispatch:
-; CFG: %interior.k.prefix.bound = and i32 %k, -32
-; CFG: br i1 %interior.k.full, label %k.preheader.interior, label %k.preheader
-; CFG-LABEL: k.preheader:
-; CFG: %i.tail.start = phi i32 [ 0, %dispatch ], [ %next.interior, %k.latch.interior ]
-; CFG: %acc.tail.start = phi i32 [ 0, %dispatch ], [ %acc.next.interior, %k.latch.interior ]
-; CFG: %[[TAIL_REMAINDER:.*]] = icmp ne i32 %interior.k.prefix.bound, %k
-; CFG: %[[NO_PREFIX:.*]] = xor i1 %interior.k.full, true
-; CFG: %[[HAS_TAIL:.*]] = or i1 %[[NO_PREFIX]], %[[TAIL_REMAINDER]]
-; CFG: br i1 %[[HAS_TAIL]], label %k.header, label %k.exit
-; CFG-LABEL: k.body:
-; CFG: call void @llvm.amdgcn.s.barrier()
-; CFG-LABEL: k.body.interior:
-; CFG: call void @llvm.amdgcn.s.barrier()
-; CFG-LABEL: k.exit:
-; CFG: %result.lcssa = phi i32 [ %next, %k.latch ], [ %i.tail.start, %k.preheader ]
-; CFG: %acc.lcssa = phi i32 [ %acc.next, %k.latch ], [ %acc.tail.start, %k.preheader ]
-
-; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_k_loop(
-; CFG-LABEL: k.preheader:
-; CFG: %interior.m.full = icmp sle i32 %y.base, %{{.*}}
-; CFG: %interior.n.full = icmp sle i32 %x.base, %{{.*}}
-; CFG: %interior.full = and i1 %interior.mn.full, %out.aligned
-; CFG: br i1 %interior.k.full, label %k.preheader.split.interior, label %k.preheader.split
-; CFG-LABEL: k.body.interior:
-; CFG: br label %k.n.check.interior
-; CFG-LABEL: k.n.check.interior:
-; CFG: br label %k.k.check.interior
-; CFG-LABEL: k.k.check.interior:
-; CFG: br label %k.barrier.interior
-
-; CFG-LABEL: define amdgpu_kernel void @canonical_predecessor_setup_k_loop(
-; CFG-LABEL: k.preheader:
-; CFG: %interior.m.full = icmp sle i32 %y.base, %{{.*}}
-; CFG: %interior.n.full = icmp sle i32 %x.base, %{{.*}}
-; CFG: %interior.full = and i1 %interior.mn.full, %out.aligned
-; CFG: br i1 %interior.k.full, label %k.preheader.split.interior, label %k.preheader.split
-; CFG-LABEL: k.body.interior:
-; CFG: br label %k.n.check.interior
-; CFG-LABEL: k.n.check.interior:
-; CFG: br label %k.k.check.interior
-; CFG-LABEL: k.k.check.interior:
-; CFG: br label %k.barrier.interior
-
-; CFG-LABEL: define amdgpu_kernel void @canonical_nested_staging_k_loop(
-; CFG-LABEL: stage.m.check.interior:
-; CFG: br label %stage.n.check.interior
-; CFG-LABEL: stage.n.check.interior:
-; CFG: br label %stage.k.check.interior
-; CFG-LABEL: stage.k.check.interior:
-; CFG: br label %stage.barrier.interior
-; CFG-LABEL: stage.n.check:
-; CFG: %or.cond = select i1 %cmp296, i1 %cmp298, i1 false
-; CFG: br i1 %or.cond, label %stage.k.check, label %stage.latch
-
-; CFG-LABEL: define amdgpu_kernel void @canonical_n_edge_fallback_k_loop(
+; CFG-LABEL: define amdgpu_kernel void @staging_only_outer_k_loop(
+; The distinct split-edge dispatch has different fast and fallback targets:
+; fast is the cloned staging entry and fallback is the original entry.
+; CFG: br i1 %interior.staging.full, label %k.body.interior, label %k.body
+; CFG-NOT: br i1 %interior.staging.full, label %[[SELF:[^, ]+]], label %[[SELF]]
 ; CFG-LABEL: k.body:
 ; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
-; CFG: br i1 %cmp267, label %if.then268, label %if.end312
+; CFG: br i1 %cmp267, label %edge.fallback, label %stage.full
 ; CFG-LABEL: k.body.interior:
 ; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked, i32 0
-; CFG: br label %if.end312.interior
-; CFG-LABEL: if.then268.interior:
-; CFG: br label %for.body278.interior
+; CFG: br label %stage.full.interior
+; CFG-LABEL: stage.full.interior:
+; CFG: br label %k.barrier
+; CFG-LABEL: k.barrier:
+; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
+; CFG: br label %compute
+; CFG-LABEL: compute:
+; CFG: br label %k.latch
+; CFG-LABEL: k.latch:
+; CFG: br i1 %more, label %k.header, label %k.exit
+; CFG-NOT: compute.interior
+; CFG-NOT: k.latch.interior
+; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_one_k_loop(

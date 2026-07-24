@@ -781,12 +781,12 @@ static bool containsBarrier(const Loop *L) {
 }
 
 /// Clone a canonical full-K prefix before the original guarded tail.
-static bool splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
-                               Value *StaticFullTileCondition,
-                               ArrayRef<FullTileBoundCheck> FullChecks,
-                               ArrayRef<Value *> Alignments,
-                               LoopInfo &LI, DominatorTree &DT,
-                               ScalarEvolution &SE) {
+[[maybe_unused]] static bool
+splitInteriorKLoop(Loop *L, BasicBlock *Dispatch,
+                   Value *StaticFullTileCondition,
+                   ArrayRef<FullTileBoundCheck> FullChecks,
+                   ArrayRef<Value *> Alignments, LoopInfo &LI,
+                   DominatorTree &DT, ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
@@ -1089,11 +1089,10 @@ static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
 /// Check the pieces that must hold before splitting a preheader.  The
 /// subsequent split only changes its predecessor; the remaining checks in
 /// splitInteriorKLoop are consequently guaranteed by this preflight.
-static bool canSplitInteriorKLoop(Loop *L,
-                                  ArrayRef<FullTileBoundCheck> FullChecks,
-                                  ArrayRef<Value *> Alignments,
-                                  LoopInfo &LI, DominatorTree &DT,
-                                  ScalarEvolution &SE) {
+[[maybe_unused]] static bool
+canSplitInteriorKLoop(Loop *L, ArrayRef<FullTileBoundCheck> FullChecks,
+                      ArrayRef<Value *> Alignments, LoopInfo &LI,
+                      DominatorTree &DT, ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exit = L->getUniqueExitBlock();
   BasicBlock *Exiting = L->getExitingBlock();
@@ -1283,6 +1282,68 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
   return HasSafetyBranch && !HasCycle(HasCycle, Entry);
 }
 
+/// Return the induction and bound for the only outer K loop this POC accepts.
+/// The no-wrap, zero-origin recurrence is what makes the per-iteration signed
+/// `IV <= K - 32` selector equivalent to a full 32-wide K tile.
+static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE, PHINode *&IV,
+                                   Value *&Bound) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Exiting = L->getExitingBlock();
+  if (!L->isLoopSimplifyForm() || !Preheader || !Exiting ||
+      Exiting != L->getLoopLatch())
+    return false;
+
+  auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
+  auto *ExitCmp =
+      ExitBranch && ExitBranch->isConditional()
+          ? dyn_cast<ICmpInst>(ExitBranch->getCondition())
+          : nullptr;
+  if (!ExitCmp)
+    return false;
+  BasicBlock *Continue = ExitBranch->getSuccessor(0) == L->getHeader()
+                             ? ExitBranch->getSuccessor(0)
+                             : ExitBranch->getSuccessor(1) == L->getHeader()
+                                   ? ExitBranch->getSuccessor(1)
+                                   : nullptr;
+  if (!Continue)
+    return false;
+  ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
+                                  ? ExitCmp->getPredicate()
+                                  : ExitCmp->getInversePredicate();
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
+    return false;
+
+  Value *IVNext = ExitCmp->getOperand(0);
+  Bound = ExitCmp->getOperand(1);
+  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNext));
+  if (!AR) {
+    std::swap(IVNext, Bound);
+    AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNext));
+  }
+  auto *Step = AR ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                  : nullptr;
+  if (!Step || Step->getAPInt().getZExtValue() != 32 ||
+      AR->getLoop() != L || !L->isLoopInvariant(Bound) ||
+      !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
+      !Bound->getType()->isIntegerTy())
+    return false;
+
+  IV = nullptr;
+  for (PHINode &PN : L->getHeader()->phis()) {
+    if (PN.getIncomingValueForBlock(Exiting) != IVNext)
+      continue;
+    auto *Initial = dyn_cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader));
+    if (!Initial || !Initial->isZero())
+      return false;
+    auto *Inc = dyn_cast<BinaryOperator>(IVNext);
+    if (!Inc || Inc->getOpcode() != Instruction::Add || !Inc->hasNoUnsignedWrap())
+      return false;
+    IV = &PN;
+    return true;
+  }
+  return false;
+}
+
 /// Clone a staging region behind a CTA-uniform dispatch.  The original entry
 /// remains reachable through the other dispatch edge and is therefore the
 /// fallback path.  The shared barrier is not cloned.
@@ -1291,7 +1352,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
                                const SmallPtrSetImpl<BasicBlock *> &Region,
                                BasicBlock *Barrier,
                                ArrayRef<FullTileBoundCheck> FullChecks,
-                               ScalarEvolution &SE) {
+                               ArrayRef<Value *> Alignments, PHINode *IV,
+                               Value *Bound, ScalarEvolution &SE) {
   // Cloning incoming values into a PHI in the shared barrier would require
   // proving the corresponding values are valid on both paths.  Reject that
   // shape rather than manufacture a potentially invalid incoming value.
@@ -1301,8 +1363,9 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   bool HasRemovableSafetyBranch = false;
   for (BasicBlock *BB : Region) {
     GuardOutcome Outcome;
-    HasRemovableSafetyBranch |= getRemovableSafetyBranchOutcome(
-        cast<BranchInst>(BB->getTerminator()), FullChecks, SE, Outcome);
+    HasRemovableSafetyBranch |= getRemovablePrefixGuardOutcome(
+        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
+        Alignments, SE, Outcome);
   }
   if (!HasRemovableSafetyBranch)
     return false;
@@ -1335,8 +1398,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   for (BasicBlock *BB : RegionBlocks) {
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
     GuardOutcome Outcome;
-    if (!getRemovableSafetyBranchOutcome(OriginalBranch, FullChecks, SE,
-                                         Outcome))
+    if (!getRemovablePrefixGuardOutcome(OriginalBranch, IV, Bound, FullChecks,
+                                        Alignments, SE, Outcome))
       continue;
 
     auto *ClonedBranch =
@@ -1360,6 +1423,95 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
                     << ", fallback " << Entry->getName() << ", shared barrier "
                     << Barrier->getName() << '\n');
   return true;
+}
+
+/// Version only the guarded staging prefix of one outer-K iteration.  The
+/// shared barrier is the reconvergence point: both CTA-uniform dispatch paths
+/// execute it, then flow to the original compute and outer latch.  This is
+/// intentionally not a loop versioning transform.
+static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
+                               LoopInfo &LI, DominatorTree &DT,
+                               ScalarEvolution &SE) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  PHINode *IV;
+  Value *Bound;
+  if (!getCanonicalOuterKLoop(L, SE, IV, Bound) || !Preheader)
+    return false;
+
+  CanonicalTileRemainder M, N;
+  SmallVector<Value *, 4> Alignments;
+  bool HasM = false, HasN = false;
+  if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
+      !HasM || !HasN || Alignments.empty())
+    return false;
+  SmallVector<FullTileBoundCheck, 2> FullChecks{
+      {1, M.Bound, M.Base, /*IsSigned=*/true},
+      {0, N.Bound, N.Base, /*IsSigned=*/true}};
+
+  // First prove the old CFG, before changing it.  The candidate must end at a
+  // single shared barrier whose successor is the existing compute phase.
+  BasicBlock *StagingEntry = nullptr;
+  BasicBlock *StagingPredecessor = nullptr;
+  BasicBlock *Barrier = nullptr;
+  for (BasicBlock *BB : L->blocks()) {
+    if (&BB == L->getHeader() || !BB.getFirstNonPHI())
+      continue;
+    BasicBlock *Dispatch = BB.getSinglePredecessor();
+    if (!Dispatch || !L->contains(Dispatch))
+      continue;
+    SmallPtrSet<BasicBlock *, 8> Candidate;
+    BasicBlock *CandidateBarrier = nullptr;
+    if (!findClosedStagingRegion(&BB, Dispatch, Candidate, CandidateBarrier) ||
+        !L->contains(CandidateBarrier) ||
+        CandidateBarrier->getSingleSuccessor() == nullptr ||
+        !L->contains(CandidateBarrier->getSingleSuccessor()) ||
+        Candidate.contains(CandidateBarrier->getSingleSuccessor()))
+      continue;
+    StagingEntry = &BB;
+    StagingPredecessor = Dispatch;
+    Barrier = CandidateBarrier;
+    break;
+  }
+  if (!StagingEntry)
+    return false;
+
+  Value *MNFull = synthesizeInteriorTileSelector(Preheader, UI);
+  if (!MNFull)
+    return false;
+
+  // Put a distinct dispatch block on the incoming edge.  Splitting
+  // StagingEntry itself would turn it into the dispatch and make its fallback
+  // successor a self-loop.  The original entry remains the guarded fallback;
+  // cloneStagingRegion changes only the initially-duplicated true edge.
+  BasicBlock *Dispatch = SplitEdge(StagingPredecessor, StagingEntry, &DT, &LI);
+  if (!Dispatch)
+    return false;
+  auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
+  SmallPtrSet<BasicBlock *, 8> Region;
+  BasicBlock *SharedBarrier = nullptr;
+  if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier) ||
+      SharedBarrier != Barrier)
+    llvm_unreachable("preflighted staging CFG changed unexpectedly");
+
+  // The new block is inside the outer loop, so this full-K predicate is
+  // evaluated once per iteration rather than only at loop entry.
+  IRBuilder<> Builder(DispatchBranch);
+  Value *KAtLeastTile = Builder.CreateICmpSGE(
+      Bound, ConstantInt::get(Bound->getType(), 32), "interior.k.nonnegative");
+  Value *KFull = Builder.CreateICmpSLE(
+      IV, Builder.CreateSub(Bound, ConstantInt::get(Bound->getType(), 32)),
+      "interior.k.tile");
+  Value *RunFast = Builder.CreateAnd(
+      MNFull, Builder.CreateAnd(KAtLeastTile, KFull, "interior.k.full"),
+      "interior.staging.full");
+  // cloneStagingRegion replaces the first edge to StagingEntry with the clone,
+  // yielding `RunFast ? staging.interior : staging`.
+  BranchInst::Create(StagingEntry, StagingEntry, RunFast, DispatchBranch);
+  DispatchBranch->eraseFromParent();
+
+  return cloneStagingRegion(F, cast<BranchInst>(Dispatch->getTerminator()),
+                            StagingEntry, Region, SharedBarrier, FullChecks,
+                            Alignments, IV, Bound, SE);
 }
 
 static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
@@ -1407,63 +1559,13 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     return HasM && HasN && HasK && HasAlignment;
   };
 
-  // A loop version is introduced for an existing canonical CTA-uniform
-  // selector.  The selector need not yet be the terminator: versioning makes
-  // it the choice between the cloned interior loop and the original edge loop.
+  // The staging-only POC deliberately does not clone an outer K loop.  It
+  // inserts a CTA-uniform dispatch inside that loop and clones only the
+  // acyclic guarded staging graph up to its first shared barrier.
   SmallVector<Loop *, 4> Loops = LI.getLoopsInPreorder();
   for (Loop *L : Loops) {
-    BasicBlock *Preheader = L->getLoopPreheader();
-    BasicBlock *Dispatch =
-        Preheader ? Preheader->getSinglePredecessor() : nullptr;
-    if (!Dispatch)
-      continue;
-    for (Instruction &I : *Dispatch) {
-      if (!I.getType()->isIntegerTy(1) || !UI.isUniformAtDef(&I))
-        continue;
-      SmallVector<FullTileBoundCheck, 2> FullChecks;
-      if (GetFullChecks(&I, FullChecks) &&
-          splitInteriorKLoop(L, Dispatch, &I, FullChecks, {}, LI, DT, SE))
-        return true;
-    }
-  }
-
-  // Real GEMM IR commonly reaches the K loop through an unconditional
-  // preheader.  Materialize the M/N/alignment dispatch immediately there,
-  // then split the preheader so the original block becomes the dispatch.
-  for (Loop *L : Loops) {
-    BasicBlock *Preheader = L->getLoopPreheader();
-    SmallVector<FullTileBoundCheck, 2> FullChecks;
-    bool HasM = false, HasN = false;
-    CanonicalTileRemainder M, N;
-    SmallVector<Value *, 4> Alignments;
-    const bool HasCanonicalSetup =
-        collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN);
-    if (HasCanonicalSetup && HasM && HasN) {
-      FullChecks.push_back({1, M.Bound, M.Base, /*IsSigned=*/true});
-      FullChecks.push_back({0, N.Bound, N.Base, /*IsSigned=*/true});
-    }
-    const bool CanSplit = Preheader && Preheader->getSinglePredecessor() &&
-                          HasCanonicalSetup && HasM && HasN &&
-                          canSplitInteriorKLoop(L, FullChecks, Alignments, LI,
-                                                DT, SE);
-    LLVM_DEBUG(dbgs() << "Interior K-loop candidate "
-                      << (L->getHeader() ? L->getHeader()->getName()
-                                         : "<none>")
-                      << ": preheader="
-                      << (Preheader ? Preheader->getName() : "<none>")
-                      << " HasM=" << HasM << " HasN=" << HasN
-                      << " canSplit=" << CanSplit << '\n');
-    if (!CanSplit)
-      continue;
-
-    Value *Selector = synthesizeInteriorTileSelector(Preheader, UI);
-    if (!Selector)
-      continue;
-    SplitBlock(Preheader, Preheader->getTerminator(), &DT, &LI);
-    if (splitInteriorKLoop(L, Preheader, Selector, FullChecks, Alignments, LI,
-                           DT, SE))
+    if (splitOuterKStaging(F, L, UI, LI, DT, SE))
       return true;
-    llvm_unreachable("preflighted interior K loop must split");
   }
 
   for (BasicBlock &BB : F) {
