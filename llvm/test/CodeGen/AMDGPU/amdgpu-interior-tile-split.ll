@@ -515,6 +515,10 @@ k.preheader:
 
 k.header:
   %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  ; Header setup is shared with the post-barrier compute phase.  Splitting the
+  ; header before these definitions would make the fast path require a merge.
+  %kt.chunk = add i32 %i, 7
+  %conv26 = sext i32 %kt.chunk to i64
   %n.extent.i32 = trunc i64 %n.extent to i32
   %n.masked = and i32 %n.extent.i32, 252
   %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
@@ -547,8 +551,8 @@ k.barrier:
   br i1 %skip.compute, label %skip.compute.path, label %compute
 
 compute:
-  %compute.value = add i32 %i, 3
-  store i32 %compute.value, ptr addrspace(1) %out, align 4
+  %compute.value = add i64 %conv26, 3
+  store i64 %compute.value, ptr addrspace(1) %out, align 4
   br label %k.latch
 
 skip.compute.path:
@@ -626,27 +630,30 @@ k.exit:
 ; CFG: br label %barrier
 
 ; CFG-LABEL: define amdgpu_kernel void @staging_only_outer_k_loop(
-; The header PHI remains in the outer loop header.  Its split-off staging
-; suffix is dispatched each K iteration: fast is the clone, fallback original.
+; The header PHI and setup remain in the outer loop header.  Only its
+; terminator is split into a staging entry: fast is the clone, fallback
+; original.  Header setup is still available after the shared barrier.
 ; CFG-LABEL: k.header:
 ; CFG: %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+; CFG: %kt.chunk = add i32 %i, 7
+; CFG: %conv26 = sext i32 %kt.chunk to i64
+; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
 ; CFG: br i1 %interior.staging.full, label %staging.interior, label %staging
 ; CFG-NOT: br i1 %interior.staging.full, label %[[SELF:[^, ]+]], label %[[SELF]]
 ; CFG-LABEL: staging:
-; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
 ; CFG: br i1 %cmp267, label %edge.fallback, label %stage.full
 ; CFG-LABEL: k.barrier:
 ; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
 ; Both exits remain shared and outside the cloned staging graph.
 ; CFG: br i1 %skip.compute, label %skip.compute.path, label %compute
 ; CFG-LABEL: compute:
+; CFG: %compute.value = add i64 %conv26, 3
 ; CFG: br label %k.latch
 ; CFG-LABEL: skip.compute.path:
 ; CFG: br label %k.latch
 ; CFG-LABEL: k.latch:
 ; CFG: br i1 %more, label %k.header, label %k.exit
 ; CFG-LABEL: staging.interior:
-; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked.interior, i32 0
 ; CFG: br label %stage.full.interior
 ; CFG-LABEL: stage.full.interior:
 ; CFG: br label %stage.inner.header.interior

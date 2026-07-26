@@ -1225,9 +1225,10 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
                                     BasicBlock *&Barrier,
                                     bool AllowNestedLoops = false,
                                     bool *ContainsLoop = nullptr,
-                                    bool AllowEntryPHIs = false) {
+                                    bool AllowEntryExternalPredecessors = false) {
   if (isBarrierBlock(Entry) ||
-      (!AllowEntryPHIs && Entry->getSinglePredecessor() != Dispatch))
+      (!AllowEntryExternalPredecessors &&
+       Entry->getSinglePredecessor() != Dispatch))
     return false;
 
   SmallVector<BasicBlock *, 8> Worklist{Entry};
@@ -1256,7 +1257,7 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
 
     for (BasicBlock *Predecessor : predecessors(BB))
       if (Predecessor != Dispatch && !Region.contains(Predecessor) &&
-          !(AllowEntryPHIs && BB == Entry))
+          !(AllowEntryExternalPredecessors && BB == Entry))
         return false;
 
     if (isa<CondBrInst>(BB->getTerminator()))
@@ -1338,7 +1339,7 @@ static bool canCloneStagingRegion(
     BasicBlock *Entry, const SmallPtrSetImpl<BasicBlock *> &Region,
     BasicBlock *Barrier, ArrayRef<FullTileBoundCheck> FullChecks,
     ArrayRef<Value *> Alignments, PHINode *IV, Value *Bound,
-    ScalarEvolution &SE, bool IgnoreEntryPHIs = false) {
+    ScalarEvolution &SE, bool IgnoreEntryInstructions = false) {
   if (isa<PHINode>(&Barrier->front())) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << Entry->getName()
@@ -1348,11 +1349,12 @@ static bool canCloneStagingRegion(
 
   for (BasicBlock *BB : Region) {
     for (Instruction &I : *BB) {
-      // Before splitting a header at its first non-PHI, model its suffix as
-      // staging but leave the loop-carried PHIs in the dispatch.  Their uses
-      // in the latch/compute phase are consequently shared, not staging
-      // live-outs, after the split.
-      if (IgnoreEntryPHIs && BB == Entry && isa<PHINode>(I))
+      // Header-anchored staging is split only at the header terminator.  All
+      // header definitions therefore stay in the shared dispatch, so their
+      // existing uses in the latch, barrier successors, and compute phase do
+      // not need path merges.  The subsequent post-split check validates the
+      // actual staging-only region without this exception.
+      if (IgnoreEntryInstructions && BB == Entry)
         continue;
       for (User *U : I.users()) {
         auto *UseI = dyn_cast<Instruction>(U);
@@ -1556,7 +1558,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   for (BasicBlock *BB : L->blocks()) {
     const bool IsHeader = BB == L->getHeader();
     Instruction *FirstNonPHI = BB->getFirstNonPHI();
-    if (!FirstNonPHI || (IsHeader && FirstNonPHI == BB->getTerminator()))
+    if (!FirstNonPHI)
       continue;
     BasicBlock *Dispatch = IsHeader ? nullptr : BB->getSinglePredecessor();
     if (!IsHeader && (!Dispatch || !L->contains(Dispatch)))
@@ -1567,12 +1569,12 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
                                  /*AllowNestedLoops=*/true,
                                  &CandidateHasLoop,
-                                 /*AllowEntryPHIs=*/IsHeader) ||
+                                 /*AllowEntryExternalPredecessors=*/IsHeader) ||
         !L->contains(CandidateBarrier) ||
         !hasOnlySharedBarrierExits(L, Candidate, CandidateBarrier) ||
         !canCloneStagingRegion(BB, Candidate, CandidateBarrier, FullChecks,
                                Alignments, IV, Bound, SE,
-                               /*IgnoreEntryPHIs=*/IsHeader))
+                               /*IgnoreEntryInstructions=*/IsHeader))
       continue;
     StagingEntry = BB;
     StagingPredecessor = Dispatch;
@@ -1596,19 +1598,17 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
 
-  // A real GEMM puts the first staging branch in the outer K header, after its
-  // PHIs.  Split at that first non-PHI so the PHIs remain the loop header and
-  // the new dispatch executes on every K iteration.  For an ordinary staging
-  // entry, use the incoming-edge split as before.  In both cases the original
-  // entry is the fallback and only the true edge is redirected to the clone.
+  // A real GEMM puts staging control in the outer K header.  Split the header
+  // only at its terminator, retaining every PHI and setup instruction in the
+  // shared dispatch.  This keeps header values used after the shared barrier
+  // single-defined on both paths.  For an ordinary staging entry, use the
+  // incoming-edge split as before.  In both cases the original entry is the
+  // fallback and only the true edge is redirected to the clone.
   BasicBlock *Dispatch = nullptr;
   if (SplitHeaderForDispatch) {
-    Instruction *FirstNonPHI = StagingEntry->getFirstNonPHI();
-    assert(FirstNonPHI && FirstNonPHI != StagingEntry->getTerminator() &&
-           "preflighted header must have a non-PHI staging body");
     Dispatch = StagingEntry;
-    StagingEntry = SplitBlock(Dispatch, FirstNonPHI, &DT, &LI, nullptr,
-                              "staging");
+    StagingEntry = SplitBlock(Dispatch, Dispatch->getTerminator(), &DT, &LI,
+                              nullptr, "staging");
     StagingPredecessor = Dispatch;
   } else {
     Dispatch = SplitEdge(StagingPredecessor, StagingEntry, &DT, &LI);
