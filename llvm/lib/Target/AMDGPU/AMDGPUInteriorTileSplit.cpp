@@ -324,7 +324,8 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
     return false;
 
   auto *Add = dyn_cast<BinaryOperator>(Index);
-  if (!Add || Add->getOpcode() != Instruction::Add)
+  if (!Add || (Add->getOpcode() != Instruction::Add &&
+               Add->getOpcode() != Instruction::Or))
     return false;
 
   Value *LHS = Add->getOperand(0);
@@ -363,7 +364,8 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
     return false;
 
   auto *Add = dyn_cast<BinaryOperator>(Index);
-  if (!Add || Add->getOpcode() != Instruction::Add)
+  if (!Add || (Add->getOpcode() != Instruction::Add &&
+               Add->getOpcode() != Instruction::Or))
     return false;
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
@@ -375,7 +377,8 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
   }
   uint64_t Maximum;
   if (!Base ||
-      !getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum))
+      !((getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
+        getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum)))
     return false;
 
   Remainder = {Dimension, Bound, Base, nullptr};

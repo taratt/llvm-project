@@ -599,7 +599,9 @@ stage.m.check:
   br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
 
 stage.n.check:
-  %n.index = add i32 %x.base, %stage.i
+  ; Clang emits this for a 128-aligned tile base plus a lane index < 128.
+  ; The OR is equivalent to addition because their set bits cannot overlap.
+  %n.index = or disjoint i32 %x.base, %stage.i
   %n.in.bounds = icmp slt i32 %n.index, %n
   br i1 %n.in.bounds, label %stage.work, label %stage.latch
 
