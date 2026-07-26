@@ -735,6 +735,12 @@ k.exit:
 ; CFG-LABEL: define amdgpu_kernel void @batched_style_direct_bounds_outer_k_loop(
 ; CFG-LABEL: k.header:
 ; CFG: br i1 %interior.staging.full, label %staging.interior, label %staging
+; CFG-LABEL: k.barrier:
+; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
+; CFG-LABEL: compute:
+; CFG: br label %k.latch
+; CFG-LABEL: k.latch:
+; CFG: br i1 %more, label %k.header, label %k.exit
 ; CFG-LABEL: staging.interior:
 ; CFG: br label %stage.header.interior
 ; CFG-LABEL: stage.m.check.interior:
@@ -743,12 +749,6 @@ k.exit:
 ; CFG: br label %stage.work.interior
 ; CFG-LABEL: stage.latch.interior:
 ; CFG: br i1 %stage.more.interior, label %stage.header.interior, label %k.barrier
-; CFG-LABEL: k.barrier:
-; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
-; CFG-LABEL: compute:
-; CFG: br label %k.latch
-; CFG-LABEL: k.latch:
-; CFG: br i1 %more, label %k.header, label %k.exit
 ; CFG-NOT: k.barrier.interior
 ; CFG-NOT: compute.interior
 ; CFG-NOT: k.latch.interior
