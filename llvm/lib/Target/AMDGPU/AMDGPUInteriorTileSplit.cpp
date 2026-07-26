@@ -338,6 +338,50 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
          (RHS == Full.Base && IsBoundedOffset(LHS));
 }
 
+/// Recover a full-tile M/N proof directly from a per-lane guard.  Some HIP
+/// GEMMs do not materialize a min/max tile extent: their staging loops retain
+/// only `workgroup.id * 128 + offset < extent`.  The same bounded-offset
+/// proof used to remove the guard makes `base <= bound - 128` sufficient for
+/// every such lane.  Keep the base spelling exact and require a uniform bound
+/// so this cannot turn a lane-varying predicate into a CTA dispatch.
+static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
+                                    UniformityInfo &UI, ScalarEvolution &SE,
+                                    CanonicalTileRemainder &Remainder) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return false;
+
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *Index = Cmp->getOperand(0);
+  Value *Bound = Cmp->getOperand(1);
+  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT) {
+    Pred = ICmpInst::getSwappedPredicate(Pred);
+    std::swap(Index, Bound);
+  }
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT ||
+      !Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(Bound))
+    return false;
+
+  auto *Add = dyn_cast<BinaryOperator>(Index);
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+  Value *LHS = Add->getOperand(0);
+  Value *RHS = Add->getOperand(1);
+  Value *Base = getWorkgroupShiftBy7OrExtend(LHS, Dimension);
+  Value *Offset = RHS;
+  if (!Base) {
+    Base = getWorkgroupShiftBy7OrExtend(RHS, Dimension);
+    Offset = LHS;
+  }
+  uint64_t Maximum;
+  if (!Base ||
+      !getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum))
+    return false;
+
+  Remainder = {Dimension, Bound, Base, nullptr};
+  return true;
+}
+
 /// The successor selected by a predicate proven in the cloned prefix.  Keep
 /// this distinct from a plain match: some edge predicates are false for a full
 /// tile, while the ordinary lane and K guards are true.
@@ -378,46 +422,78 @@ static bool isNamedCall(Value *V, StringRef Name) {
          Call->getCalledFunction()->getName().starts_with(Name);
 }
 
+/// Match the select lowering of `smin(smax(Difference, 0), 128)`.  Scalar
+/// optimization commonly replaces the intrinsic form before this pass runs;
+/// accept only its exact signed, ordered select spelling.
+static bool getSelectClampedTileExtent(Value *V, Value *&Difference) {
+  auto *Min = dyn_cast<SelectInst>(V);
+  auto *MinCmp = Min ? dyn_cast<ICmpInst>(Min->getCondition()) : nullptr;
+  auto *TileSize =
+      Min ? dyn_cast<ConstantInt>(Min->getFalseValue()) : nullptr;
+  if (!MinCmp || !TileSize || !TileSize->equalsInt(128) ||
+      MinCmp->getPredicate() != ICmpInst::ICMP_SLT ||
+      MinCmp->getOperand(1) != TileSize ||
+      Min->getTrueValue() != MinCmp->getOperand(0))
+    return false;
+
+  auto *Max = dyn_cast<SelectInst>(Min->getTrueValue());
+  auto *MaxCmp = Max ? dyn_cast<ICmpInst>(Max->getCondition()) : nullptr;
+  auto *Zero =
+      Max ? dyn_cast<ConstantInt>(Max->getFalseValue()) : nullptr;
+  if (!MaxCmp || !Zero || !Zero->isZero() ||
+      MaxCmp->getPredicate() != ICmpInst::ICMP_SGT ||
+      MaxCmp->getOperand(1) != Zero ||
+      Max->getTrueValue() != MaxCmp->getOperand(0))
+    return false;
+
+  Difference = Max->getTrueValue();
+  return true;
+}
+
 /// Match min(max(Bound - (workgroup.id << 7), 0), 128), which is the
 /// clamp form emitted by Clang for a 128-row or 128-column tile extent.
 static bool getClampedTileExtent(Value *V, unsigned Dimension,
                                  CanonicalTileRemainder &Remainder) {
-  if (!isNamedCall(V, "llvm.smin.") && !isNamedCall(V, "llvm.umin."))
-    return false;
-
-  auto *Min = cast<CallBase>(V);
-  Value *Extent = nullptr;
-  bool HasTileSize = false;
-  for (Value *Operand : Min->args()) {
-    if (auto *C = dyn_cast<ConstantInt>(Operand)) {
-      if (!C->equalsInt(128) || HasTileSize)
-        return false;
-      HasTileSize = true;
-    } else {
-      if (Extent)
-        return false;
-      Extent = Operand;
-    }
-  }
-  if (!HasTileSize || !Extent || !isNamedCall(Extent, "llvm.smax."))
-    return false;
-
-  auto *Max = cast<CallBase>(Extent);
   Value *Difference = nullptr;
-  bool HasZero = false;
-  for (Value *Operand : Max->args()) {
-    if (auto *C = dyn_cast<ConstantInt>(Operand)) {
-      if (!C->isZero() || HasZero)
-        return false;
-      HasZero = true;
-    } else {
-      if (Difference)
-        return false;
-      Difference = Operand;
+  if (isNamedCall(V, "llvm.smin.") || isNamedCall(V, "llvm.umin.")) {
+    auto *Min = cast<CallBase>(V);
+    Value *Extent = nullptr;
+    bool HasTileSize = false;
+    for (Value *Operand : Min->args()) {
+      if (auto *C = dyn_cast<ConstantInt>(Operand)) {
+        if (!C->equalsInt(128) || HasTileSize)
+          return false;
+        HasTileSize = true;
+      } else {
+        if (Extent)
+          return false;
+        Extent = Operand;
+      }
     }
+    if (!HasTileSize || !Extent || !isNamedCall(Extent, "llvm.smax."))
+      return false;
+
+    auto *Max = cast<CallBase>(Extent);
+    bool HasZero = false;
+    for (Value *Operand : Max->args()) {
+      if (auto *C = dyn_cast<ConstantInt>(Operand)) {
+        if (!C->isZero() || HasZero)
+          return false;
+        HasZero = true;
+      } else {
+        if (Difference)
+          return false;
+        Difference = Operand;
+      }
+    }
+    if (!HasZero)
+      return false;
+  } else if (!getSelectClampedTileExtent(V, Difference)) {
+    return false;
   }
-  auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
-  if (!HasZero || !Sub || Sub->getOpcode() != Instruction::Sub ||
+
+  auto *Sub = dyn_cast<BinaryOperator>(Difference);
+  if (!Sub || Sub->getOpcode() != Instruction::Sub ||
       !isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension))
     return false;
 
@@ -1045,16 +1121,49 @@ static bool collectInteriorTileSetup(
   return true;
 }
 
+/// Supplement clamp setup with the direct M/N guards retained by simple HIP
+/// staging loops.  Do not search outside the candidate outer K loop, and
+/// reject competing base/bound pairs rather than choosing one by order.
+static bool collectDirectInteriorTileBounds(
+    Loop *L, UniformityInfo &UI, ScalarEvolution &SE,
+    CanonicalTileRemainder &M, CanonicalTileRemainder &N, bool &HasM,
+    bool &HasN, bool &HasDirectM, bool &HasDirectN) {
+  auto Record = [](const CanonicalTileRemainder &Remainder,
+                   CanonicalTileRemainder &Recorded, bool &HasRecorded) {
+    if (HasRecorded)
+      return Recorded.Bound == Remainder.Bound &&
+             Recorded.Base == Remainder.Base;
+    Recorded = Remainder;
+    HasRecorded = true;
+    return true;
+  };
+  for (BasicBlock *BB : L->blocks()) {
+    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
+    CanonicalTileRemainder Remainder;
+    if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE,
+                                Remainder)) {
+      HasDirectM = true;
+      if (!Record(Remainder, M, HasM))
+        return false;
+    }
+    if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE,
+                                Remainder)) {
+      HasDirectN = true;
+      if (!Record(Remainder, N, HasN))
+        return false;
+    }
+  }
+  return true;
+}
+
 /// Build the CTA-uniform M/N/alignment selector from the canonical setup
 /// values for the K loop.
-static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
-                                              UniformityInfo &UI) {
-  CanonicalTileRemainder M, N;
-  SmallVector<Value *, 4> Alignments;
-  bool HasM = false, HasN = false;
-  if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
-      !HasM || !HasN || Alignments.empty() ||
-      M.Bound->getType() != N.Bound->getType())
+static Value *synthesizeInteriorTileSelector(
+    BasicBlock *Preheader, const CanonicalTileRemainder &M,
+    const CanonicalTileRemainder &N, ArrayRef<Value *> Alignments) {
+  if (M.Bound->getType() != N.Bound->getType())
     return nullptr;
 
   IRBuilder<> Builder(Preheader->getTerminator());
@@ -1079,6 +1188,8 @@ static Value *synthesizeInteriorTileSelector(BasicBlock *Preheader,
       "interior.n.full");
   NFull = Builder.CreateAnd(NPositive, NFull, "interior.n.tile");
   Value *MNFull = Builder.CreateAnd(MFull, NFull, "interior.mn.full");
+  if (Alignments.empty())
+    return MNFull;
   Value *Alignment = Alignments.front();
   for (unsigned I = 1; I != Alignments.size(); ++I)
     Alignment = Builder.CreateAnd(Alignment, Alignments[I],
@@ -1536,11 +1647,15 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   CanonicalTileRemainder M, N;
   SmallVector<Value *, 4> Alignments;
   bool HasM = false, HasN = false;
+  bool HasDirectM = false, HasDirectN = false;
   if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
-      !HasM || !HasN || Alignments.empty()) {
+      !collectDirectInteriorTileBounds(L, UI, SE, M, N, HasM, HasN,
+                                       HasDirectM, HasDirectN) ||
+      !HasM || !HasN ||
+      (Alignments.empty() && !(HasDirectM && HasDirectN))) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << L->getHeader()->getName()
-                      << ": missing M/N extent or alignment setup\n");
+                      << ": missing or ambiguous M/N tile/alignment setup\n");
     return false;
   }
   SmallVector<FullTileBoundCheck, 2> FullChecks{
@@ -1590,7 +1705,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
 
-  Value *MNFull = synthesizeInteriorTileSelector(Preheader, UI);
+  Value *MNFull = synthesizeInteriorTileSelector(Preheader, M, N, Alignments);
   if (!MNFull) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << L->getHeader()->getName()

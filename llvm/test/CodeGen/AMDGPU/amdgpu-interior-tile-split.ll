@@ -569,6 +569,69 @@ k.exit:
   ret void
 }
 
+; A batched-GEMM-style staging loop has no materialized min/max M/N extents
+; and no pointer-alignment predicate.  Its M/N proof is the pair of direct
+; `workgroup.id * 128 + bounded staging index < extent` guards.  Only the
+; nested staging loop is cloned; the barrier and compute/latch remain shared.
+define amdgpu_kernel void @batched_style_direct_bounds_outer_k_loop(
+    ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
+entry:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  br label %k.preheader
+
+k.preheader:
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %stage.header
+
+stage.header:
+  %stage.i = phi i32 [ 0, %k.header ], [ %stage.next, %stage.latch ]
+  br label %stage.m.check
+
+stage.m.check:
+  %m.index = add i32 %y.base, %stage.i
+  %m.in.bounds = icmp slt i32 %m.index, %m
+  br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
+
+stage.n.check:
+  %n.index = add i32 %x.base, %stage.i
+  %n.in.bounds = icmp slt i32 %n.index, %n
+  br i1 %n.in.bounds, label %stage.work, label %stage.latch
+
+stage.work:
+  %stage.value = add i32 %i, %stage.i
+  br label %stage.latch
+
+stage.latch:
+  %stage.next = add nuw i32 %stage.i, 1
+  %stage.more = icmp ult i32 %stage.next, 128
+  br i1 %stage.more, label %stage.header, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %compute
+
+compute:
+  %computed = add i32 %i, 1
+  store i32 %computed, ptr addrspace(1) %out, align 4
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  %result.lcssa = phi i32 [ %next, %k.latch ]
+  store i32 %result.lcssa, ptr addrspace(1) %out, align 4
+  ret void
+}
+
 ; The equivalent one-K-tile loop is structurally proven to execute once.
 define amdgpu_kernel void @canonical_synthesized_one_k_loop(
     ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
@@ -668,5 +731,25 @@ k.exit:
 ; CFG-NOT: k.barrier.interior
 ; CFG-NOT: compute.interior
 ; CFG-NOT: skip.compute.path.interior
+; CFG-NOT: k.latch.interior
+; CFG-LABEL: define amdgpu_kernel void @batched_style_direct_bounds_outer_k_loop(
+; CFG-LABEL: k.header:
+; CFG: br i1 %interior.staging.full, label %staging.interior, label %staging
+; CFG-LABEL: staging.interior:
+; CFG: br label %stage.header.interior
+; CFG-LABEL: stage.m.check.interior:
+; CFG: br label %stage.n.check.interior
+; CFG-LABEL: stage.n.check.interior:
+; CFG: br label %stage.work.interior
+; CFG-LABEL: stage.latch.interior:
+; CFG: br i1 %stage.more.interior, label %stage.header.interior, label %k.barrier
+; CFG-LABEL: k.barrier:
+; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
+; CFG-LABEL: compute:
+; CFG: br label %k.latch
+; CFG-LABEL: k.latch:
+; CFG: br i1 %more, label %k.header, label %k.exit
+; CFG-NOT: k.barrier.interior
+; CFG-NOT: compute.interior
 ; CFG-NOT: k.latch.interior
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_one_k_loop(
