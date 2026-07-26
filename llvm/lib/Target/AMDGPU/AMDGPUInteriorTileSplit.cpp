@@ -1224,8 +1224,10 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
                                     SmallPtrSetImpl<BasicBlock *> &Region,
                                     BasicBlock *&Barrier,
                                     bool AllowNestedLoops = false,
-                                    bool *ContainsLoop = nullptr) {
-  if (isBarrierBlock(Entry) || Entry->getSinglePredecessor() != Dispatch)
+                                    bool *ContainsLoop = nullptr,
+                                    bool AllowEntryPHIs = false) {
+  if (isBarrierBlock(Entry) ||
+      (!AllowEntryPHIs && Entry->getSinglePredecessor() != Dispatch))
     return false;
 
   SmallVector<BasicBlock *, 8> Worklist{Entry};
@@ -1253,7 +1255,8 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
       return false;
 
     for (BasicBlock *Predecessor : predecessors(BB))
-      if (Predecessor != Dispatch && !Region.contains(Predecessor))
+      if (Predecessor != Dispatch && !Region.contains(Predecessor) &&
+          !(AllowEntryPHIs && BB == Entry))
         return false;
 
     if (isa<CondBrInst>(BB->getTerminator()))
@@ -1314,6 +1317,20 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
   return HasSafetyBranch && (AllowNestedLoops || !HasCycleInRegion);
 }
 
+/// The shared barrier may fan out to compute and a skip-compute path, but no
+/// successor may leave the outer K iteration or re-enter cloned staging.
+static bool hasOnlySharedBarrierExits(
+    const Loop *L, const SmallPtrSetImpl<BasicBlock *> &Region,
+    const BasicBlock *Barrier) {
+  bool HasSuccessor = false;
+  for (const BasicBlock *Successor : successors(Barrier)) {
+    HasSuccessor = true;
+    if (!L->contains(Successor) || Region.contains(Successor))
+      return false;
+  }
+  return HasSuccessor;
+}
+
 /// Prove that sharing Barrier does not require a merge of a value produced by
 /// the cloned staging graph.  A direct use in the barrier or compute phase
 /// would otherwise refer only to the fallback definition on the cloned path.
@@ -1321,7 +1338,7 @@ static bool canCloneStagingRegion(
     BasicBlock *Entry, const SmallPtrSetImpl<BasicBlock *> &Region,
     BasicBlock *Barrier, ArrayRef<FullTileBoundCheck> FullChecks,
     ArrayRef<Value *> Alignments, PHINode *IV, Value *Bound,
-    ScalarEvolution &SE) {
+    ScalarEvolution &SE, bool IgnoreEntryPHIs = false) {
   if (isa<PHINode>(&Barrier->front())) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << Entry->getName()
@@ -1331,6 +1348,12 @@ static bool canCloneStagingRegion(
 
   for (BasicBlock *BB : Region) {
     for (Instruction &I : *BB) {
+      // Before splitting a header at its first non-PHI, model its suffix as
+      // staging but leave the loop-carried PHIs in the dispatch.  Their uses
+      // in the latch/compute phase are consequently shared, not staging
+      // live-outs, after the split.
+      if (IgnoreEntryPHIs && BB == Entry && isa<PHINode>(I))
+        continue;
       for (User *U : I.users()) {
         auto *UseI = dyn_cast<Instruction>(U);
         if (UseI && !Region.contains(UseI->getParent())) {
@@ -1523,34 +1546,39 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
       {0, N.Bound, N.Base, /*IsSigned=*/true}};
 
   // First prove the old CFG, before changing it.  The candidate must end at a
-  // single shared barrier whose successor is the existing compute phase.
+  // shared barrier whose exits remain in the outer K iteration and outside
+  // staging.  Real GEMM has both compute and skip-compute barrier exits.
   BasicBlock *StagingEntry = nullptr;
   BasicBlock *StagingPredecessor = nullptr;
   BasicBlock *Barrier = nullptr;
   bool HasNestedStagingLoop = false;
+  bool SplitHeaderForDispatch = false;
   for (BasicBlock *BB : L->blocks()) {
-    if (BB == L->getHeader() || !BB->getFirstNonPHI())
+    const bool IsHeader = BB == L->getHeader();
+    Instruction *FirstNonPHI = BB->getFirstNonPHI();
+    if (!FirstNonPHI || (IsHeader && FirstNonPHI == BB->getTerminator()))
       continue;
-    BasicBlock *Dispatch = BB->getSinglePredecessor();
-    if (!Dispatch || !L->contains(Dispatch))
+    BasicBlock *Dispatch = IsHeader ? nullptr : BB->getSinglePredecessor();
+    if (!IsHeader && (!Dispatch || !L->contains(Dispatch)))
       continue;
     SmallPtrSet<BasicBlock *, 8> Candidate;
     BasicBlock *CandidateBarrier = nullptr;
     bool CandidateHasLoop = false;
     if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
                                  /*AllowNestedLoops=*/true,
-                                 &CandidateHasLoop) ||
+                                 &CandidateHasLoop,
+                                 /*AllowEntryPHIs=*/IsHeader) ||
         !L->contains(CandidateBarrier) ||
-        CandidateBarrier->getSingleSuccessor() == nullptr ||
-        !L->contains(CandidateBarrier->getSingleSuccessor()) ||
-        Candidate.contains(CandidateBarrier->getSingleSuccessor()) ||
+        !hasOnlySharedBarrierExits(L, Candidate, CandidateBarrier) ||
         !canCloneStagingRegion(BB, Candidate, CandidateBarrier, FullChecks,
-                               Alignments, IV, Bound, SE))
+                               Alignments, IV, Bound, SE,
+                               /*IgnoreEntryPHIs=*/IsHeader))
       continue;
     StagingEntry = BB;
     StagingPredecessor = Dispatch;
     Barrier = CandidateBarrier;
     HasNestedStagingLoop = CandidateHasLoop;
+    SplitHeaderForDispatch = IsHeader;
     break;
   }
   if (!StagingEntry) {
@@ -1568,19 +1596,34 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
 
-  // Put a distinct dispatch block on the incoming edge.  Splitting
-  // StagingEntry itself would turn it into the dispatch and make its fallback
-  // successor a self-loop.  The original entry remains the guarded fallback;
-  // cloneStagingRegion changes only the initially-duplicated true edge.
-  BasicBlock *Dispatch = SplitEdge(StagingPredecessor, StagingEntry, &DT, &LI);
-  if (!Dispatch)
-    return false;
+  // A real GEMM puts the first staging branch in the outer K header, after its
+  // PHIs.  Split at that first non-PHI so the PHIs remain the loop header and
+  // the new dispatch executes on every K iteration.  For an ordinary staging
+  // entry, use the incoming-edge split as before.  In both cases the original
+  // entry is the fallback and only the true edge is redirected to the clone.
+  BasicBlock *Dispatch = nullptr;
+  if (SplitHeaderForDispatch) {
+    Instruction *FirstNonPHI = StagingEntry->getFirstNonPHI();
+    assert(FirstNonPHI && FirstNonPHI != StagingEntry->getTerminator() &&
+           "preflighted header must have a non-PHI staging body");
+    Dispatch = StagingEntry;
+    StagingEntry = SplitBlock(Dispatch, FirstNonPHI, &DT, &LI, nullptr,
+                              "staging");
+    StagingPredecessor = Dispatch;
+  } else {
+    Dispatch = SplitEdge(StagingPredecessor, StagingEntry, &DT, &LI);
+    if (!Dispatch)
+      return false;
+  }
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
   BasicBlock *SharedBarrier = nullptr;
   if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier,
                                /*AllowNestedLoops=*/true) ||
-      SharedBarrier != Barrier)
+      SharedBarrier != Barrier ||
+      !hasOnlySharedBarrierExits(L, Region, SharedBarrier) ||
+      !canCloneStagingRegion(StagingEntry, Region, SharedBarrier, FullChecks,
+                             Alignments, IV, Bound, SE))
     llvm_unreachable("preflighted staging CFG changed unexpectedly");
 
   // The new block is inside the outer loop, so this full-K predicate is

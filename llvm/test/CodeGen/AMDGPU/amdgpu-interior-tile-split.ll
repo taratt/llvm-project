@@ -481,9 +481,10 @@ k.exit:
   ret void
 }
 
-; Regression for the staging-only POC: only k.body and its pre-barrier
-; fallback graph may acquire `.interior` blocks.  The compute block and the
-; outer latch remain single shared blocks after the common barrier.
+; Regression for the staging-only POC: staging begins in the outer K header
+; immediately after its PHIs, so only the split-off staging body and its
+; pre-barrier fallback graph may acquire `.interior` blocks.  The compute
+; block and outer latch remain single shared blocks after the common barrier.
 define amdgpu_kernel void @staging_only_outer_k_loop(
     ptr addrspace(1) %out, i32 %m, i32 %n, i32 %k) {
 entry:
@@ -514,9 +515,6 @@ k.preheader:
 
 k.header:
   %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
-  br label %k.body
-
-k.body:
   %n.extent.i32 = trunc i64 %n.extent to i32
   %n.masked = and i32 %n.extent.i32, 252
   %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
@@ -545,11 +543,15 @@ stage.inner.latch:
 
 k.barrier:
   call void @llvm.amdgcn.s.barrier()
-  br label %compute
+  %skip.compute = icmp eq i32 %i, -1
+  br i1 %skip.compute, label %skip.compute.path, label %compute
 
 compute:
   %compute.value = add i32 %i, 3
   store i32 %compute.value, ptr addrspace(1) %out, align 4
+  br label %k.latch
+
+skip.compute.path:
   br label %k.latch
 
 k.latch:
@@ -624,21 +626,26 @@ k.exit:
 ; CFG: br label %barrier
 
 ; CFG-LABEL: define amdgpu_kernel void @staging_only_outer_k_loop(
-; The distinct split-edge dispatch has different fast and fallback targets:
-; fast is the cloned staging entry and fallback is the original entry.
-; CFG: br i1 %interior.staging.full, label %k.body.interior, label %k.body
+; The header PHI remains in the outer loop header.  Its split-off staging
+; suffix is dispatched each K iteration: fast is the clone, fallback original.
+; CFG-LABEL: k.header:
+; CFG: %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+; CFG: br i1 %interior.staging.full, label %staging.interior, label %staging
 ; CFG-NOT: br i1 %interior.staging.full, label %[[SELF:[^, ]+]], label %[[SELF]]
-; CFG-LABEL: k.body:
+; CFG-LABEL: staging:
 ; CFG: %cond215 = select i1 %out.aligned, i32 %n.masked, i32 0
 ; CFG: br i1 %cmp267, label %edge.fallback, label %stage.full
 ; CFG-LABEL: k.barrier:
 ; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
-; CFG: br label %compute
+; Both exits remain shared and outside the cloned staging graph.
+; CFG: br i1 %skip.compute, label %skip.compute.path, label %compute
 ; CFG-LABEL: compute:
+; CFG: br label %k.latch
+; CFG-LABEL: skip.compute.path:
 ; CFG: br label %k.latch
 ; CFG-LABEL: k.latch:
 ; CFG: br i1 %more, label %k.header, label %k.exit
-; CFG-LABEL: k.body.interior:
+; CFG-LABEL: staging.interior:
 ; CFG: %cond215.interior = select i1 %out.aligned, i32 %n.masked.interior, i32 0
 ; CFG: br label %stage.full.interior
 ; CFG-LABEL: stage.full.interior:
@@ -653,5 +660,6 @@ k.exit:
 ; The clone contains no barrier; both paths converge at the original one.
 ; CFG-NOT: k.barrier.interior
 ; CFG-NOT: compute.interior
+; CFG-NOT: skip.compute.path.interior
 ; CFG-NOT: k.latch.interior
 ; CFG-LABEL: define amdgpu_kernel void @canonical_synthesized_one_k_loop(
