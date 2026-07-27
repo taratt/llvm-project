@@ -263,9 +263,10 @@ bool CGNVCUDARuntime::isBMMInteriorSpecializationCandidate(
 
 void CGNVCUDARuntime::maybeCreateBMMInteriorHandle(
     CodeGenFunction &CGF, const FunctionArgList &Args) {
+  auto *FD = dyn_cast_or_null<FunctionDecl>(CGF.CurFuncDecl);
   if (!CGF.getLangOpts().HIPBMMInteriorSpecialization ||
       !CGF.getLangOpts().HIP || CGF.getLangOpts().CUDAIsDevice ||
-      !isBMMInteriorSpecializationCandidate(CGF.CurFuncDecl, Args) ||
+      !isBMMInteriorSpecializationCandidate(FD, Args) ||
       InteriorKernelHandles.contains(CGF.CurFn))
     return;
 
