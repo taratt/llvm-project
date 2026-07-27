@@ -1675,14 +1675,15 @@ static bool canCloneStagingRegion(
 
   bool HasRemovableSafetyBranch = false;
   for (BasicBlock *BB : Region) {
+    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
     GuardOutcome Outcome;
     HasRemovableSafetyBranch |= getRemovablePrefixGuardOutcome(
-        cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
-        Alignments, SE, Outcome);
+        Branch, IV, Bound, FullChecks, Alignments, SE, Outcome);
     if (!HasRemovableSafetyBranch)
       HasRemovableSafetyBranch = getInteriorConjunctionRemainder(
-          cast<BranchInst>(BB->getTerminator())->getCondition(),
-          DirectGuards);
+          Branch->getCondition(), DirectGuards);
   }
   if (!HasRemovableSafetyBranch)
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
@@ -1794,7 +1795,9 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
 
   unsigned RemovedSafetyBranches = 0;
   for (BasicBlock *BB : RegionBlocks) {
-    auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
+    auto *OriginalBranch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!OriginalBranch || !OriginalBranch->isConditional())
+      continue;
     Value *Remainder =
         getInteriorConjunctionRemainder(OriginalBranch->getCondition(),
                                         DirectGuards);
