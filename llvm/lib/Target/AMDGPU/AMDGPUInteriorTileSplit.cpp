@@ -348,6 +348,19 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
 static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
                                     UniformityInfo &UI, ScalarEvolution &SE,
                                     CanonicalTileRemainder &Remainder) {
+  // InstCombine represents a short-circuit conjunction as
+  // `select guard, bound-check, false`.  The tile-bound conjunct remains a
+  // sufficient source for the uniform M/N dispatch proof, but the other
+  // conjunct must still be retained in the cloned staging path.
+  if (auto *Select = dyn_cast<SelectInst>(V)) {
+    auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
+    if (False && False->isZero())
+      return getDirectTileBoundCheck(Select->getTrueValue(), Dimension, UI,
+                                     SE, Remainder) ||
+             getDirectTileBoundCheck(Select->getCondition(), Dimension, UI,
+                                     SE, Remainder);
+  }
+
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp)
     return false;

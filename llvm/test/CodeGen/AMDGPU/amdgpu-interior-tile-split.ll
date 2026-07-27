@@ -595,7 +595,10 @@ stage.header:
 
 stage.m.check:
   %m.index = add i32 %y.base, %stage.i
-  %m.in.bounds = icmp slt i32 %m.index, %m
+  %m.direct.in.bounds = icmp slt i32 %m.index, %m
+  ; This is `stage.i < 128 && m.index < m` after InstCombine.
+  %m.loop.guard = icmp ult i32 %stage.i, 128
+  %m.in.bounds = select i1 %m.loop.guard, i1 %m.direct.in.bounds, i1 false
   br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
 
 stage.n.check:
