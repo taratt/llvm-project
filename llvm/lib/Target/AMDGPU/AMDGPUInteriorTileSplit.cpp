@@ -49,6 +49,11 @@ STATISTIC(NumPreparedInteriorKLoopSplits,
 
 namespace {
 
+// Cloning a large pre-barrier graph duplicates enough code and live ranges to
+// outweigh removing its lane guards.  Keep the clone deliberately local: the
+// outer-K scan can still select a later closed staging subregion.
+constexpr unsigned MaxStagingCloneBlocks = 6;
+
 enum IDDependency : unsigned {
   DependsOnNone = 0,
   DependsOnWorkgroupID = 1u << 0,
@@ -1916,6 +1921,13 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
                                DirectGuards, Alignments, IV, Bound, SE,
                                /*IgnoreEntryInstructions=*/IsHeader))
       continue;
+    if (Candidate.size() > MaxStagingCloneBlocks) {
+      LLVM_DEBUG(dbgs() << "Interior staging candidate rejected at "
+                        << BB->getName() << ": " << Candidate.size()
+                        << " blocks exceeds clone limit "
+                        << MaxStagingCloneBlocks << '\n');
+      continue;
+    }
     StagingEntry = BB;
     StagingPredecessor = Dispatch;
     Barrier = CandidateBarrier;
