@@ -1159,9 +1159,16 @@ static bool collectDirectInteriorTileBounds(
       continue;
     SmallPtrSet<Value *, 16> Visited;
     if (getIDDependencies(Branch->getCondition(), Visited) &
-        DependsOnWorkgroupID)
+        DependsOnWorkgroupID) {
       LLVM_DEBUG(dbgs() << "Interior direct-bound candidate: "
                         << *Branch->getCondition() << '\n');
+      if (auto *Select = dyn_cast<SelectInst>(Branch->getCondition())) {
+        if (auto *Guard = dyn_cast<Instruction>(Select->getCondition()))
+          LLVM_DEBUG(dbgs() << "  conjunction guard: " << *Guard << '\n');
+        if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue()))
+          LLVM_DEBUG(dbgs() << "  conjunction check: " << *Check << '\n');
+      }
+    }
     CanonicalTileRemainder Remainder;
     if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE,
                                 Remainder)) {
