@@ -1191,6 +1191,12 @@ static bool collectDirectInteriorTileBounds(
                   if (auto *Definition = dyn_cast<Instruction>(Operand))
                     LLVM_DEBUG(dbgs() << "  guard index operand: "
                                       << *Definition << '\n');
+                  if (auto *Definition = dyn_cast<BinaryOperator>(Operand))
+                    for (Value *Input : Definition->operands())
+                      if (auto *InputDefinition =
+                              dyn_cast<Instruction>(Input))
+                        LLVM_DEBUG(dbgs() << "  guard index input: "
+                                          << *InputDefinition << '\n');
             }
         }
         if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue())) {
