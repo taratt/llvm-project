@@ -421,6 +421,14 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
+/// Clone the narrow bmm_device kernel ABI into a full-tile-only entrypoint.
+class AMDGPUBMMInteriorSpecializationPass
+    : public PassInfoMixin<AMDGPUBMMInteriorSpecializationPass> {
+public:
+  AMDGPUBMMInteriorSpecializationPass() = default;
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
 class SIModeRegisterPass : public RequiredPassInfoMixin<SIModeRegisterPass> {
 public:
   SIModeRegisterPass() = default;

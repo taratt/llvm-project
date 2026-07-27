@@ -66,6 +66,10 @@ private:
   llvm::DenseMap<StringRef, llvm::GlobalValue *> KernelHandles;
   // Map a kernel handle to the kernel stub.
   llvm::DenseMap<llvm::GlobalValue *, llvm::Function *> KernelStubs;
+  // Extra HIP handles for the narrowly recognized full-tile BMM entrypoints.
+  // They are emitted only for host compilation with the opt-in POC enabled.
+  llvm::DenseMap<llvm::Function *, llvm::GlobalVariable *>
+      InteriorKernelHandles;
   struct VarInfo {
     llvm::GlobalVariable *Var;
     const VarDecl *D;
@@ -154,6 +158,10 @@ private:
   Address prepareKernelArgs(CodeGenFunction &CGF, FunctionArgList &Args);
   Address prepareKernelArgsLLVMOffload(CodeGenFunction &CGF,
                                        FunctionArgList &Args);
+  bool isBMMInteriorSpecializationCandidate(const FunctionDecl *FD,
+                                            const FunctionArgList &Args) const;
+  void maybeCreateBMMInteriorHandle(CodeGenFunction &CGF,
+                                    const FunctionArgList &Args);
   void emitDeviceStubBodyLegacy(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitDeviceStubBodyNew(CodeGenFunction &CGF, FunctionArgList &Args);
   std::string getDeviceSideName(const NamedDecl *ND) override;
@@ -226,6 +234,54 @@ std::string CGNVCUDARuntime::addPrefixToName(StringRef FuncName) const {
 std::string
 CGNVCUDARuntime::addUnderscoredPrefixToName(StringRef FuncName) const {
   return ("__" + Prefix + FuncName).str();
+}
+
+bool CGNVCUDARuntime::isBMMInteriorSpecializationCandidate(
+    const FunctionDecl *FD, const FunctionArgList &Args) const {
+  // This POC deliberately accepts one source ABI only:
+  // bmm_device(ptr, ptr, ptr, i32 B, i32 M, i32 N, i32 K, i64, i64, i64).
+  if (!FD || FD->getName() != "bmm_device" || Args.size() != 10 ||
+      FD->getNumParams() != 10)
+    return false;
+  for (unsigned I = 0; I != 3; ++I) {
+    QualType Ty = FD->getParamDecl(I)->getType();
+    if (!Ty->isPointerType() ||
+        !Ty->getPointeeType().getUnqualifiedType()->isSpecificBuiltinType(
+            BuiltinType::Float))
+      return false;
+  }
+  for (unsigned I = 3; I != 7; ++I)
+    if (!FD->getParamDecl(I)->getType()->isIntegerType() ||
+        CGM.getContext().getTypeSize(FD->getParamDecl(I)->getType()) != 32)
+      return false;
+  for (unsigned I = 7; I != 10; ++I)
+    if (!FD->getParamDecl(I)->getType()->isIntegerType() ||
+        CGM.getContext().getTypeSize(FD->getParamDecl(I)->getType()) != 64)
+      return false;
+  return true;
+}
+
+void CGNVCUDARuntime::maybeCreateBMMInteriorHandle(
+    CodeGenFunction &CGF, const FunctionArgList &Args) {
+  if (!CGF.getLangOpts().HIPBMMInteriorSpecialization ||
+      !CGF.getLangOpts().HIP || CGF.getLangOpts().CUDAIsDevice ||
+      !isBMMInteriorSpecializationCandidate(CGF.CurFuncDecl, Args) ||
+      InteriorKernelHandles.contains(CGF.CurFn))
+    return;
+
+  auto *Original =
+      dyn_cast<llvm::GlobalVariable>(KernelHandles[CGF.CurFn->getName()]);
+  if (!Original)
+    return;
+
+  auto *Interior = new llvm::GlobalVariable(
+      TheModule, Original->getValueType(), /*isConstant=*/true,
+      Original->getLinkage(), /*Initializer=*/nullptr,
+      (Original->getName() + ".interior").str());
+  Interior->setAlignment(Original->getAlign());
+  Interior->setDSOLocal(Original->isDSOLocal());
+  Interior->setVisibility(Original->getVisibility());
+  InteriorKernelHandles[CGF.CurFn] = Interior;
 }
 
 static std::unique_ptr<MangleContext> InitDeviceMC(CodeGenModule &CGM) {
@@ -336,6 +392,7 @@ void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
     GV->setLinkage(CGF.CurFn->getLinkage());
     GV->setInitializer(CGF.CurFn);
   }
+  maybeCreateBMMInteriorHandle(CGF, Args);
   if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
                          CudaFeature::CUDA_USES_NEW_LAUNCH) ||
       (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
@@ -477,6 +534,33 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
   // Emit the call to cudaLaunch
   llvm::Value *Kernel =
       CGF.Builder.CreatePointerCast(KernelHandles[CGF.CurFn->getName()], PtrTy);
+  if (auto It = InteriorKernelHandles.find(CGF.CurFn);
+      It != InteriorKernelHandles.end()) {
+    // The device clone removes M/N edge predicates. Select it only
+    // when the exact BMM ABI proves every launched tile is full.  The
+    // original handle remains the fallback for every other shape.
+    llvm::Value *M = CGF.Builder.CreateLoad(CGF.GetAddrOfLocalVar(Args[4]));
+    llvm::Value *N = CGF.Builder.CreateLoad(CGF.GetAddrOfLocalVar(Args[5]));
+    llvm::Value *K = CGF.Builder.CreateLoad(CGF.GetAddrOfLocalVar(Args[6]));
+    auto IsPositiveMultiple = [&](llvm::Value *Value, uint64_t Tile) {
+      llvm::Value *Positive = CGF.Builder.CreateICmpSGT(
+          Value, llvm::ConstantInt::get(Value->getType(), 0));
+      llvm::Value *Remainder = CGF.Builder.CreateAnd(
+          Value, llvm::ConstantInt::get(Value->getType(), Tile - 1));
+      return CGF.Builder.CreateAnd(
+          Positive, CGF.Builder.CreateICmpEQ(
+                        Remainder,
+                        llvm::ConstantInt::get(Value->getType(), 0)));
+    };
+    llvm::Value *FullTiles = CGF.Builder.CreateAnd(
+        IsPositiveMultiple(M, 128),
+        CGF.Builder.CreateAnd(IsPositiveMultiple(N, 128),
+                              IsPositiveMultiple(K, 32)));
+    llvm::Value *Interior =
+        CGF.Builder.CreatePointerCast(It->second, PtrTy);
+    Kernel = CGF.Builder.CreateSelect(FullTiles, Interior, Kernel,
+                                      "bmm.interior.kernel");
+  }
   CallArgList LaunchKernelArgs;
   LaunchKernelArgs.add(RValue::get(Kernel),
                        cudaLaunchKernelFD->getParamDecl(0)->getType());
@@ -664,6 +748,25 @@ llvm::Function *CGNVCUDARuntime::makeRegisterGlobalsFn() {
         NullPtr,
         llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(Context))};
     Builder.CreateCall(RegisterFunc, Args);
+    if (auto It = InteriorKernelHandles.find(I.Kernel);
+        It != InteriorKernelHandles.end()) {
+      std::string InteriorName =
+          getDeviceSideName(cast<NamedDecl>(I.D)) + ".interior";
+      llvm::Constant *InteriorKernelName = makeConstantString(InteriorName);
+      llvm::Value *InteriorArgs[] = {
+          &GpuBinaryHandlePtr,
+          It->second,
+          InteriorKernelName,
+          InteriorKernelName,
+          llvm::ConstantInt::getAllOnesValue(IntTy),
+          NullPtr,
+          NullPtr,
+          NullPtr,
+          NullPtr,
+          llvm::ConstantPointerNull::get(
+              llvm::PointerType::getUnqual(Context))};
+      Builder.CreateCall(RegisterFunc, InteriorArgs);
+    }
   }
 
   llvm::Type *VarSizeTy = IntTy;
@@ -1292,6 +1395,15 @@ void CGNVCUDARuntime::createOffloadingEntries() {
         M, Kind, KernelHandles[I.Kernel->getName()],
         getDeviceSideName(cast<NamedDecl>(I.D)), /*Flags=*/0, /*Data=*/0,
         llvm::offloading::OffloadGlobalEntry);
+  for (KernelInfo &I : EmittedKernels) {
+    auto It = InteriorKernelHandles.find(I.Kernel);
+    if (It == InteriorKernelHandles.end())
+      continue;
+    llvm::offloading::emitOffloadingEntry(
+        M, Kind, It->second,
+        getDeviceSideName(cast<NamedDecl>(I.D)) + ".interior",
+        /*Flags=*/0, /*Data=*/0, llvm::offloading::OffloadGlobalEntry);
+  }
 
   for (VarInfo &I : DeviceVars) {
     uint64_t VarSize =

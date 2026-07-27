@@ -7537,6 +7537,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (Args.hasFlag(options::OPT_fhip_new_launch_api,
                      options::OPT_fno_hip_new_launch_api, true))
       CmdArgs.push_back("-fhip-new-launch-api");
+    Args.addOptInFlag(CmdArgs, options::OPT_fhip_bmm_interior_specialization,
+                      options::OPT_fno_hip_bmm_interior_specialization);
+    if (Args.hasArg(options::OPT_fhip_bmm_interior_specialization))
+      CmdArgs.append({"-mllvm", "-amdgpu-enable-bmm-interior-specialization"});
     Args.addOptInFlag(CmdArgs, options::OPT_fgpu_allow_device_init,
                       options::OPT_fno_gpu_allow_device_init);
     Args.AddLastArg(CmdArgs, options::OPT_hipstdpar);

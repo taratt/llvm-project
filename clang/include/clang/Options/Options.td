@@ -1490,6 +1490,14 @@ defm hip_new_launch_api : BoolFOption<"hip-new-launch-api",
   PosFlag<SetTrue, [], [ClangOption, CC1Option], "Use">,
   NegFlag<SetFalse, [], [ClangOption], "Don't use">,
   BothFlags<[], [ClangOption], " new kernel launching API for HIP">>;
+defm hip_bmm_interior_specialization :
+  BoolFOption<"hip-bmm-interior-specialization",
+    LangOpts<"HIPBMMInteriorSpecialization">, DefaultFalse,
+    PosFlag<SetTrue, [], [ClangOption, CC1Option], "Enable">,
+    NegFlag<SetFalse, [], [ClangOption], "Disable">,
+    BothFlags<[], [ClangOption],
+      " source-transparent full-tile specialization for the recognized "
+      "bmm_device HIP kernel ABI">>;
 defm hip_fp32_correctly_rounded_divide_sqrt : BoolFOption<"hip-fp32-correctly-rounded-divide-sqrt",
   CodeGenOpts<"HIPCorrectlyRoundedDivSqrt">, DefaultTrue,
   PosFlag<SetTrue, [], [ClangOption], "Specify">,

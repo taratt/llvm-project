@@ -33,6 +33,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cstdint>
 
@@ -2120,6 +2121,93 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
   return Changed;
 }
 
+static bool isBMMInteriorABI(const Function &F) {
+  if (F.getName() != "bmm_device" || !AMDGPU::isEntryFunctionCC(F.getCallingConv()) ||
+      F.arg_size() != 10)
+    return false;
+  auto Arg = F.arg_begin();
+  for (unsigned I = 0; I != 3; ++I, ++Arg)
+    if (!Arg->getType()->isPointerTy())
+      return false;
+  for (unsigned I = 0; I != 4; ++I, ++Arg)
+    if (!Arg->getType()->isIntegerTy(32))
+      return false;
+  for (unsigned I = 0; I != 3; ++I, ++Arg)
+    if (!Arg->getType()->isIntegerTy(64))
+      return false;
+  return true;
+}
+
+static bool dependsOnBMMExtent(Value *V, ArrayRef<Argument *> Extents,
+                               SmallPtrSetImpl<Value *> &Visited) {
+  if (!Visited.insert(V).second)
+    return false;
+  for (Argument *Extent : Extents)
+    if (Extent == V)
+      return true;
+  if (auto *I = dyn_cast<Instruction>(V))
+    for (Value *Operand : I->operands())
+      if (dependsOnBMMExtent(Operand, Extents, Visited))
+        return true;
+  return false;
+}
+
+/// Remove a comparison only where a positive full-tile extent proves which
+/// edge of the conditional is safe.  Require a workgroup/workitem dependent
+/// operand: this excludes scalar K-loop termination tests, whose direction
+/// cannot be replaced without changing trip counts.
+static bool removeFullTileChecks(Function &F) {
+  SmallVector<Argument *, 3> Extents;
+  auto Arg = F.arg_begin();
+  std::advance(Arg, 4); // B, M, N, K are arguments 3..6.
+  Extents.push_back(&*Arg++); // M
+  Extents.push_back(&*Arg++); // N
+  Extents.push_back(&*Arg);   // K
+
+  SmallVector<BranchInst *, 16> Checks;
+  for (BasicBlock &BB : F) {
+    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+    auto *Cmp = BI && BI->isConditional()
+                    ? dyn_cast<ICmpInst>(BI->getCondition())
+                    : nullptr;
+    if (!Cmp)
+      continue;
+    SmallPtrSet<Value *, 32> Visited;
+    SmallPtrSet<Value *, 32> LeftIDs;
+    SmallPtrSet<Value *, 32> RightIDs;
+    unsigned IDs = getIDDependencies(Cmp->getOperand(0), LeftIDs) |
+                   getIDDependencies(Cmp->getOperand(1), RightIDs);
+    if (IDs != DependsOnNone && dependsOnBMMExtent(Cmp, Extents, Visited))
+      Checks.push_back(BI);
+  }
+
+  bool Changed = false;
+  for (BranchInst *BI : Checks) {
+    auto *Cmp = cast<ICmpInst>(BI->getCondition());
+    unsigned SafeSuccessor;
+    switch (Cmp->getPredicate()) {
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_SLE:
+    case CmpInst::ICMP_ULE:
+      SafeSuccessor = 0;
+      break;
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_UGT:
+      SafeSuccessor = 1;
+      break;
+    default:
+      continue;
+    }
+    BranchInst::Create(BI->getSuccessor(SafeSuccessor), BI);
+    BI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 class AMDGPUInteriorTileSplitLegacy : public FunctionPass {
 public:
   static char ID;
@@ -2150,6 +2238,23 @@ public:
 };
 
 } // end anonymous namespace
+
+PreservedAnalyses AMDGPUBMMInteriorSpecializationPass::run(
+    Module &M, ModuleAnalysisManager &) {
+  Function *Original = M.getFunction("bmm_device");
+  if (!Original || !isBMMInteriorABI(*Original) ||
+      M.getFunction("bmm_device.interior"))
+    return PreservedAnalyses::all();
+
+  ValueToValueMapTy VMap;
+  Function *Interior = CloneFunction(Original, VMap);
+  Interior->setName("bmm_device.interior");
+  // Host registration references this name from another compilation unit, so
+  // retain it even if no direct device-side call names the clone.
+  appendToCompilerUsed(M, {Interior});
+  removeFullTileChecks(*Interior);
+  return PreservedAnalyses::none();
+}
 
 PreservedAnalyses
 AMDGPUInteriorTileSplitPass::run(Function &F, FunctionAnalysisManager &FAM) {

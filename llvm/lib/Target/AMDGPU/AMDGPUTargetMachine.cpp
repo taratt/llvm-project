@@ -650,6 +650,11 @@ static cl::opt<bool> EnableInteriorTileSplit(
     cl::desc("Identify and specialize AMDGPU interior tile regions"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> EnableBMMInteriorSpecialization(
+    "amdgpu-enable-bmm-interior-specialization",
+    cl::desc("Clone the recognized HIP bmm_device full-tile kernel"),
+    cl::init(false), cl::Hidden);
+
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   // Register the target
   RegisterTargetMachine<R600TargetMachine> X(getTheR600Target());
@@ -1037,6 +1042,9 @@ void AMDGPUTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
       [this](ModulePassManager &PM, OptimizationLevel Level,
              ThinOrFullLTOPhase Phase) {
         if (!isLTOPreLink(Phase) && getTargetTriple().isAMDGCN()) {
+          if (EnableBMMInteriorSpecialization)
+            PM.addPass(AMDGPUBMMInteriorSpecializationPass());
+
           // When we are not using -fgpu-rdc, we can run accelerator code
           // selection relatively early, but still after linking to prevent
           // eager removal of potentially reachable symbols.
