@@ -594,7 +594,11 @@ stage.header:
   br label %stage.m.check
 
 stage.m.check:
-  %m.index = add i32 %y.base, %stage.i
+  ; A staging index may be widened before mapping it back to a tile row.
+  ; Proving the pre-shift range proves this right-shifted offset is < 128.
+  %m.offset.wide = shl i32 %stage.i, 5
+  %m.offset = lshr i32 %m.offset.wide, 5
+  %m.index = add i32 %y.base, %m.offset
   %m.direct.in.bounds = icmp slt i32 %m.index, %m
   ; This is `stage.i < 128 && m.index < m` after InstCombine.
   %m.loop.guard = icmp ult i32 %stage.i, 128

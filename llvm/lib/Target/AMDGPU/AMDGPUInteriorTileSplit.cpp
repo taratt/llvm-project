@@ -289,6 +289,24 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     return true;
   }
 
+  if (auto *Shift = dyn_cast<BinaryOperator>(Offset)) {
+    if (Shift->getOpcode() == Instruction::LShr) {
+      auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+      if (!Amount || Amount->getZExtValue() >= 64)
+        return false;
+      uint64_t ShiftAmount = Amount->getZExtValue();
+      if (Limit > (UINT64_MAX >> ShiftAmount))
+        return false;
+      uint64_t OperandMaximum;
+      if (!getUnsignedOffsetMaximumBelow(Shift->getOperand(0),
+                                         Limit << ShiftAmount, SE,
+                                         OperandMaximum))
+        return false;
+      Maximum = OperandMaximum >> ShiftAmount;
+      return true;
+    }
+  }
+
   auto *Add = dyn_cast<BinaryOperator>(Offset);
   if (!Add || Add->getOpcode() != Instruction::Add)
     return false;
