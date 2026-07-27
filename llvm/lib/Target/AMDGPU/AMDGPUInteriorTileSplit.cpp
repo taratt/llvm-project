@@ -1804,8 +1804,9 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
     if (Remainder) {
       auto *ClonedBranch =
           cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
-      Value *ClonedRemainder =
-          MapValue(Remainder, VMap, RF_IgnoreMissingLocals);
+      Value *ClonedRemainder = Remainder;
+      if (Value *Mapped = VMap.lookup(Remainder))
+        ClonedRemainder = Mapped;
       ClonedBranch->setCondition(ClonedRemainder);
       ++RemovedSafetyBranches;
       continue;
