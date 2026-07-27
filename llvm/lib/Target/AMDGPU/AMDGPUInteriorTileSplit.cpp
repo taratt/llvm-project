@@ -1191,12 +1191,27 @@ static bool collectDirectInteriorTileBounds(
                   if (auto *Definition = dyn_cast<Instruction>(Operand))
                     LLVM_DEBUG(dbgs() << "  guard index operand: "
                                       << *Definition << '\n');
-                  if (auto *Definition = dyn_cast<BinaryOperator>(Operand))
-                    for (Value *Input : Definition->operands())
+                  if (auto *Definition = dyn_cast<BinaryOperator>(Operand)) {
+                    for (Value *Input : Definition->operands()) {
                       if (auto *InputDefinition =
                               dyn_cast<Instruction>(Input))
                         LLVM_DEBUG(dbgs() << "  guard index input: "
                                           << *InputDefinition << '\n');
+                      if (auto *Phi = dyn_cast<PHINode>(Input))
+                        for (Value *Incoming : Phi->incoming_values())
+                          if (auto *IncomingDefinition =
+                                  dyn_cast<Instruction>(Incoming))
+                            LLVM_DEBUG(dbgs()
+                                       << "  guard index phi input: "
+                                       << *IncomingDefinition << '\n');
+                    }
+                  }
+                  if (auto *Phi = dyn_cast<PHINode>(Operand))
+                    for (Value *Incoming : Phi->incoming_values())
+                      if (auto *IncomingDefinition =
+                              dyn_cast<Instruction>(Incoming))
+                        LLVM_DEBUG(dbgs() << "  guard index phi input: "
+                                          << *IncomingDefinition << '\n');
                 }
               }
             }
