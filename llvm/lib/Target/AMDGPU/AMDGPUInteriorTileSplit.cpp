@@ -321,6 +321,88 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   return true;
 }
 
+static bool dependsOnValue(Value *V, Value *Needle,
+                           SmallPtrSetImpl<Value *> &Visited) {
+  if (V == Needle)
+    return true;
+  if (!Visited.insert(V).second)
+    return false;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  for (Value *Operand : I->operands())
+    if (dependsOnValue(Operand, Needle, Visited))
+      return true;
+  return false;
+}
+
+/// Recover the range of a Clang-expanded staging induction variable.  LTO can
+/// obscure this recurrence from ScalarEvolution, but the loop itself still
+/// proves it: the PHI starts from a workitem ID, advances by a positive
+/// constant, and its in-loop successor is guarded by an unsigned/signed
+/// constant upper bound.
+static bool getLoopBoundedShiftedOffsetMaximum(Value *Offset, uint64_t Limit,
+                                                LoopInfo &LI,
+                                                uint64_t &Maximum) {
+  auto *Shift = dyn_cast<BinaryOperator>(Offset);
+  if (!Shift || Shift->getOpcode() != Instruction::LShr)
+    return false;
+  auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+  auto *Phi = dyn_cast<PHINode>(Shift->getOperand(0));
+  if (!Amount || !Phi || Amount->getZExtValue() >= 64)
+    return false;
+  uint64_t ShiftAmount = Amount->getZExtValue();
+  if (Limit > (UINT64_MAX >> ShiftAmount))
+    return false;
+  uint64_t PreShiftLimit = Limit << ShiftAmount;
+
+  Loop *L = LI.getLoopFor(Phi->getParent());
+  if (!L)
+    return false;
+  bool HasWorkitemStart = false;
+  bool HasPositiveStep = false;
+  for (Value *Incoming : Phi->incoming_values()) {
+    SmallPtrSet<Value *, 16> Visited;
+    HasWorkitemStart |=
+        getIDDependencies(Incoming, Visited) == DependsOnWorkitemID;
+    auto *Add = dyn_cast<BinaryOperator>(Incoming);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      continue;
+    Value *Other = Add->getOperand(0) == Phi ? Add->getOperand(1)
+                                             : Add->getOperand(0);
+    if (Add->getOperand(0) != Phi && Add->getOperand(1) != Phi)
+      continue;
+    auto *Step = dyn_cast<ConstantInt>(Other);
+    HasPositiveStep |= Step && !Step->isNegative() && !Step->isZero();
+  }
+  if (!HasWorkitemStart || !HasPositiveStep)
+    return false;
+
+  SmallVector<BasicBlock *, 4> ExitingBlocks;
+  L->getExitingBlocks(ExitingBlocks);
+  for (BasicBlock *Exiting : ExitingBlocks) {
+    auto *Branch = dyn_cast<BranchInst>(Exiting->getTerminator());
+    if (!Branch || !Branch->isConditional() ||
+        !L->contains(Branch->getSuccessor(0)))
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(Branch->getCondition());
+    if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_ULT &&
+                 Cmp->getPredicate() != ICmpInst::ICMP_SLT))
+      continue;
+    auto *Bound = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+    if (!Bound || Bound->isNegative())
+      continue;
+    uint64_t BoundValue = Bound->getZExtValue();
+    SmallPtrSet<Value *, 32> Visited;
+    if (BoundValue <= 1023 || BoundValue > PreShiftLimit ||
+        !dependsOnValue(Cmp->getOperand(0), Phi, Visited))
+      continue;
+    Maximum = (BoundValue - 1) >> ShiftAmount;
+    return Maximum < Limit;
+  }
+  return false;
+}
+
 /// Match `Base + Offset < Bound` for the exact Base/Bound pair selected by
 /// Full.  Direct lane forms use the architectural lane proof; nested staging
 /// forms use SCEV's unsigned range for their affine offset.
@@ -365,6 +447,7 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
 /// so this cannot turn a lane-varying predicate into a CTA dispatch.
 static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
                                     UniformityInfo &UI, ScalarEvolution &SE,
+                                    LoopInfo &LI,
                                     CanonicalTileRemainder &Remainder) {
   // InstCombine represents a short-circuit conjunction as
   // `select guard, bound-check, false`.  The tile-bound conjunct remains a
@@ -374,9 +457,9 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
     auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
     if (False && False->isZero())
       return getDirectTileBoundCheck(Select->getTrueValue(), Dimension, UI,
-                                     SE, Remainder) ||
+                                     SE, LI, Remainder) ||
              getDirectTileBoundCheck(Select->getCondition(), Dimension, UI,
-                                     SE, Remainder);
+                                     SE, LI, Remainder);
   }
 
   auto *Cmp = dyn_cast<ICmpInst>(V);
@@ -409,7 +492,8 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
   uint64_t Maximum;
   if (!Base ||
       !((getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
-        getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum)))
+        getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum) ||
+        getLoopBoundedShiftedOffsetMaximum(Offset, 128, LI, Maximum)))
     return false;
 
   Remainder = {Dimension, Bound, Base, nullptr};
@@ -1159,7 +1243,7 @@ static bool collectInteriorTileSetup(
 /// staging loops.  Do not search outside the candidate outer K loop, and
 /// reject competing base/bound pairs rather than choosing one by order.
 static bool collectDirectInteriorTileBounds(
-    Loop *L, UniformityInfo &UI, ScalarEvolution &SE,
+    Loop *L, UniformityInfo &UI, ScalarEvolution &SE, LoopInfo &LI,
     CanonicalTileRemainder &M, CanonicalTileRemainder &N, bool &HasM,
     bool &HasN, bool &HasDirectM, bool &HasDirectN) {
   auto Record = [](const CanonicalTileRemainder &Remainder,
@@ -1225,13 +1309,13 @@ static bool collectDirectInteriorTileBounds(
       }
     }
     CanonicalTileRemainder Remainder;
-    if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE,
+    if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE, LI,
                                 Remainder)) {
       HasDirectM = true;
       if (!Record(Remainder, M, HasM))
         return false;
     }
-    if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE,
+    if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE, LI,
                                 Remainder)) {
       HasDirectN = true;
       if (!Record(Remainder, N, HasN))
@@ -1735,7 +1819,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
       collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN);
   bool HasDirectSetup =
       HasCanonicalSetup &&
-      collectDirectInteriorTileBounds(L, UI, SE, M, N, HasM, HasN,
+      collectDirectInteriorTileBounds(L, UI, SE, LI, M, N, HasM, HasN,
                                       HasDirectM, HasDirectN);
   LLVM_DEBUG(dbgs() << "Interior staging setup for "
                     << L->getHeader()->getName()
