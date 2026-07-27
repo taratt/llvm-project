@@ -18,9 +18,9 @@ void launch(const float *a, const float *b, float *c, int batch, int m, int n,
 // interior handle only for 128x128x32-divisible launches.
 // CHECK: @{{.*bmm_device.*}}.interior ={{.*}}constant ptr
 // CHECK: @{{.*bmm_device.*}}.interior
-// CHECK: bmm.interior.kernel
 // CHECK: and i32 {{.*}}, 127
 // CHECK: and i32 {{.*}}, 31
+// CHECK: bmm.interior.kernel
 // CHECK: __hipRegisterFunction
 // CHECK: .interior
 
