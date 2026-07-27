@@ -1163,10 +1163,18 @@ static bool collectDirectInteriorTileBounds(
       LLVM_DEBUG(dbgs() << "Interior direct-bound candidate: "
                         << *Branch->getCondition() << '\n');
       if (auto *Select = dyn_cast<SelectInst>(Branch->getCondition())) {
-        if (auto *Guard = dyn_cast<Instruction>(Select->getCondition()))
+        if (auto *Guard = dyn_cast<Instruction>(Select->getCondition())) {
           LLVM_DEBUG(dbgs() << "  conjunction guard: " << *Guard << '\n');
-        if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue()))
+          if (auto *Cmp = dyn_cast<ICmpInst>(Guard))
+            if (auto *Index = dyn_cast<Instruction>(Cmp->getOperand(0)))
+              LLVM_DEBUG(dbgs() << "  guard index: " << *Index << '\n');
+        }
+        if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue())) {
           LLVM_DEBUG(dbgs() << "  conjunction check: " << *Check << '\n');
+          if (auto *Cmp = dyn_cast<ICmpInst>(Check))
+            if (auto *Index = dyn_cast<Instruction>(Cmp->getOperand(0)))
+              LLVM_DEBUG(dbgs() << "  check index: " << *Index << '\n');
+        }
       }
     }
     CanonicalTileRemainder Remainder;
