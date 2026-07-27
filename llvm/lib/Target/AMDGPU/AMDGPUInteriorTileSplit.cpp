@@ -496,7 +496,7 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
         getLoopBoundedShiftedOffsetMaximum(Offset, 128, LI, Maximum)))
     return false;
 
-  Remainder = {Dimension, Bound, Base, nullptr};
+  Remainder = {Dimension, Bound, Base, Cmp};
   return true;
 }
 
@@ -945,6 +945,30 @@ static bool getRemovablePrefixGuardOutcome(
     return true;
   }
   return getRemovableSafetyBranchOutcome(Branch, FullChecks, SE, Outcome);
+}
+
+/// Return the non-M/N conjunct of `select(lhs, rhs, false)`.  Direct-bound
+/// analysis has already proved every value in DirectGuards is a tile-bound
+/// check covered by the uniform interior dispatch; the remaining conjunct
+/// (normally the K check) must stay in the cloned path.
+static Value *getInteriorConjunctionRemainder(
+    Value *V, ArrayRef<Value *> DirectGuards) {
+  auto *Select = dyn_cast<SelectInst>(V);
+  auto *FalseValue = Select ? dyn_cast<ConstantInt>(Select->getFalseValue())
+                            : nullptr;
+  if (!FalseValue || !FalseValue->isZero())
+    return nullptr;
+  auto IsDirectGuard = [&](Value *Candidate) {
+    for (Value *Guard : DirectGuards)
+      if (Candidate == Guard)
+        return true;
+    return false;
+  };
+  if (IsDirectGuard(Select->getCondition()))
+    return Select->getTrueValue();
+  if (IsDirectGuard(Select->getTrueValue()))
+    return Select->getCondition();
+  return nullptr;
 }
 
 static void collectConjuncts(Value *V, SmallVectorImpl<Value *> &Conjuncts) {
@@ -1616,6 +1640,7 @@ static bool hasOnlySharedBarrierExits(
 static bool canCloneStagingRegion(
     BasicBlock *Entry, const SmallPtrSetImpl<BasicBlock *> &Region,
     BasicBlock *Barrier, ArrayRef<FullTileBoundCheck> FullChecks,
+    ArrayRef<Value *> DirectGuards,
     ArrayRef<Value *> Alignments, PHINode *IV, Value *Bound,
     ScalarEvolution &SE, bool IgnoreEntryInstructions = false) {
   if (isa<PHINode>(&Barrier->front())) {
@@ -1654,6 +1679,10 @@ static bool canCloneStagingRegion(
     HasRemovableSafetyBranch |= getRemovablePrefixGuardOutcome(
         cast<BranchInst>(BB->getTerminator()), IV, Bound, FullChecks,
         Alignments, SE, Outcome);
+    if (!HasRemovableSafetyBranch)
+      HasRemovableSafetyBranch = getInteriorConjunctionRemainder(
+          cast<BranchInst>(BB->getTerminator())->getCondition(),
+          DirectGuards);
   }
   if (!HasRemovableSafetyBranch)
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
@@ -1732,10 +1761,11 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
                                const SmallPtrSetImpl<BasicBlock *> &Region,
                                BasicBlock *Barrier,
                                ArrayRef<FullTileBoundCheck> FullChecks,
+                               ArrayRef<Value *> DirectGuards,
                                ArrayRef<Value *> Alignments, PHINode *IV,
                                Value *Bound, ScalarEvolution &SE) {
-  if (!canCloneStagingRegion(Entry, Region, Barrier, FullChecks, Alignments,
-                             IV, Bound, SE))
+  if (!canCloneStagingRegion(Entry, Region, Barrier, FullChecks, DirectGuards,
+                             Alignments, IV, Bound, SE))
     return false;
 
   unsigned EntrySuccessor = 0;
@@ -1765,6 +1795,18 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   unsigned RemovedSafetyBranches = 0;
   for (BasicBlock *BB : RegionBlocks) {
     auto *OriginalBranch = cast<BranchInst>(BB->getTerminator());
+    Value *Remainder =
+        getInteriorConjunctionRemainder(OriginalBranch->getCondition(),
+                                        DirectGuards);
+    if (Remainder) {
+      auto *ClonedBranch =
+          cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
+      Value *ClonedRemainder =
+          MapValue(Remainder, VMap, RF_IgnoreMissingLocals);
+      ClonedBranch->setCondition(ClonedRemainder);
+      ++RemovedSafetyBranches;
+      continue;
+    }
     GuardOutcome Outcome;
     if (!getRemovablePrefixGuardOutcome(OriginalBranch, IV, Bound, FullChecks,
                                         Alignments, SE, Outcome))
@@ -1839,6 +1881,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   SmallVector<FullTileBoundCheck, 2> FullChecks{
       {1, M.Bound, M.Base, /*IsSigned=*/true},
       {0, N.Bound, N.Base, /*IsSigned=*/true}};
+  SmallVector<Value *, 2> DirectGuards{M.Difference, N.Difference};
 
   // First prove the old CFG, before changing it.  The candidate must end at a
   // shared barrier whose exits remain in the outer K iteration and outside
@@ -1866,7 +1909,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
         !L->contains(CandidateBarrier) ||
         !hasOnlySharedBarrierExits(L, Candidate, CandidateBarrier) ||
         !canCloneStagingRegion(BB, Candidate, CandidateBarrier, FullChecks,
-                               Alignments, IV, Bound, SE,
+                               DirectGuards, Alignments, IV, Bound, SE,
                                /*IgnoreEntryInstructions=*/IsHeader))
       continue;
     StagingEntry = BB;
@@ -1916,7 +1959,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
       SharedBarrier != Barrier ||
       !hasOnlySharedBarrierExits(L, Region, SharedBarrier) ||
       !canCloneStagingRegion(StagingEntry, Region, SharedBarrier, FullChecks,
-                             Alignments, IV, Bound, SE))
+                             DirectGuards, Alignments, IV, Bound, SE))
     llvm_unreachable("preflighted staging CFG changed unexpectedly");
 
   // The new block is inside the outer loop, so this full-K predicate is
@@ -1937,7 +1980,7 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
 
   bool Changed = cloneStagingRegion(
       F, cast<BranchInst>(Dispatch->getTerminator()), StagingEntry, Region,
-      SharedBarrier, FullChecks, Alignments, IV, Bound, SE);
+      SharedBarrier, FullChecks, DirectGuards, Alignments, IV, Bound, SE);
   if (Changed && HasNestedStagingLoop)
     LLVM_DEBUG(dbgs() << "Cloned nested-loop staging region in " << F.getName()
                       << "; outer K latch and shared barrier were retained\n");
@@ -2023,7 +2066,7 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
         continue;
 
       if (cloneStagingRegion(F, Branch, Successor, Region, Barrier,
-                             FullChecks, {}, nullptr, nullptr, SE))
+                             FullChecks, {}, {}, nullptr, nullptr, SE))
         return true;
     }
   }
