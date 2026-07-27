@@ -1186,8 +1186,8 @@ static bool collectDirectInteriorTileBounds(
           if (auto *Cmp = dyn_cast<ICmpInst>(Guard))
             if (auto *Index = dyn_cast<Instruction>(Cmp->getOperand(0))) {
               LLVM_DEBUG(dbgs() << "  guard index: " << *Index << '\n');
-              if (auto *Binary = dyn_cast<BinaryOperator>(Index))
-                for (Value *Operand : Binary->operands())
+              if (auto *Binary = dyn_cast<BinaryOperator>(Index)) {
+                for (Value *Operand : Binary->operands()) {
                   if (auto *Definition = dyn_cast<Instruction>(Operand))
                     LLVM_DEBUG(dbgs() << "  guard index operand: "
                                       << *Definition << '\n');
@@ -1197,6 +1197,8 @@ static bool collectDirectInteriorTileBounds(
                               dyn_cast<Instruction>(Input))
                         LLVM_DEBUG(dbgs() << "  guard index input: "
                                           << *InputDefinition << '\n');
+                }
+              }
             }
         }
         if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue())) {
