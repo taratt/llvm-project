@@ -1651,9 +1651,20 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   SmallVector<Value *, 4> Alignments;
   bool HasM = false, HasN = false;
   bool HasDirectM = false, HasDirectN = false;
-  if (!collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN) ||
-      !collectDirectInteriorTileBounds(L, UI, SE, M, N, HasM, HasN,
-                                       HasDirectM, HasDirectN) ||
+  bool HasCanonicalSetup =
+      collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN);
+  bool HasDirectSetup =
+      HasCanonicalSetup &&
+      collectDirectInteriorTileBounds(L, UI, SE, M, N, HasM, HasN,
+                                      HasDirectM, HasDirectN);
+  LLVM_DEBUG(dbgs() << "Interior staging setup for "
+                    << L->getHeader()->getName()
+                    << ": canonical=" << HasCanonicalSetup
+                    << " M=" << HasM << " N=" << HasN
+                    << " direct-M=" << HasDirectM
+                    << " direct-N=" << HasDirectN
+                    << " alignments=" << Alignments.size() << '\n');
+  if (!HasCanonicalSetup || !HasDirectSetup ||
       !HasM || !HasN ||
       (Alignments.empty() && !(HasDirectM && HasDirectN))) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
