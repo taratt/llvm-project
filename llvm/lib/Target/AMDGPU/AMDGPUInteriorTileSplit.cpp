@@ -1144,6 +1144,11 @@ static bool collectDirectInteriorTileBounds(
     auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
     if (!Branch || !Branch->isConditional())
       continue;
+    SmallPtrSet<Value *, 16> Visited;
+    if (getIDDependencies(Branch->getCondition(), Visited) &
+        DependsOnWorkgroupID)
+      LLVM_DEBUG(dbgs() << "Interior direct-bound candidate: "
+                        << *Branch->getCondition() << '\n');
     CanonicalTileRemainder Remainder;
     if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE,
                                 Remainder)) {
