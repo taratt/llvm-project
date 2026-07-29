@@ -2155,16 +2155,8 @@ bool SITargetLowering::canMergeStoresTo(unsigned AS, EVT MemVT,
     unsigned MaxPrivateBits = 8 * getSubtarget()->getMaxPrivateElementSize();
     return (MemVT.getSizeInBits() <= MaxPrivateBits);
   }
-  if (AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::REGION_ADDRESS) {
-    // The SelectionDAG store merger may form a 128-bit local store when the
-    // subtarget can select it as a ds_write_b128.  Restrict older subtargets
-    // to the existing ds_write2_b32/b64 width.
-    unsigned MaxLocalBits =
-        getSubtarget()->hasDS96AndDS128() && getSubtarget()->useDS128()
-            ? 4 * 32
-            : 2 * 32;
-    return MemVT.getSizeInBits() <= MaxLocalBits;
-  }
+  if (AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::REGION_ADDRESS)
+    return (MemVT.getSizeInBits() <= 2 * 32);
   return true;
 }
 
