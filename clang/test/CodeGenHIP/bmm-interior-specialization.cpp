@@ -15,9 +15,10 @@ void launch(const float *a, const float *b, float *c, int batch, int m, int n,
 
 // The host module registers both entrypoints. The new-launch stub loads the
 // M/N/K ABI slots, performs positive power-of-two tile tests, and selects the
-// interior handle only for 128x128x32-divisible launches.
-// CHECK: @{{.*bmm_device.*}}.interior ={{.*}}constant ptr
-// CHECK: @{{.*bmm_device.*}}.interior
+// interior handle only for 128x128x32-divisible launches. The `.interior`
+// handle must be a defined host symbol (same stub initializer as the original)
+// so the final host .so does not have an undefined reference.
+// CHECK: @{{.*bmm_device.*}}.interior ={{.*}}constant ptr @{{.*}}
 // CHECK: and i32 {{.*}}, 31
 // CHECK: and i32 {{.*}}, 127
 // CHECK: and i32 {{.*}}, 127

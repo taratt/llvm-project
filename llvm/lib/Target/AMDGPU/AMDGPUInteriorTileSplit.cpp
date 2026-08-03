@@ -8,13 +8,16 @@
 //
 /// \file
 /// Clones a deliberately narrow GEMM staging shape behind a workgroup-uniform
-/// interior dispatch.  The proof rejects shapes which could accidentally clone
-/// an outer loop or a barrier.
+/// interior dispatch, then rewrites proven-interior global→LDS staging into
+/// unguarded <4 x float> traffic (and merges adjacent scalar float chains).
+/// The proof rejects shapes which could accidentally clone an outer loop or a
+/// barrier.
 ///
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPU.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -22,13 +25,20 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -36,6 +46,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cstdint>
+#include <optional>
 
 #define DEBUG_TYPE "amdgpu-interior-tile-split"
 
@@ -47,13 +58,23 @@ STATISTIC(NumPreparedInteriorTileSplits,
           "Number of canonical interior-tile splits cloned");
 STATISTIC(NumPreparedInteriorKLoopSplits,
           "Number of canonical interior K loops versioned");
+STATISTIC(NumInteriorStagingVectorWidens,
+          "Number of interior cooperative staging loops widened to <4 x float>");
+STATISTIC(NumInteriorFloatChainsVectorized,
+          "Number of interior adjacent float load/store chains vectorized");
 
 namespace {
 
-// Cloning a large pre-barrier graph duplicates enough code and live ranges to
-// outweigh removing its lane guards.  Keep the clone deliberately local: the
-// outer-K scan can still select a later closed staging subregion.
-constexpr unsigned MaxStagingCloneBlocks = 6;
+// Cloning a large pre-barrier graph duplicates live ranges.  With unguarded
+// float4 rewriting on the fast path the payoff can outweigh that cost, so the
+// limit is higher than the original guard-stripping-only POC.
+constexpr unsigned MaxStagingCloneBlocks = 16;
+constexpr unsigned VectorWidth = 4;
+
+static cl::opt<bool> EnableInteriorTileVectorize(
+    "amdgpu-interior-tile-vectorize",
+    cl::desc("Rewrite proven-interior GEMM staging to <4 x float> loads/stores"),
+    cl::init(true), cl::Hidden);
 
 enum IDDependency : unsigned {
   DependsOnNone = 0,
@@ -1760,6 +1781,489 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE, PHINode *&IV,
   return false;
 }
 
+static Type *getFloatTy(LLVMContext &Ctx) { return Type::getFloatTy(Ctx); }
+
+static FixedVectorType *getFloat4Ty(LLVMContext &Ctx) {
+  return FixedVectorType::get(getFloatTy(Ctx), VectorWidth);
+}
+
+/// Return C if V is (IV urem C) or (IV and (C-1)) with C a power of two.
+static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::URem && BO->getOperand(0) == IV) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        Modulus = C->getZExtValue();
+        return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
+      }
+    }
+    if (BO->getOpcode() == Instruction::And && BO->getOperand(0) == IV) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        uint64_t Mask = C->getZExtValue();
+        if (Mask && ((Mask + 1) & Mask) == 0) {
+          Modulus = static_cast<unsigned>(Mask + 1);
+          return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor) {
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::UDiv && BO->getOperand(0) == IV) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        Divisor = C->getZExtValue();
+        return Divisor >= VectorWidth && (Divisor % VectorWidth) == 0;
+      }
+    }
+    if (BO->getOpcode() == Instruction::LShr && BO->getOperand(0) == IV) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        unsigned Shift = C->getZExtValue();
+        if (Shift >= 2 && Shift < 31) {
+          Divisor = 1u << Shift;
+          return (Divisor % VectorWidth) == 0;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool isLocalOrLDSPointer(Value *Ptr) {
+  return Ptr->getType()->getPointerAddressSpace() == AMDGPUAS::LOCAL_ADDRESS;
+}
+
+static bool isGlobalPointer(Value *Ptr) {
+  unsigned AS = Ptr->getType()->getPointerAddressSpace();
+  return AS == AMDGPUAS::GLOBAL_ADDRESS || AS == AMDGPUAS::CONSTANT_ADDRESS;
+}
+
+/// Replace IV%Mod / IV/Mod with IV%(Mod/4) and (IV%(Mod/4))*4 / IV/(Mod/4).
+static bool rewriteIndexForFloat4(PHINode *IV, unsigned Modulus,
+                                  SmallVectorImpl<Instruction *> &ToErase) {
+  unsigned Inner4 = Modulus / VectorWidth;
+  SmallVector<Instruction *, 8> Rems;
+  SmallVector<Instruction *, 8> Divs;
+  for (User *U : IV->users()) {
+    unsigned M = 0, D = 0;
+    if (matchUnitStrideRem(U, IV, M) && M == Modulus)
+      Rems.push_back(cast<Instruction>(U));
+    if (matchUnitStrideDiv(U, IV, D) && D == Modulus)
+      Divs.push_back(cast<Instruction>(U));
+  }
+  if (Rems.empty() || Divs.empty())
+    return false;
+
+  IRBuilder<> B(&*IV->getParent()->getFirstInsertionPt());
+  Value *Inner4C = ConstantInt::get(IV->getType(), Inner4);
+  Value *VecC = ConstantInt::get(IV->getType(), VectorWidth);
+  Value *NewRem = B.CreateURem(IV, Inner4C, IV->getName() + ".col4");
+  Value *NewRemScaled =
+      B.CreateMul(NewRem, VecC, IV->getName() + ".col4.scaled", true, true);
+  Value *NewDiv = B.CreateUDiv(IV, Inner4C, IV->getName() + ".row4");
+
+  for (Instruction *Rem : Rems) {
+    Rem->replaceAllUsesWith(NewRemScaled);
+    ToErase.push_back(Rem);
+  }
+  for (Instruction *Div : Divs) {
+    Div->replaceAllUsesWith(NewDiv);
+    ToErase.push_back(Div);
+  }
+  return true;
+}
+
+static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
+  if (!LI || !SI || LI->getParent() != SI->getParent())
+    return false;
+  if (!LI->getType()->isFloatTy() || !SI->getValueOperand()->getType()->isFloatTy())
+    return false;
+  if (SI->getValueOperand() != LI &&
+      !(isa<CastInst>(SI->getValueOperand()) &&
+        cast<CastInst>(SI->getValueOperand())->getOperand(0) == LI))
+    return false;
+  if (!isGlobalPointer(LI->getPointerOperand()) ||
+      !isLocalOrLDSPointer(SI->getPointerOperand()))
+    return false;
+
+  // Prefer naturally aligned bases; still emit align(16) so isel can form b128
+  // when the interior proof / allocator alignment holds in practice.
+  Align LoadAlign = std::max(LI->getAlign(), Align(16));
+  Align StoreAlign = std::max(SI->getAlign(), Align(16));
+
+  IRBuilder<> B(LI);
+  Type *VecTy = getFloat4Ty(LI->getContext());
+  LoadInst *NewLoad =
+      B.CreateAlignedLoad(VecTy, LI->getPointerOperand(), LoadAlign,
+                          LI->getName() + ".v4");
+  NewLoad->setOrdering(LI->getOrdering());
+  NewLoad->setSyncScopeID(LI->getSyncScopeID());
+
+  B.SetInsertPoint(SI);
+  StoreInst *NewStore = B.CreateAlignedStore(NewLoad, SI->getPointerOperand(),
+                                             StoreAlign);
+  NewStore->setOrdering(SI->getOrdering());
+  NewStore->setSyncScopeID(SI->getSyncScopeID());
+
+  SI->eraseFromParent();
+  LI->replaceAllUsesWith(PoisonValue::get(LI->getType()));
+  LI->eraseFromParent();
+  return true;
+}
+
+/// Fair-ablation payoff: turn a scalar cooperative global→LDS staging loop
+/// into a float4 loop on the proven interior path.
+///
+/// Recognizes IV += Step, IV < Bound with Bound%4==0, and indexing of the form
+/// (IV / Modulus, IV % Modulus) feeding one float load (global) and one float
+/// store (LDS). Rewrites the trip count to Bound/4 and replaces rem/div so each
+/// iteration owns a unique <4 x float> chunk.
+static bool widenOneCooperativeStagingLoop(PHINode *IV) {
+  BasicBlock *Header = IV->getParent();
+  if (IV->getNumIncomingValues() != 2)
+    return false;
+
+  // Find latch: incoming that is Add IV, StepC.
+  BasicBlock *Latch = nullptr;
+  BinaryOperator *Add = nullptr;
+  ConstantInt *StepC = nullptr;
+  for (unsigned I = 0; I != IV->getNumIncomingValues(); ++I) {
+    if (auto *BO = dyn_cast<BinaryOperator>(IV->getIncomingValue(I))) {
+      if (BO->getOpcode() == Instruction::Add && BO->getOperand(0) == IV) {
+        if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+          Latch = IV->getIncomingBlock(I);
+          Add = BO;
+          StepC = C;
+          break;
+        }
+      }
+      if (BO->getOpcode() == Instruction::Add && BO->getOperand(1) == IV) {
+        if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
+          Latch = IV->getIncomingBlock(I);
+          Add = BO;
+          StepC = C;
+          break;
+        }
+      }
+    }
+  }
+  if (!Latch || !Add || !StepC || StepC->isZero())
+    return false;
+
+  auto *LatchBr = dyn_cast<BranchInst>(Latch->getTerminator());
+  if (!LatchBr || !LatchBr->isConditional())
+    return false;
+  auto *Cmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+  if (!Cmp ||
+      (Cmp->getPredicate() != ICmpInst::ICMP_ULT &&
+       Cmp->getPredicate() != ICmpInst::ICMP_SLT))
+    return false;
+
+  Value *CmpIV = Cmp->getOperand(0);
+  Value *CmpBound = Cmp->getOperand(1);
+  if (CmpIV != Add && CmpIV != IV)
+    std::swap(CmpIV, CmpBound);
+  if (CmpIV != Add && CmpIV != IV)
+    return false;
+  auto *BoundC = dyn_cast<ConstantInt>(CmpBound);
+  if (!BoundC)
+    return false;
+  uint64_t Bound = BoundC->getZExtValue();
+  if (Bound < VectorWidth || (Bound % VectorWidth) != 0)
+    return false;
+
+  // Discover modulus from IV users.
+  unsigned Modulus = 0;
+  for (User *U : IV->users()) {
+    unsigned M = 0;
+    if (matchUnitStrideRem(U, IV, M)) {
+      Modulus = M;
+      break;
+    }
+  }
+  if (!Modulus)
+    return false;
+  unsigned Dummy = 0;
+  bool HasDiv = false;
+  for (User *U : IV->users()) {
+    if (matchUnitStrideDiv(U, IV, Dummy) && Dummy == Modulus) {
+      HasDiv = true;
+      break;
+    }
+  }
+  if (!HasDiv)
+    return false;
+
+  // Find a scalar float global load and LDS store in blocks dominated by the
+  // header that use this IV's rem/div addressing. Restrict to the loop body by
+  // requiring the load to be in Header or a unique successor chain before Latch.
+  LoadInst *LI = nullptr;
+  StoreInst *SI = nullptr;
+  SmallVector<BasicBlock *, 8> Worklist = {Header};
+  SmallPtrSet<BasicBlock *, 8> Visited;
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.pop_back_val();
+    if (!Visited.insert(BB).second)
+      continue;
+    for (Instruction &Inst : *BB) {
+      if (auto *L = dyn_cast<LoadInst>(&Inst)) {
+        if (L->getType()->isFloatTy() && isGlobalPointer(L->getPointerOperand()))
+          LI = L;
+      }
+      if (auto *S = dyn_cast<StoreInst>(&Inst)) {
+        if (S->getValueOperand()->getType()->isFloatTy() &&
+            isLocalOrLDSPointer(S->getPointerOperand()))
+          SI = S;
+      }
+    }
+    if (BB == Latch)
+      continue;
+    for (BasicBlock *Succ : successors(BB))
+      if (Succ != Header)
+        Worklist.push_back(Succ);
+  }
+  if (!LI || !SI)
+    return false;
+
+  // The stored value must be the load (possibly through a trivial cast/phi of
+  // only the load after guard stripping).
+  Value *Stored = SI->getValueOperand();
+  if (auto *Phi = dyn_cast<PHINode>(Stored)) {
+    Value *IncomingLoad = nullptr;
+    for (Value *Inc : Phi->incoming_values()) {
+      if (isa<Constant>(Inc))
+        continue;
+      Value *Src = Inc;
+      if (auto *Cast = dyn_cast<CastInst>(Src))
+        Src = Cast->getOperand(0);
+      if (Src != LI)
+        return false;
+      IncomingLoad = LI;
+    }
+    if (!IncomingLoad)
+      return false;
+    Phi->replaceAllUsesWith(LI);
+    if (Phi->use_empty())
+      Phi->eraseFromParent();
+    Stored = LI;
+  } else if (Stored != LI) {
+    if (!(isa<CastInst>(Stored) &&
+          cast<CastInst>(Stored)->getOperand(0) == LI))
+      return false;
+  }
+
+  // Probe that the load/store pair is eligible before mutating indices.
+  if (!isGlobalPointer(LI->getPointerOperand()) ||
+      !isLocalOrLDSPointer(SI->getPointerOperand()))
+    return false;
+
+  SmallVector<Instruction *, 8> DeadIdx;
+  if (!rewriteIndexForFloat4(IV, Modulus, DeadIdx))
+    return false;
+
+  // Shrink the trip count: each iteration now covers 4 elements.
+  Constant *NewBound =
+      ConstantInt::get(BoundC->getType(), Bound / VectorWidth);
+  if (Cmp->getOperand(0) == CmpBound)
+    Cmp->setOperand(0, NewBound);
+  else
+    Cmp->setOperand(1, NewBound);
+
+  // GEPs that still index with the raw IV (common for linearized LDS stores)
+  // must switch to element offsets in the float4 domain: elem = IV * 4.
+  {
+    IRBuilder<> ScaleB(&*IV->getParent()->getFirstInsertionPt());
+    Value *ScaledIV = ScaleB.CreateMul(
+        IV, ConstantInt::get(IV->getType(), VectorWidth), IV->getName() + ".elem",
+        /*HasNUW=*/true, /*HasNSW=*/true);
+    SmallVector<Use *, 8> IVUses;
+    for (Use &U : IV->uses())
+      IVUses.push_back(&U);
+    for (Use *U : IVUses) {
+      Instruction *UserI = dyn_cast<Instruction>(U->getUser());
+      if (!UserI || UserI == Add || UserI == ScaledIV)
+        continue;
+      if (isa<GetElementPtrInst>(UserI)) {
+        U->set(ScaledIV);
+        continue;
+      }
+      // Scale address arithmetic that feeds GEPs, but not the rem/div rewrite
+      // helpers we just inserted.
+      if (UserI->getName().ends_with(".col4") ||
+          UserI->getName().ends_with(".row4") ||
+          UserI->getName().ends_with(".col4.scaled"))
+        continue;
+      if (auto *BO = dyn_cast<BinaryOperator>(UserI)) {
+        if (BO->getOpcode() == Instruction::Add ||
+            BO->getOpcode() == Instruction::Or ||
+            BO->getOpcode() == Instruction::Mul) {
+          bool FeedsGEP = false;
+          for (User *UU : BO->users())
+            if (isa<GetElementPtrInst>(UU))
+              FeedsGEP = true;
+          if (FeedsGEP)
+            U->set(ScaledIV);
+        }
+      }
+    }
+  }
+
+  if (!widenLoadStoreToFloat4(LI, SI))
+    return false;
+
+  for (Instruction *I : DeadIdx) {
+    if (I->use_empty())
+      I->eraseFromParent();
+  }
+
+  ++NumInteriorStagingVectorWidens;
+  LLVM_DEBUG(dbgs() << "Widened interior cooperative staging loop with IV "
+                    << IV->getName() << " modulus " << Modulus << " bound "
+                    << Bound << " -> " << (Bound / VectorWidth) << '\n');
+  return true;
+}
+
+static unsigned widenCooperativeStagingLoops(
+    ArrayRef<BasicBlock *> Blocks) {
+  unsigned Widened = 0;
+  SmallPtrSet<PHINode *, 8> Seen;
+  for (BasicBlock *BB : Blocks) {
+    for (PHINode &PN : BB->phis()) {
+      if (!Seen.insert(&PN).second)
+        continue;
+      if (!PN.getType()->isIntegerTy())
+        continue;
+      if (widenOneCooperativeStagingLoop(&PN))
+        ++Widened;
+    }
+  }
+  return Widened;
+}
+
+static std::optional<int64_t> constantByteOffsetBetween(Value *PtrA, Value *PtrB,
+                                                        const DataLayout &DL) {
+  unsigned AS = cast<PointerType>(PtrA->getType())->getAddressSpace();
+  unsigned IndexWidth = DL.getIndexSizeInBits(AS);
+  APInt OffA(IndexWidth, 0), OffB(IndexWidth, 0);
+  Value *BaseA = PtrA->stripAndAccumulateConstantOffsets(DL, OffA,
+                                                         /*AllowNonInbounds=*/true);
+  Value *BaseB = PtrB->stripAndAccumulateConstantOffsets(DL, OffB,
+                                                         /*AllowNonInbounds=*/true);
+  if (BaseA != BaseB)
+    return std::nullopt;
+  return (OffB - OffA).getSExtValue();
+}
+
+/// Merge four contiguous scalar float loads/stores in one BB into <4 x float>.
+static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
+  unsigned Vectorized = 0;
+  for (BasicBlock *BB : Blocks) {
+    const DataLayout &DL = BB->getModule()->getDataLayout();
+    SmallVector<LoadInst *, 8> Loads;
+    SmallVector<StoreInst *, 8> Stores;
+    for (Instruction &I : *BB) {
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        if (LI->getType()->isFloatTy())
+          Loads.push_back(LI);
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (SI->getValueOperand()->getType()->isFloatTy())
+          Stores.push_back(SI);
+    }
+
+    auto ConsumeChain =
+        [&](auto &Ops, bool IsLoad) {
+          SmallPtrSet<Instruction *, 8> Used;
+          for (unsigned I = 0; I + VectorWidth <= Ops.size(); ++I) {
+            if (Used.count(Ops[I]))
+              continue;
+            SmallVector<Instruction *, 4> Chain = {Ops[I]};
+            for (unsigned J = I + 1; J < Ops.size() && Chain.size() < VectorWidth;
+                 ++J) {
+              if (Used.count(Ops[J]))
+                continue;
+              auto Off = constantByteOffsetBetween(
+                  IsLoad ? cast<LoadInst>(Chain.front())->getPointerOperand()
+                         : cast<StoreInst>(Chain.front())->getPointerOperand(),
+                  IsLoad ? cast<LoadInst>(Ops[J])->getPointerOperand()
+                         : cast<StoreInst>(Ops[J])->getPointerOperand(),
+                  DL);
+              if (!Off || *Off != static_cast<int64_t>(Chain.size() * 4))
+                continue;
+              // Require program order and no intervening side-effect between
+              // consecutive chain members.
+              Instruction *Prev = Chain.back();
+              Instruction *Next = Ops[J];
+              if (!Prev->comesBefore(Next))
+                continue;
+              bool Clean = true;
+              for (Instruction *It = Prev->getNextNode(); It && It != Next;
+                   It = It->getNextNode()) {
+                if (It->mayReadOrWriteMemory() || It->mayHaveSideEffects()) {
+                  Clean = false;
+                  break;
+                }
+              }
+              if (!Clean)
+                continue;
+              Chain.push_back(Ops[J]);
+            }
+            if (Chain.size() != VectorWidth)
+              continue;
+
+            IRBuilder<> B(Chain.front());
+            Type *VecTy = getFloat4Ty(BB->getContext());
+            Value *BasePtr =
+                IsLoad ? cast<LoadInst>(Chain.front())->getPointerOperand()
+                       : cast<StoreInst>(Chain.front())->getPointerOperand();
+            Align A = Align(16);
+            if (IsLoad) {
+              for (Instruction *C : Chain)
+                A = std::max(A, cast<LoadInst>(C)->getAlign());
+              LoadInst *NewLI = B.CreateAlignedLoad(VecTy, BasePtr, A,
+                                                    "interior.f32x4");
+              for (unsigned K = 0; K != VectorWidth; ++K) {
+                Value *Ext = B.CreateExtractElement(NewLI, B.getInt32(K));
+                Chain[K]->replaceAllUsesWith(Ext);
+                Used.insert(Chain[K]);
+              }
+              for (Instruction *C : Chain)
+                cast<LoadInst>(C)->eraseFromParent();
+            } else {
+              for (Instruction *C : Chain)
+                A = std::max(A, cast<StoreInst>(C)->getAlign());
+              Value *Vec = PoisonValue::get(VecTy);
+              for (unsigned K = 0; K != VectorWidth; ++K) {
+                Vec = B.CreateInsertElement(
+                    Vec, cast<StoreInst>(Chain[K])->getValueOperand(),
+                    B.getInt32(K));
+                Used.insert(Chain[K]);
+              }
+              B.SetInsertPoint(Chain.back());
+              B.CreateAlignedStore(Vec, BasePtr, A);
+              for (Instruction *C : llvm::reverse(Chain))
+                cast<StoreInst>(C)->eraseFromParent();
+            }
+            ++Vectorized;
+            ++NumInteriorFloatChainsVectorized;
+          }
+        };
+
+    ConsumeChain(Loads, true);
+    ConsumeChain(Stores, false);
+  }
+  return Vectorized;
+}
+
+static unsigned optimizeInteriorMemoryPaths(ArrayRef<BasicBlock *> Blocks) {
+  if (!EnableInteriorTileVectorize)
+    return 0;
+  unsigned Changed = 0;
+  Changed += widenCooperativeStagingLoops(Blocks);
+  Changed += vectorizeAdjacentFloatChains(Blocks);
+  return Changed;
+}
+
 /// Clone a staging region behind a CTA-uniform dispatch.  The original entry
 /// remains reachable through the other dispatch edge and is therefore the
 /// fallback path.  The shared barrier is not cloned.
@@ -1832,12 +2336,19 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   }
 
   Dispatch->setSuccessor(EntrySuccessor, cast<BasicBlock>(VMap[Entry]));
+
+  SmallVector<BasicBlock *, 8> InteriorBlocks;
+  for (BasicBlock *BB : RegionBlocks)
+    InteriorBlocks.push_back(cast<BasicBlock>(VMap[BB]));
+  const unsigned MemoryOpts = optimizeInteriorMemoryPaths(InteriorBlocks);
+
   ++NumPreparedInteriorTileSplits;
   LLVM_DEBUG(dbgs() << "Cloned canonical interior-tile staging region in "
                     << F.getName() << " at "
                     << Dispatch->getParent()->getName()
                     << "; removed " << RemovedSafetyBranches
                     << " proven lane bounds branch(es)"
+                    << "; memory opts " << MemoryOpts
                     << "; fast staging entry "
                     << cast<BasicBlock>(VMap[Entry])->getName()
                     << ", fallback " << Entry->getName() << ", shared barrier "
@@ -2121,9 +2632,15 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
   return Changed;
 }
 
+static bool isBMMDeviceName(StringRef Name) {
+  // Accept both the demangled POC name and the Itanium HIP mangling
+  // `_Z10bmm_device...` that real hipcc device IR uses.
+  return Name == "bmm_device" || Name.starts_with("_Z10bmm_device");
+}
+
 static bool isBMMInteriorABI(const Function &F) {
-  if (F.getName() != "bmm_device" || !AMDGPU::isEntryFunctionCC(F.getCallingConv()) ||
-      F.arg_size() != 10)
+  if (!isBMMDeviceName(F.getName()) ||
+      !AMDGPU::isEntryFunctionCC(F.getCallingConv()) || F.arg_size() != 10)
     return false;
   auto Arg = F.arg_begin();
   for (unsigned I = 0; I != 3; ++I, ++Arg)
@@ -2136,6 +2653,13 @@ static bool isBMMInteriorABI(const Function &F) {
     if (!Arg->getType()->isIntegerTy(64))
       return false;
   return true;
+}
+
+static Function *findBMMInteriorCandidate(Module &M) {
+  for (Function &F : M)
+    if (!F.isDeclaration() && isBMMInteriorABI(F))
+      return &F;
+  return nullptr;
 }
 
 static bool dependsOnBMMExtent(Value *V, ArrayRef<Argument *> Extents,
@@ -2205,6 +2729,13 @@ static bool removeFullTileChecks(Function &F) {
     BI->eraseFromParent();
     Changed = true;
   }
+
+  if (Changed) {
+    SmallVector<BasicBlock *, 16> Blocks;
+    for (BasicBlock &BB : F)
+      Blocks.push_back(&BB);
+    optimizeInteriorMemoryPaths(Blocks);
+  }
   return Changed;
 }
 
@@ -2241,14 +2772,19 @@ public:
 
 PreservedAnalyses AMDGPUBMMInteriorSpecializationPass::run(
     Module &M, ModuleAnalysisManager &) {
-  Function *Original = M.getFunction("bmm_device");
-  if (!Original || !isBMMInteriorABI(*Original) ||
-      M.getFunction("bmm_device.interior"))
+  Function *Original = findBMMInteriorCandidate(M);
+  if (!Original)
+    return PreservedAnalyses::all();
+
+  // Host registration looks up `<device-side-name>.interior`, which for HIP is
+  // the mangled kernel name plus the suffix.
+  std::string InteriorName = (Original->getName() + ".interior").str();
+  if (M.getFunction(InteriorName))
     return PreservedAnalyses::all();
 
   ValueToValueMapTy VMap;
   Function *Interior = CloneFunction(Original, VMap);
-  Interior->setName("bmm_device.interior");
+  Interior->setName(InteriorName);
   // Host registration references this name from another compilation unit, so
   // retain it even if no direct device-side call names the clone.
   appendToCompilerUsed(M, {Interior});

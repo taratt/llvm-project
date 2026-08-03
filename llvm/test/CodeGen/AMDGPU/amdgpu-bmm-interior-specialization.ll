@@ -2,12 +2,11 @@
 
 declare i32 @llvm.amdgcn.workgroup.id.x()
 
-; The pass is deliberately limited to this BMM kernel ABI. The original keeps
-; its edge branch; the registered `.interior` clone selects the proven-safe
-; direction for M/N/K comparisons.
-define amdgpu_kernel void @bmm_device(ptr addrspace(1) %a, ptr addrspace(1) %b,
-                                      ptr addrspace(1) %c, i32 %batch, i32 %m,
-                                      i32 %n, i32 %k, i64 %sa, i64 %sb, i64 %sc) {
+; The pass is deliberately limited to this BMM kernel ABI. Accept both the
+; demangled POC name and HIP Itanium mangling; clone as `<name>.interior`.
+define amdgpu_kernel void @_Z10bmm_devicePKfS0_Pfiiiilll(
+    ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, i32 %batch,
+    i32 %m, i32 %n, i32 %k, i64 %sa, i64 %sb, i64 %sc) {
 entry:
   %wg = call i32 @llvm.amdgcn.workgroup.id.x()
   %row = shl i32 %wg, 7
@@ -30,9 +29,9 @@ exit:
   ret void
 }
 
-; CHECK-LABEL: define amdgpu_kernel void @bmm_device(
+; CHECK-LABEL: define amdgpu_kernel void @_Z10bmm_devicePKfS0_Pfiiiilll(
 ; CHECK: br i1 %m.ok, label %m.in, label %exit
-; CHECK-LABEL: define amdgpu_kernel void @bmm_device.interior(
+; CHECK-LABEL: define amdgpu_kernel void @_Z10bmm_devicePKfS0_Pfiiiilll.interior(
 ; CHECK: br label %m.in
 ; CHECK-LABEL: m.in:
 ; CHECK: br label %n.in

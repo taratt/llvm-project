@@ -272,12 +272,15 @@ void CGNVCUDARuntime::maybeCreateBMMInteriorHandle(
 
   auto *Original =
       dyn_cast<llvm::GlobalVariable>(KernelHandles[CGF.CurFn->getName()]);
-  if (!Original)
+  // HIP kernel handles are host-side definitions whose address is passed to
+  // __hipRegisterFunction. Creating `.interior` as an unresolved external
+  // made the host .so fail to load; mirror the original handle instead.
+  if (!Original || !Original->hasInitializer())
     return;
 
   auto *Interior = new llvm::GlobalVariable(
       TheModule, Original->getValueType(), /*isConstant=*/true,
-      Original->getLinkage(), /*Initializer=*/nullptr,
+      Original->getLinkage(), Original->getInitializer(),
       (Original->getName() + ".interior").str());
   Interior->setAlignment(Original->getAlign());
   Interior->setDSOLocal(Original->isDSOLocal());
