@@ -1790,7 +1790,7 @@ static FixedVectorType *getFloat4Ty(LLVMContext &Ctx) {
   return FixedVectorType::get(getFloatTy(Ctx), VectorWidth);
 }
 
-static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor);
+static bool matchUnitStrideDiv(Value *V, Value *Src, unsigned &Divisor);
 
 static bool isZeroFloat(Value *V) {
   if (auto *C = dyn_cast<ConstantFP>(V))
@@ -1818,15 +1818,19 @@ static Value *peelLoadThroughTrivialSelects(Value *V, LoadInst *LI) {
   return V;
 }
 
-static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor) {
+static bool matchUnitStrideDiv(Value *V, Value *Src, unsigned &Divisor) {
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() == Instruction::UDiv && BO->getOperand(0) == IV) {
+    if ((BO->getOpcode() == Instruction::UDiv ||
+         BO->getOpcode() == Instruction::SDiv) &&
+        BO->getOperand(0) == Src) {
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         Divisor = C->getZExtValue();
         return Divisor >= VectorWidth && (Divisor % VectorWidth) == 0;
       }
     }
-    if (BO->getOpcode() == Instruction::LShr && BO->getOperand(0) == IV) {
+    if ((BO->getOpcode() == Instruction::LShr ||
+         BO->getOpcode() == Instruction::AShr) &&
+        BO->getOperand(0) == Src) {
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         unsigned Shift = C->getZExtValue();
         if (Shift >= 2 && Shift < 31) {
@@ -1839,11 +1843,13 @@ static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor) {
   return false;
 }
 
-/// Return C if V is (IV urem C), (IV and (C-1)), or the HIP BMM form
-/// `IV - (IV/C)*C` / `IV - ((IV>>log2(C))<<log2(C))` with C a power of two.
-static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
+/// Return C if V is (Src urem C), (Src and (C-1)), or
+/// `Src - (Src/C)*C` / `Src - ((Src>>log2(C))<<log2(C))` with C a power of two.
+static bool matchUnitStrideRem(Value *V, Value *Src, unsigned &Modulus) {
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() == Instruction::URem && BO->getOperand(0) == IV) {
+    if ((BO->getOpcode() == Instruction::URem ||
+         BO->getOpcode() == Instruction::SRem) &&
+        BO->getOperand(0) == Src) {
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         Modulus = C->getZExtValue();
         return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
@@ -1852,9 +1858,9 @@ static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
     if (BO->getOpcode() == Instruction::And) {
       Value *Masked = BO->getOperand(0);
       Value *MaskV = BO->getOperand(1);
-      if (Masked != IV)
+      if (Masked != Src)
         std::swap(Masked, MaskV);
-      if (Masked == IV) {
+      if (Masked == Src) {
         if (auto *C = dyn_cast<ConstantInt>(MaskV)) {
           uint64_t Mask = C->getZExtValue();
           if (Mask && ((Mask + 1) & Mask) == 0) {
@@ -1865,7 +1871,7 @@ static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
       }
     }
     // Real clang HIP: `lk = idx - lm * C` with `lm = idx / C` (or lshr/shl).
-    if (BO->getOpcode() == Instruction::Sub && BO->getOperand(0) == IV) {
+    if (BO->getOpcode() == Instruction::Sub && BO->getOperand(0) == Src) {
       Value *Scaled = BO->getOperand(1);
       if (auto *ScaleBO = dyn_cast<BinaryOperator>(Scaled)) {
         Value *Lm = nullptr;
@@ -1891,7 +1897,7 @@ static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
         }
         if (Lm && C >= VectorWidth && (C % VectorWidth) == 0) {
           unsigned D = 0;
-          if (matchUnitStrideDiv(Lm, IV, D) && D == C) {
+          if (matchUnitStrideDiv(Lm, Src, D) && D == C) {
             Modulus = C;
             return true;
           }
@@ -1912,7 +1918,12 @@ static bool isGlobalPointer(Value *Ptr) {
 }
 
 /// Replace IV%Mod / IV/Mod with IV%(Mod/4) and (IV%(Mod/4))*4 / IV/(Mod/4).
-static bool rewriteIndexForFloat4(PHINode *IV, unsigned Modulus,
+/// When Step is a multiple of Modulus, clang often sinks `IV%Mod` to an
+/// invariant `Init%Mod` (e.g. tid%32 with step 256); rewrite only the uses
+/// that sit in LoopBlocks so the fallback path keeps the shared rem.
+static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
+                                  uint64_t Step,
+                                  const SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
                                   SmallVectorImpl<Instruction *> &ToErase) {
   unsigned Inner4 = Modulus / VectorWidth;
   SmallVector<Instruction *, 8> Rems;
@@ -1924,7 +1935,14 @@ static bool rewriteIndexForFloat4(PHINode *IV, unsigned Modulus,
     if (matchUnitStrideDiv(U, IV, D) && D == Modulus)
       Divs.push_back(cast<Instruction>(U));
   }
-  if (Rems.empty() || Divs.empty())
+  if (Rems.empty() && Init && (Step % Modulus) == 0) {
+    for (User *U : Init->users()) {
+      unsigned M = 0;
+      if (matchUnitStrideRem(U, Init, M) && M == Modulus)
+        Rems.push_back(cast<Instruction>(U));
+    }
+  }
+  if (Divs.empty() || Rems.empty())
     return false;
 
   IRBuilder<> B(&*IV->getParent()->getFirstInsertionPt());
@@ -1936,8 +1954,17 @@ static bool rewriteIndexForFloat4(PHINode *IV, unsigned Modulus,
   Value *NewDiv = B.CreateUDiv(IV, Inner4C, IV->getName() + ".row4");
 
   for (Instruction *Rem : Rems) {
-    Rem->replaceAllUsesWith(NewRemScaled);
-    ToErase.push_back(Rem);
+    SmallVector<Use *, 8> Uses;
+    for (Use &U : Rem->uses())
+      Uses.push_back(&U);
+    for (Use *U : Uses) {
+      auto *UserI = dyn_cast<Instruction>(U->getUser());
+      if (!UserI || !LoopBlocks.count(UserI->getParent()))
+        continue;
+      U->set(NewRemScaled);
+    }
+    if (Rem->use_empty())
+      ToErase.push_back(Rem);
   }
   for (Instruction *Div : Divs) {
     Div->replaceAllUsesWith(NewDiv);
@@ -2045,7 +2072,14 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (Bound < VectorWidth || (Bound % VectorWidth) != 0)
     return false;
 
-  // Discover modulus from IV users.
+  Value *Init = nullptr;
+  for (unsigned I = 0; I != IV->getNumIncomingValues(); ++I)
+    if (IV->getIncomingBlock(I) != Latch)
+      Init = IV->getIncomingValue(I);
+
+  // Discover modulus: prefer rem/and/sub of IV; if clang sunk rem because
+  // Step is a multiple of the tile dimension (BMM: step 256, mod 32/128),
+  // take modulus from div/lshr of IV instead.
   unsigned Modulus = 0;
   for (User *U : IV->users()) {
     unsigned M = 0;
@@ -2055,14 +2089,24 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     }
   }
   if (!Modulus) {
-    LLVM_DEBUG(dbgs() << "Widen skipped (no rem/and/sub modulus) for IV in "
+    for (User *U : IV->users()) {
+      unsigned D = 0;
+      if (matchUnitStrideDiv(U, IV, D)) {
+        Modulus = D;
+        break;
+      }
+    }
+  }
+  if (!Modulus) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (no rem/div modulus) for IV in "
                       << Header->getName() << '\n');
     return false;
   }
-  unsigned Dummy = 0;
+
   bool HasDiv = false;
   for (User *U : IV->users()) {
-    if (matchUnitStrideDiv(U, IV, Dummy) && Dummy == Modulus) {
+    unsigned D = 0;
+    if (matchUnitStrideDiv(U, IV, D) && D == Modulus) {
       HasDiv = true;
       break;
     }
@@ -2070,6 +2114,30 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (!HasDiv) {
     LLVM_DEBUG(dbgs() << "Widen skipped (no matching div/lshr) for IV in "
                       << Header->getName() << " modulus " << Modulus << '\n');
+    return false;
+  }
+
+  bool HasRem = false;
+  for (User *U : IV->users()) {
+    unsigned M = 0;
+    if (matchUnitStrideRem(U, IV, M) && M == Modulus) {
+      HasRem = true;
+      break;
+    }
+  }
+  if (!HasRem && Init && (StepC->getZExtValue() % Modulus) == 0) {
+    for (User *U : Init->users()) {
+      unsigned M = 0;
+      if (matchUnitStrideRem(U, Init, M) && M == Modulus) {
+        HasRem = true;
+        break;
+      }
+    }
+  }
+  if (!HasRem) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (no rem on IV or invariant Init) for IV in "
+                      << Header->getName() << " modulus " << Modulus
+                      << " step " << StepC->getZExtValue() << '\n');
     return false;
   }
 
@@ -2143,7 +2211,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     return false;
 
   SmallVector<Instruction *, 8> DeadIdx;
-  if (!rewriteIndexForFloat4(IV, Modulus, DeadIdx))
+  if (!rewriteIndexForFloat4(IV, Init, Modulus, StepC->getZExtValue(), Visited,
+                             DeadIdx))
     return false;
 
   // Shrink the trip count: each iteration now covers 4 elements.

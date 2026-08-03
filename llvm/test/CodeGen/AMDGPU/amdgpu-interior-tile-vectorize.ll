@@ -99,7 +99,8 @@ k.exit:
   ret void
 }
 
-; Real HIP BMM indexing: lm = idx >> 5; lk = idx - (lm << 5).
+; Real HIP BMM after InstCombine: step 256 is a multiple of 32, so
+; lk = idx%32 sinks to the invariant tid%32; only lm = idx>>5 uses the IV.
 ; CHECK: Widened interior cooperative staging loop
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4_bmm_idx(
 ; CHECK: load <4 x float>, ptr addrspace(1)
@@ -113,6 +114,8 @@ entry:
   %tid = call i32 @llvm.amdgcn.workitem.id.x()
   %x.base = shl i32 %workgroup.x, 7
   %y.base = shl i32 %workgroup.y, 7
+  ; Invariant rem sunk out of the staging IV.
+  %lk = and i32 %tid, 31
   br label %k.preheader
 
 k.preheader:
@@ -133,8 +136,6 @@ k.header:
 staging:
   %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
   %lm = lshr i32 %idx, 5
-  %lm.scaled = shl i32 %lm, 5
-  %lk = sub i32 %idx, %lm.scaled
   %gm = add i32 %y.base, %lm
   %gn = add i32 %x.base, %lk
   %m.in.bounds = icmp slt i32 %gm, %m
