@@ -65,10 +65,13 @@ STATISTIC(NumInteriorFloatChainsVectorized,
 
 namespace {
 
-// Cloning a large pre-barrier graph duplicates live ranges.  With unguarded
-// float4 rewriting on the fast path the payoff can outweigh that cost, so the
-// limit is higher than the original guard-stripping-only POC.
-constexpr unsigned MaxStagingCloneBlocks = 16;
+// Cloning a large pre-barrier graph duplicates live ranges.  Real BMM A+B
+// staging is typically ~8 blocks; keep headroom for similar GEMM shapes.
+static cl::opt<unsigned> MaxStagingCloneBlocks(
+    "amdgpu-interior-tile-max-staging-blocks",
+    cl::desc("Max blocks allowed when cloning an interior staging region"),
+    cl::init(24), cl::Hidden);
+
 constexpr unsigned VectorWidth = 4;
 
 static cl::opt<bool> EnableInteriorTileVectorize(
