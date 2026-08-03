@@ -688,7 +688,9 @@ k.exit:
 }
 
 ; CHECK: Potential interior-tile boundary check in candidate:
-; CHECK: Cloned nested-loop staging region in staging_only_outer_k_loop; outer K latch and shared barrier were retained
+; At least one outer-K staging clone must retain a nested staging loop.
+; CHECK-DAG: Cloned nested-loop staging region in {{staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop}}; outer K latch and shared barrier were retained
+; CHECK-DAG: Cloned canonical interior-tile staging region in {{canonical_staging|staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop}}
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
 ; CFG: br i1 %full, label %staging.interior, label %edge
