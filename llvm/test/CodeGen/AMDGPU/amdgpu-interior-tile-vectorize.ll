@@ -99,6 +99,84 @@ k.exit:
   ret void
 }
 
+; Real HIP BMM indexing: lm = idx >> 5; lk = idx - (lm << 5).
+; CHECK: Widened interior cooperative staging loop
+; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4_bmm_idx(
+; CHECK: load <4 x float>, ptr addrspace(1)
+; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
+define amdgpu_kernel void @coop_staging_float4_bmm_idx(ptr addrspace(1) %a,
+                                                       ptr addrspace(3) %lds,
+                                                       i32 %m, i32 %n, i32 %k) {
+entry:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %x.base = shl i32 %workgroup.x, 7
+  %y.base = shl i32 %workgroup.y, 7
+  br label %k.preheader
+
+k.preheader:
+  %n.remaining = sub i32 %n, %x.base
+  %n.nonnegative = call i32 @llvm.smax.i32(i32 %n.remaining, i32 0)
+  %n.extent = call i32 @llvm.smin.i32(i32 %n.nonnegative, i32 128)
+  %m.remaining = sub i32 %m, %y.base
+  %m.nonnegative = call i32 @llvm.smax.i32(i32 %m.remaining, i32 0)
+  %m.extent = call i32 @llvm.smin.i32(i32 %m.nonnegative, i32 128)
+  %k.remaining = sub i32 %k, 0
+  %k.extent = call i32 @llvm.smin.i32(i32 %k.remaining, i32 32)
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %k.preheader ], [ %next, %k.latch ]
+  br label %staging
+
+staging:
+  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
+  %lm = lshr i32 %idx, 5
+  %lm.scaled = shl i32 %lm, 5
+  %lk = sub i32 %idx, %lm.scaled
+  %gm = add i32 %y.base, %lm
+  %gn = add i32 %x.base, %lk
+  %m.in.bounds = icmp slt i32 %gm, %m
+  br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
+
+stage.n.check:
+  %n.in.bounds = icmp slt i32 %gn, %n
+  br i1 %n.in.bounds, label %stage.load, label %stage.latch
+
+stage.load:
+  %gk = add i32 %i, %lk
+  %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %gm
+  %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk
+  %val = load float, ptr addrspace(1) %a.ptr.k, align 4
+  %sel = select i1 true, float %val, float 0.000000e+00
+  %lds.row = mul i32 %lm, 32
+  %lds.off = add i32 %lds.row, %lk
+  %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
+  store float %sel, ptr addrspace(3) %lds.ptr, align 4
+  br label %stage.latch
+
+stage.latch:
+  %idx.next = add nuw i32 %idx, 256
+  %stage.more = icmp ult i32 %idx.next, 4096
+  br i1 %stage.more, label %staging, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %compute
+
+compute:
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  ret void
+}
+
 ; Adjacent scalar stores on the interior path collapse to one <4 x float> store.
 ; CHECK-LABEL: define amdgpu_kernel void @adjacent_store_chain(
 ; CHECK: store <4 x float>

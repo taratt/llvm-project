@@ -1790,26 +1790,32 @@ static FixedVectorType *getFloat4Ty(LLVMContext &Ctx) {
   return FixedVectorType::get(getFloatTy(Ctx), VectorWidth);
 }
 
-/// Return C if V is (IV urem C) or (IV and (C-1)) with C a power of two.
-static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
-  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() == Instruction::URem && BO->getOperand(0) == IV) {
-      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-        Modulus = C->getZExtValue();
-        return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
-      }
-    }
-    if (BO->getOpcode() == Instruction::And && BO->getOperand(0) == IV) {
-      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-        uint64_t Mask = C->getZExtValue();
-        if (Mask && ((Mask + 1) & Mask) == 0) {
-          Modulus = static_cast<unsigned>(Mask + 1);
-          return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
-        }
-      }
-    }
-  }
+static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor);
+
+static bool isZeroFloat(Value *V) {
+  if (auto *C = dyn_cast<ConstantFP>(V))
+    return C->isZero();
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->isZero();
   return false;
+}
+
+/// Peel `select(c, load, 0)` / `select(c, 0, load)` left after guard folding.
+static Value *peelLoadThroughTrivialSelects(Value *V, LoadInst *LI) {
+  while (auto *Sel = dyn_cast<SelectInst>(V)) {
+    Value *T = Sel->getTrueValue();
+    Value *F = Sel->getFalseValue();
+    if (isZeroFloat(F))
+      V = T;
+    else if (isZeroFloat(T))
+      V = F;
+    else
+      break;
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    if (Cast->getOperand(0) == LI)
+      return Cast;
+  return V;
 }
 
 static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor) {
@@ -1826,6 +1832,69 @@ static bool matchUnitStrideDiv(Value *V, PHINode *IV, unsigned &Divisor) {
         if (Shift >= 2 && Shift < 31) {
           Divisor = 1u << Shift;
           return (Divisor % VectorWidth) == 0;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/// Return C if V is (IV urem C), (IV and (C-1)), or the HIP BMM form
+/// `IV - (IV/C)*C` / `IV - ((IV>>log2(C))<<log2(C))` with C a power of two.
+static bool matchUnitStrideRem(Value *V, PHINode *IV, unsigned &Modulus) {
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::URem && BO->getOperand(0) == IV) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        Modulus = C->getZExtValue();
+        return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
+      }
+    }
+    if (BO->getOpcode() == Instruction::And) {
+      Value *Masked = BO->getOperand(0);
+      Value *MaskV = BO->getOperand(1);
+      if (Masked != IV)
+        std::swap(Masked, MaskV);
+      if (Masked == IV) {
+        if (auto *C = dyn_cast<ConstantInt>(MaskV)) {
+          uint64_t Mask = C->getZExtValue();
+          if (Mask && ((Mask + 1) & Mask) == 0) {
+            Modulus = static_cast<unsigned>(Mask + 1);
+            return Modulus >= VectorWidth && (Modulus % VectorWidth) == 0;
+          }
+        }
+      }
+    }
+    // Real clang HIP: `lk = idx - lm * C` with `lm = idx / C` (or lshr/shl).
+    if (BO->getOpcode() == Instruction::Sub && BO->getOperand(0) == IV) {
+      Value *Scaled = BO->getOperand(1);
+      if (auto *ScaleBO = dyn_cast<BinaryOperator>(Scaled)) {
+        Value *Lm = nullptr;
+        unsigned C = 0;
+        if (ScaleBO->getOpcode() == Instruction::Mul) {
+          Value *Op0 = ScaleBO->getOperand(0);
+          Value *Op1 = ScaleBO->getOperand(1);
+          if (auto *CI = dyn_cast<ConstantInt>(Op1)) {
+            Lm = Op0;
+            C = CI->getZExtValue();
+          } else if (auto *CI = dyn_cast<ConstantInt>(Op0)) {
+            Lm = Op1;
+            C = CI->getZExtValue();
+          }
+        } else if (ScaleBO->getOpcode() == Instruction::Shl) {
+          if (auto *CI = dyn_cast<ConstantInt>(ScaleBO->getOperand(1))) {
+            unsigned Shift = CI->getZExtValue();
+            if (Shift >= 2 && Shift < 31) {
+              Lm = ScaleBO->getOperand(0);
+              C = 1u << Shift;
+            }
+          }
+        }
+        if (Lm && C >= VectorWidth && (C % VectorWidth) == 0) {
+          unsigned D = 0;
+          if (matchUnitStrideDiv(Lm, IV, D) && D == C) {
+            Modulus = C;
+            return true;
+          }
         }
       }
     }
@@ -1985,8 +2054,11 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
       break;
     }
   }
-  if (!Modulus)
+  if (!Modulus) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (no rem/and/sub modulus) for IV in "
+                      << Header->getName() << '\n');
     return false;
+  }
   unsigned Dummy = 0;
   bool HasDiv = false;
   for (User *U : IV->users()) {
@@ -1995,8 +2067,11 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
       break;
     }
   }
-  if (!HasDiv)
+  if (!HasDiv) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (no matching div/lshr) for IV in "
+                      << Header->getName() << " modulus " << Modulus << '\n');
     return false;
+  }
 
   // Find a scalar float global load and LDS store in blocks dominated by the
   // header that use this IV's rem/div addressing. Restrict to the loop body by
@@ -2029,15 +2104,15 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (!LI || !SI)
     return false;
 
-  // The stored value must be the load (possibly through a trivial cast/phi of
-  // only the load after guard stripping).
-  Value *Stored = SI->getValueOperand();
+  // The stored value must be the load (possibly through a trivial cast/phi /
+  // select-with-zero left after guard stripping).
+  Value *Stored = peelLoadThroughTrivialSelects(SI->getValueOperand(), LI);
   if (auto *Phi = dyn_cast<PHINode>(Stored)) {
     Value *IncomingLoad = nullptr;
     for (Value *Inc : Phi->incoming_values()) {
-      if (isa<Constant>(Inc))
+      if (isa<Constant>(Inc) || isZeroFloat(Inc))
         continue;
-      Value *Src = Inc;
+      Value *Src = peelLoadThroughTrivialSelects(Inc, LI);
       if (auto *Cast = dyn_cast<CastInst>(Src))
         Src = Cast->getOperand(0);
       if (Src != LI)
@@ -2055,6 +2130,12 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
           cast<CastInst>(Stored)->getOperand(0) == LI))
       return false;
   }
+
+  // If the store still feeds through a select/phi we just simplified away from
+  // the value operand view, rewrite the store to use the load directly so the
+  // float4 widen can replace both.
+  if (SI->getValueOperand() != Stored && Stored == LI)
+    SI->setOperand(0, LI);
 
   // Probe that the load/store pair is eligible before mutating indices.
   if (!isGlobalPointer(LI->getPointerOperand()) ||
