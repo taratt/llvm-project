@@ -755,7 +755,9 @@ k.exit:
 ; CFG-LABEL: staging.interior:
 ; CFG: br label %stage.header.interior
 ; CFG-LABEL: stage.m.check.interior:
-; CFG: br label %stage.n.check.interior
+; The M conjunction may keep the uniform loop-trip conjunct; only the proven
+; tile-bound half is required to be removed on the interior path.
+; CFG: br {{.*}}label %stage.n.check.interior
 ; CFG-LABEL: stage.n.check.interior:
 ; CFG: br label %stage.work.interior
 ; CFG-LABEL: stage.latch.interior:

@@ -18,10 +18,11 @@ declare i32 @llvm.smin.i32(i32, i32)
 ; CHECK: Widened interior cooperative staging loop
 ; CHECK: Cloned nested-loop staging region in coop_staging_float4
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4(
-; CHECK: br i1 %interior.staging.full, label %staging.interior, label %staging
+; SplitBlock may rename the staging entry (e.g. staging1.interior).
+; CHECK: br i1 %interior.staging.full, label %{{[^,]*}}staging{{[^,]*}}.interior, label %{{[^,]*}}staging{{[^,]*}}
 ; CHECK-LABEL: stage.load.interior:
 ; CHECK: load <4 x float>, ptr addrspace(1)
-; CHECK: store <4 x float>, ptr addrspace(3)
+; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
 ; CHECK: icmp ult i32 %{{.*}}, 1024
 define amdgpu_kernel void @coop_staging_float4(ptr addrspace(1) %a,
                                                ptr addrspace(3) %lds,
