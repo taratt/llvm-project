@@ -1917,6 +1917,31 @@ static bool isGlobalPointer(Value *Ptr) {
   return AS == AMDGPUAS::GLOBAL_ADDRESS || AS == AMDGPUAS::CONSTANT_ADDRESS;
 }
 
+/// Collect rem/div ops eligible for float4 index rewrite. Rem may sit on the
+/// loop-invariant Init when Step is a multiple of Modulus.
+static bool collectFloat4IndexOps(PHINode *IV, Value *Init, unsigned Modulus,
+                                  uint64_t Step,
+                                  SmallVectorImpl<Instruction *> &Rems,
+                                  SmallVectorImpl<Instruction *> &Divs) {
+  Rems.clear();
+  Divs.clear();
+  for (User *U : IV->users()) {
+    unsigned M = 0, D = 0;
+    if (matchUnitStrideRem(U, IV, M) && M == Modulus)
+      Rems.push_back(cast<Instruction>(U));
+    if (matchUnitStrideDiv(U, IV, D) && D == Modulus)
+      Divs.push_back(cast<Instruction>(U));
+  }
+  if (Rems.empty() && Init && Modulus && (Step % Modulus) == 0) {
+    for (User *U : Init->users()) {
+      unsigned M = 0;
+      if (matchUnitStrideRem(U, Init, M) && M == Modulus)
+        Rems.push_back(cast<Instruction>(U));
+    }
+  }
+  return !Divs.empty() && !Rems.empty();
+}
+
 /// Replace IV%Mod / IV/Mod with IV%(Mod/4) and (IV%(Mod/4))*4 / IV/(Mod/4).
 /// When Step is a multiple of Modulus, clang often sinks `IV%Mod` to an
 /// invariant `Init%Mod` (e.g. tid%32 with step 256); rewrite only the uses
@@ -1925,26 +1950,12 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
                                   uint64_t Step,
                                   const SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
                                   SmallVectorImpl<Instruction *> &ToErase) {
-  unsigned Inner4 = Modulus / VectorWidth;
   SmallVector<Instruction *, 8> Rems;
   SmallVector<Instruction *, 8> Divs;
-  for (User *U : IV->users()) {
-    unsigned M = 0, D = 0;
-    if (matchUnitStrideRem(U, IV, M) && M == Modulus)
-      Rems.push_back(cast<Instruction>(U));
-    if (matchUnitStrideDiv(U, IV, D) && D == Modulus)
-      Divs.push_back(cast<Instruction>(U));
-  }
-  if (Rems.empty() && Init && (Step % Modulus) == 0) {
-    for (User *U : Init->users()) {
-      unsigned M = 0;
-      if (matchUnitStrideRem(U, Init, M) && M == Modulus)
-        Rems.push_back(cast<Instruction>(U));
-    }
-  }
-  if (Divs.empty() || Rems.empty())
+  if (!collectFloat4IndexOps(IV, Init, Modulus, Step, Rems, Divs))
     return false;
 
+  unsigned Inner4 = Modulus / VectorWidth;
   IRBuilder<> B(&*IV->getParent()->getFirstInsertionPt());
   Value *Inner4C = ConstantInt::get(IV->getType(), Inner4);
   Value *VecC = ConstantInt::get(IV->getType(), VectorWidth);
@@ -1974,7 +1985,7 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
 }
 
 static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
-  if (!LI || !SI || LI->getParent() != SI->getParent())
+  if (!LI || !SI)
     return false;
   if (!LI->getType()->isFloatTy() || !SI->getValueOperand()->getType()->isFloatTy())
     return false;
@@ -2171,13 +2182,17 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   }
   if (!LI || !SI)
     return false;
+  if (!isGlobalPointer(LI->getPointerOperand()) ||
+      !isLocalOrLDSPointer(SI->getPointerOperand()))
+    return false;
 
-  // The stored value must be the load (possibly through a trivial cast/phi /
-  // select-with-zero left after guard stripping).
+  // Validate the stored value without mutating. Accept load, cast(load),
+  // select(load,0), or phi of those.
   Value *Stored = peelLoadThroughTrivialSelects(SI->getValueOperand(), LI);
-  if (auto *Phi = dyn_cast<PHINode>(Stored)) {
+  PHINode *StorePhi = dyn_cast<PHINode>(Stored);
+  if (StorePhi) {
     Value *IncomingLoad = nullptr;
-    for (Value *Inc : Phi->incoming_values()) {
+    for (Value *Inc : StorePhi->incoming_values()) {
       if (isa<Constant>(Inc) || isZeroFloat(Inc))
         continue;
       Value *Src = peelLoadThroughTrivialSelects(Inc, LI);
@@ -2189,31 +2204,58 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     }
     if (!IncomingLoad)
       return false;
-    Phi->replaceAllUsesWith(LI);
-    if (Phi->use_empty())
-      Phi->eraseFromParent();
-    Stored = LI;
   } else if (Stored != LI) {
     if (!(isa<CastInst>(Stored) &&
           cast<CastInst>(Stored)->getOperand(0) == LI))
       return false;
   }
 
-  // If the store still feeds through a select/phi we just simplified away from
-  // the value operand view, rewrite the store to use the load directly so the
-  // float4 widen can replace both.
-  if (SI->getValueOperand() != Stored && Stored == LI)
-    SI->setOperand(0, LI);
-
-  // Probe that the load/store pair is eligible before mutating indices.
-  if (!isGlobalPointer(LI->getPointerOperand()) ||
-      !isLocalOrLDSPointer(SI->getPointerOperand()))
+  SmallVector<Instruction *, 8> Rems;
+  SmallVector<Instruction *, 8> Divs;
+  if (!collectFloat4IndexOps(IV, Init, Modulus, StepC->getZExtValue(), Rems,
+                             Divs)) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (collect rem/div failed) for IV in "
+                      << Header->getName() << '\n');
     return false;
+  }
+  // Ensure at least one rem use sits in the loop; otherwise rewrite would be a
+  // no-op on rem and leave inconsistent indexing.
+  bool RemUsedInLoop = false;
+  for (Instruction *Rem : Rems) {
+    for (User *U : Rem->users()) {
+      if (auto *UI = dyn_cast<Instruction>(U))
+        if (Visited.count(UI->getParent())) {
+          RemUsedInLoop = true;
+          break;
+        }
+    }
+    if (RemUsedInLoop)
+      break;
+  }
+  if (!RemUsedInLoop) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (rem not used in loop) for IV in "
+                      << Header->getName() << '\n');
+    return false;
+  }
+
+  // --- Commit mutations (no early return after this point) ---
+  if (StorePhi) {
+    StorePhi->replaceAllUsesWith(LI);
+    if (StorePhi->use_empty())
+      StorePhi->eraseFromParent();
+  }
+  if (SI->getValueOperand() != LI) {
+    Value *Op = SI->getValueOperand();
+    if (peelLoadThroughTrivialSelects(Op, LI) == LI ||
+        (isa<CastInst>(Op) && cast<CastInst>(Op)->getOperand(0) == LI))
+      SI->setOperand(0, LI);
+  }
 
   SmallVector<Instruction *, 8> DeadIdx;
-  if (!rewriteIndexForFloat4(IV, Init, Modulus, StepC->getZExtValue(), Visited,
-                             DeadIdx))
-    return false;
+  bool Rewritten = rewriteIndexForFloat4(IV, Init, Modulus, StepC->getZExtValue(),
+                                         Visited, DeadIdx);
+  assert(Rewritten && "collectFloat4IndexOps succeeded but rewrite failed");
+  (void)Rewritten;
 
   // Shrink the trip count: each iteration now covers 4 elements.
   Constant *NewBound =
@@ -2245,7 +2287,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
       // helpers we just inserted.
       if (UserI->getName().ends_with(".col4") ||
           UserI->getName().ends_with(".row4") ||
-          UserI->getName().ends_with(".col4.scaled"))
+          UserI->getName().ends_with(".col4.scaled") ||
+          UserI->getName().ends_with(".elem"))
         continue;
       if (auto *BO = dyn_cast<BinaryOperator>(UserI)) {
         if (BO->getOpcode() == Instruction::Add ||
@@ -2262,8 +2305,9 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     }
   }
 
-  if (!widenLoadStoreToFloat4(LI, SI))
-    return false;
+  bool Widened = widenLoadStoreToFloat4(LI, SI);
+  assert(Widened && "prevalidated load/store widen failed");
+  (void)Widened;
 
   for (Instruction *I : DeadIdx) {
     if (I->use_empty())
