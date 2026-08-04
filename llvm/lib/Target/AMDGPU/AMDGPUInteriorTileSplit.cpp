@@ -1918,7 +1918,8 @@ static bool isGlobalPointer(Value *Ptr) {
 }
 
 /// Collect rem/div ops eligible for float4 index rewrite. Rem may sit on the
-/// loop-invariant Init when Step is a multiple of Modulus.
+/// loop-invariant Init when Step is a multiple of Modulus. Rem may also be
+/// absent entirely in that case (LDS linearized on IV; column rem unused).
 static bool collectFloat4IndexOps(PHINode *IV, Value *Init, unsigned Modulus,
                                   uint64_t Step,
                                   SmallVectorImpl<Instruction *> &Rems,
@@ -1939,7 +1940,11 @@ static bool collectFloat4IndexOps(PHINode *IV, Value *Init, unsigned Modulus,
         Rems.push_back(cast<Instruction>(U));
     }
   }
-  return !Divs.empty() && !Rems.empty();
+  if (Divs.empty())
+    return false;
+  // Need an explicit rem, or a step that makes rem loop-invariant so HIP may
+  // omit / sink it away from the staging IV.
+  return !Rems.empty() || (Init && (Step % Modulus) == 0);
 }
 
 /// Replace IV%Mod / IV/Mod with IV%(Mod/4) and (IV%(Mod/4))*4 / IV/(Mod/4).
@@ -1959,23 +1964,25 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
   IRBuilder<> B(&*IV->getParent()->getFirstInsertionPt());
   Value *Inner4C = ConstantInt::get(IV->getType(), Inner4);
   Value *VecC = ConstantInt::get(IV->getType(), VectorWidth);
-  Value *NewRem = B.CreateURem(IV, Inner4C, IV->getName() + ".col4");
-  Value *NewRemScaled =
-      B.CreateMul(NewRem, VecC, IV->getName() + ".col4.scaled", true, true);
   Value *NewDiv = B.CreateUDiv(IV, Inner4C, IV->getName() + ".row4");
 
-  for (Instruction *Rem : Rems) {
-    SmallVector<Use *, 8> Uses;
-    for (Use &U : Rem->uses())
-      Uses.push_back(&U);
-    for (Use *U : Uses) {
-      auto *UserI = dyn_cast<Instruction>(U->getUser());
-      if (!UserI || !LoopBlocks.count(UserI->getParent()))
-        continue;
-      U->set(NewRemScaled);
+  if (!Rems.empty()) {
+    Value *NewRem = B.CreateURem(IV, Inner4C, IV->getName() + ".col4");
+    Value *NewRemScaled =
+        B.CreateMul(NewRem, VecC, IV->getName() + ".col4.scaled", true, true);
+    for (Instruction *Rem : Rems) {
+      SmallVector<Use *, 8> Uses;
+      for (Use &U : Rem->uses())
+        Uses.push_back(&U);
+      for (Use *U : Uses) {
+        auto *UserI = dyn_cast<Instruction>(U->getUser());
+        if (!UserI || !LoopBlocks.count(UserI->getParent()))
+          continue;
+        U->set(NewRemScaled);
+      }
+      if (Rem->use_empty())
+        ToErase.push_back(Rem);
     }
-    if (Rem->use_empty())
-      ToErase.push_back(Rem);
   }
   for (Instruction *Div : Divs) {
     Div->replaceAllUsesWith(NewDiv);
@@ -2128,6 +2135,9 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     return false;
   }
 
+  // Rem of IV is ideal. When step is a multiple of the tile dim, clang sinks
+  // rem onto tid and the interior clone may not reference it at all (LDS is
+  // often linearized on the raw IV). Allow that shape.
   bool HasRem = false;
   for (User *U : IV->users()) {
     unsigned M = 0;
@@ -2136,15 +2146,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
       break;
     }
   }
-  if (!HasRem && Init && (StepC->getZExtValue() % Modulus) == 0) {
-    for (User *U : Init->users()) {
-      unsigned M = 0;
-      if (matchUnitStrideRem(U, Init, M) && M == Modulus) {
-        HasRem = true;
-        break;
-      }
-    }
-  }
+  if (!HasRem && Init && (StepC->getZExtValue() % Modulus) == 0)
+    HasRem = true;
   if (!HasRem) {
     LLVM_DEBUG(dbgs() << "Widen skipped (no rem on IV or invariant Init) for IV in "
                       << Header->getName() << " modulus " << Modulus
@@ -2215,25 +2218,6 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (!collectFloat4IndexOps(IV, Init, Modulus, StepC->getZExtValue(), Rems,
                              Divs)) {
     LLVM_DEBUG(dbgs() << "Widen skipped (collect rem/div failed) for IV in "
-                      << Header->getName() << '\n');
-    return false;
-  }
-  // Ensure at least one rem use sits in the loop; otherwise rewrite would be a
-  // no-op on rem and leave inconsistent indexing.
-  bool RemUsedInLoop = false;
-  for (Instruction *Rem : Rems) {
-    for (User *U : Rem->users()) {
-      if (auto *UI = dyn_cast<Instruction>(U))
-        if (Visited.count(UI->getParent())) {
-          RemUsedInLoop = true;
-          break;
-        }
-    }
-    if (RemUsedInLoop)
-      break;
-  }
-  if (!RemUsedInLoop) {
-    LLVM_DEBUG(dbgs() << "Widen skipped (rem not used in loop) for IV in "
                       << Header->getName() << '\n');
     return false;
   }
