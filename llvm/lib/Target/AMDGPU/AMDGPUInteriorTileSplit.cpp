@@ -1950,18 +1950,48 @@ static bool collectFloat4IndexOps(PHINode *IV, Value *Init, unsigned Modulus,
   return !Rems.empty() || (Init && (Step % Modulus) == 0);
 }
 
+/// Count rem uses that sit in LoopBlocks (addressing for this staging loop).
+static unsigned countRemUsesInBlocks(ArrayRef<Instruction *> Rems,
+                                     const SmallPtrSetImpl<BasicBlock *> &LoopBlocks) {
+  unsigned Count = 0;
+  for (Instruction *Rem : Rems) {
+    for (User *U : Rem->users()) {
+      auto *UserI = dyn_cast<Instruction>(U);
+      if (UserI && LoopBlocks.count(UserI->getParent()))
+        ++Count;
+    }
+  }
+  return Count;
+}
+
 /// Replace IV%Mod / IV/Mod with IV%(Mod/4) and (IV%(Mod/4))*4 / IV/(Mod/4).
 /// When Step is a multiple of Modulus, clang often sinks `IV%Mod` to an
 /// invariant `Init%Mod` (e.g. tid%32 with step 256); rewrite only the uses
 /// that sit in LoopBlocks so the fallback path keeps the shared rem.
-static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
-                                  uint64_t Step,
-                                  const SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-                                  SmallVectorImpl<Instruction *> &ToErase) {
+/// Returns the number of rem uses rewritten in LoopBlocks.
+static unsigned rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
+                                      uint64_t Step,
+                                      const SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
+                                      SmallVectorImpl<Instruction *> &ToErase) {
   SmallVector<Instruction *, 8> Rems;
   SmallVector<Instruction *, 8> Divs;
   if (!collectFloat4IndexOps(IV, Init, Modulus, Step, Rems, Divs))
-    return false;
+    return 0;
+
+  // Also pick up rem ops that live in the loop (e.g. after address clone).
+  if (Init && (Step % Modulus) == 0) {
+    for (BasicBlock *BB : LoopBlocks) {
+      for (Instruction &I : *BB) {
+        unsigned M = 0;
+        if (matchUnitStrideRem(&I, Init, M) && M == Modulus &&
+            !llvm::is_contained(Rems, &I))
+          Rems.push_back(&I);
+        if (matchUnitStrideRem(&I, IV, M) && M == Modulus &&
+            !llvm::is_contained(Rems, &I))
+          Rems.push_back(&I);
+      }
+    }
+  }
 
   unsigned Inner4 = Modulus / VectorWidth;
   IRBuilder<> B(&*IV->getParent()->getFirstInsertionPt());
@@ -1969,6 +1999,7 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
   Value *VecC = ConstantInt::get(IV->getType(), VectorWidth);
   Value *NewDiv = B.CreateUDiv(IV, Inner4C, IV->getName() + ".row4");
 
+  unsigned RemUsesReplaced = 0;
   if (!Rems.empty()) {
     Value *NewRem = B.CreateURem(IV, Inner4C, IV->getName() + ".col4");
     Value *NewRemScaled =
@@ -1982,6 +2013,7 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
         if (!UserI || !LoopBlocks.count(UserI->getParent()))
           continue;
         U->set(NewRemScaled);
+        ++RemUsesReplaced;
       }
       if (Rem->use_empty())
         ToErase.push_back(Rem);
@@ -2000,7 +2032,7 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
     if (Div->use_empty())
       ToErase.push_back(Div);
   }
-  return true;
+  return RemUsesReplaced;
 }
 
 /// Walk select/phi/cast/zero to find the unique float load feeding V, if any.
@@ -2239,6 +2271,7 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     return false;
   if (Step % VectorWidth != 0)
     return false;
+  const uint64_t Float4Bound = ElementLimit / VectorWidth;
 
   Value *Init = nullptr;
   for (unsigned I = 0; I != IV->getNumIncomingValues(); ++I)
@@ -2408,6 +2441,30 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
                       << Header->getName() << '\n');
     return false;
   }
+  // Rem ops that feed this loop's addresses must be rewritten; otherwise a
+  // tid%32 column used as a float4 base walks past a 32-wide LDS row.
+  if (Init && (Step % Modulus) == 0) {
+    for (BasicBlock *BB : Visited) {
+      for (Instruction &I : *BB) {
+        unsigned M = 0;
+        if (matchUnitStrideRem(&I, Init, M) && M == Modulus &&
+            !llvm::is_contained(Rems, &I))
+          Rems.push_back(&I);
+        if (matchUnitStrideRem(&I, IV, M) && M == Modulus &&
+            !llvm::is_contained(Rems, &I))
+          Rems.push_back(&I);
+      }
+    }
+  }
+  const unsigned RemUsesInLoop = countRemUsesInBlocks(Rems, Visited);
+  // A rem that feeds staging addresses must be rewritten. If rem ops were
+  // collected but do not feed this loop, refuse: widening div-only while
+  // leaving tid%Mod columns intact walks float4 past the tile edge.
+  if (!Rems.empty() && RemUsesInLoop == 0) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (rem not feeding staging addresses) for IV in "
+                      << Header->getName() << '\n');
+    return false;
+  }
 
   // After retargeting, the load should only feed this store (and a transient
   // phi/select we are about to drop).
@@ -2440,14 +2497,14 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     StorePhi->eraseFromParent();
 
   SmallVector<Instruction *, 8> DeadIdx;
-  bool Rewritten =
+  unsigned RemUsesReplaced =
       rewriteIndexForFloat4(IV, Init, Modulus, Step, Visited, DeadIdx);
-  assert(Rewritten && "collectFloat4IndexOps succeeded but rewrite failed");
-  (void)Rewritten;
+  assert((Rems.empty() || RemUsesReplaced > 0) &&
+         "expected rem uses in loop to be rewritten");
+  (void)RemUsesInLoop;
 
   // Shrink the trip count using the true element limit (not N-Step).
-  Constant *NewBound =
-      ConstantInt::get(BoundC->getType(), ElementLimit / VectorWidth);
+  Constant *NewBound = ConstantInt::get(BoundC->getType(), Float4Bound);
   if (Cmp->getOperand(0) == CmpBound)
     Cmp->setOperand(0, NewBound);
   else
@@ -2455,6 +2512,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
 
   // GEPs that still index with the raw IV (common for linearized LDS stores)
   // must switch to element offsets in the float4 domain: elem = IV * 4.
+  // When rem uses were rewritten, only scale direct IV GEPs — do not rewrite
+  // Add/Or/Mul address arithmetic (that would double-apply on top of rem/div).
   {
     IRBuilder<> ScaleB(&*IV->getParent()->getFirstInsertionPt());
     Value *ScaledIV = ScaleB.CreateMul(
@@ -2471,6 +2530,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
         U->set(ScaledIV);
         continue;
       }
+      if (RemUsesReplaced > 0)
+        continue;
       // Scale address arithmetic that feeds GEPs, but not the rem/div rewrite
       // helpers we just inserted.
       if (UserI->getName().ends_with(".col4") ||
@@ -2510,7 +2571,7 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   LLVM_DEBUG(dbgs() << "Widened interior cooperative staging loop with IV "
                     << IV->getName() << " modulus " << Modulus
                     << " element-limit " << ElementLimit << " -> "
-                    << (ElementLimit / VectorWidth) << '\n');
+                    << Float4Bound << " rem-uses " << RemUsesReplaced << '\n');
   return true;
 }
 
