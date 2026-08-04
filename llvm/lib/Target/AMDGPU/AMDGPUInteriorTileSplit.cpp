@@ -2001,35 +2001,107 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
   return true;
 }
 
-static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
+/// Walk select/phi/cast/zero to find the unique float load feeding V, if any.
+static LoadInst *findUniqueFloatLoad(Value *V) {
+  SmallPtrSet<Value *, 8> Seen;
+  SmallVector<Value *, 8> Worklist = {V};
+  LoadInst *Found = nullptr;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (!Seen.insert(Cur).second)
+      continue;
+    if (isZeroFloat(Cur) || isa<UndefValue>(Cur) || isa<PoisonValue>(Cur))
+      continue;
+    if (auto *LI = dyn_cast<LoadInst>(Cur)) {
+      if (!LI->getType()->isFloatTy())
+        return nullptr;
+      if (Found && Found != LI)
+        return nullptr;
+      Found = LI;
+      continue;
+    }
+    if (auto *Cast = dyn_cast<CastInst>(Cur)) {
+      Worklist.push_back(Cast->getOperand(0));
+      continue;
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(Cur)) {
+      Worklist.push_back(Sel->getTrueValue());
+      Worklist.push_back(Sel->getFalseValue());
+      continue;
+    }
+    if (auto *Phi = dyn_cast<PHINode>(Cur)) {
+      for (Value *Inc : Phi->incoming_values())
+        Worklist.push_back(Inc);
+      continue;
+    }
+    return nullptr;
+  }
+  return Found;
+}
+
+static bool pointerAvailableAt(Value *Ptr, Instruction *At, DominatorTree &DT) {
+  if (!Ptr || isa<Argument>(Ptr) || isa<Constant>(Ptr) || isa<GlobalValue>(Ptr))
+    return true;
+  if (auto *I = dyn_cast<Instruction>(Ptr))
+    return DT.dominates(I, At);
+  return false;
+}
+
+static bool valueDependsOn(Value *V, Value *Target,
+                           SmallPtrSetImpl<Value *> &Seen) {
+  if (V == Target)
+    return true;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || !Seen.insert(V).second)
+    return false;
+  for (Value *Op : I->operands())
+    if (valueDependsOn(Op, Target, Seen))
+      return true;
+  return false;
+}
+
+static bool addrDependsOnIV(Instruction *MemI, Value *IV, Value *Init) {
+  SmallPtrSet<Value *, 16> Seen;
+  Value *Ptr = nullptr;
+  if (auto *LI = dyn_cast<LoadInst>(MemI))
+    Ptr = LI->getPointerOperand();
+  else if (auto *SI = dyn_cast<StoreInst>(MemI))
+    Ptr = SI->getPointerOperand();
+  if (!Ptr)
+    return false;
+  if (valueDependsOn(Ptr, IV, Seen))
+    return true;
+  if (Init) {
+    Seen.clear();
+    if (valueDependsOn(Ptr, Init, Seen))
+      return true;
+  }
+  return false;
+}
+
+static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI,
+                                   bool MaterializeAtStore) {
   if (!LI || !SI)
     return false;
-  if (!LI->getType()->isFloatTy() || !SI->getValueOperand()->getType()->isFloatTy())
+  if (!LI->getType()->isFloatTy() ||
+      !SI->getValueOperand()->getType()->isFloatTy())
     return false;
-  if (SI->getValueOperand() != LI &&
-      !(isa<CastInst>(SI->getValueOperand()) &&
-        cast<CastInst>(SI->getValueOperand())->getOperand(0) == LI))
-    return false;
+  if (!MaterializeAtStore) {
+    if (SI->getValueOperand() != LI &&
+        !(isa<CastInst>(SI->getValueOperand()) &&
+          cast<CastInst>(SI->getValueOperand())->getOperand(0) == LI))
+      return false;
+  }
   if (!isGlobalPointer(LI->getPointerOperand()) ||
       !isLocalOrLDSPointer(SI->getPointerOperand()))
     return false;
 
-  // Refuse to widen if the load has other non-store users; replacing those
-  // with poison breaks later passes (CodeSinking under LTO).
-  for (User *U : LI->users()) {
-    if (U == SI)
-      continue;
-    if (auto *Cast = dyn_cast<CastInst>(U)) {
-      if (Cast->hasOneUse() && Cast->user_back() == SI)
-        continue;
-    }
-    return false;
-  }
-
   Align LoadAlign = std::max(LI->getAlign(), Align(16));
   Align StoreAlign = std::max(SI->getAlign(), Align(16));
 
-  IRBuilder<> B(LI);
+  Instruction *LoadIP = MaterializeAtStore ? static_cast<Instruction *>(SI)
+                                           : static_cast<Instruction *>(LI);
+  IRBuilder<> B(LoadIP);
   Type *VecTy = getFloat4Ty(LI->getContext());
   LoadInst *NewLoad =
       B.CreateAlignedLoad(VecTy, LI->getPointerOperand(), LoadAlign,
@@ -2175,11 +2247,12 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     return false;
   }
 
-  // Find a scalar float global load and LDS store in blocks dominated by the
-  // header that use this IV's rem/div addressing. Restrict to the loop body by
-  // requiring the load to be in Header or a unique successor chain before Latch.
+  // Pair an LDS float store with the unique global float load that feeds it
+  // (through phi/select/cast). Do not pick "last load" and "last store"
+  // independently — that mismatches sibling staging loops.
   LoadInst *LI = nullptr;
   StoreInst *SI = nullptr;
+  PHINode *StorePhi = nullptr;
   SmallVector<BasicBlock *, 8> Worklist = {Header};
   SmallPtrSet<BasicBlock *, 8> Visited;
   while (!Worklist.empty()) {
@@ -2187,15 +2260,18 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     if (!Visited.insert(BB).second)
       continue;
     for (Instruction &Inst : *BB) {
-      if (auto *L = dyn_cast<LoadInst>(&Inst)) {
-        if (L->getType()->isFloatTy() && isGlobalPointer(L->getPointerOperand()))
-          LI = L;
-      }
-      if (auto *S = dyn_cast<StoreInst>(&Inst)) {
-        if (S->getValueOperand()->getType()->isFloatTy() &&
-            isLocalOrLDSPointer(S->getPointerOperand()))
-          SI = S;
-      }
+      auto *S = dyn_cast<StoreInst>(&Inst);
+      if (!S || !S->getValueOperand()->getType()->isFloatTy() ||
+          !isLocalOrLDSPointer(S->getPointerOperand()))
+        continue;
+      LoadInst *Cand = findUniqueFloatLoad(S->getValueOperand());
+      if (!Cand || !isGlobalPointer(Cand->getPointerOperand()))
+        continue;
+      // Must belong to this cooperative IV (not a sibling A/B staging loop).
+      if (!addrDependsOnIV(Cand, IV, Init) && !addrDependsOnIV(S, IV, Init))
+        continue;
+      LI = Cand;
+      SI = S;
     }
     if (BB == Latch)
       continue;
@@ -2203,26 +2279,25 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
       if (Succ != Header)
         Worklist.push_back(Succ);
   }
-  if (!LI || !SI)
+  if (!LI || !SI || !Visited.count(LI->getParent()))
     return false;
-  if (!isGlobalPointer(LI->getPointerOperand()) ||
-      !isLocalOrLDSPointer(SI->getPointerOperand()))
-    return false;
-  // Fresh DT (rebuilt after cloning) — allow cross-block widen when the load
-  // dominates the store so the vector load is available at the store.
-  if (!DT.dominates(LI, SI)) {
+
+  const bool LoadDomStore = DT.dominates(LI, SI);
+  const bool MaterializeAtStore =
+      !LoadDomStore && pointerAvailableAt(LI->getPointerOperand(), SI, DT) &&
+      pointerAvailableAt(SI->getPointerOperand(), SI, DT);
+  if (!LoadDomStore && !MaterializeAtStore) {
     LLVM_DEBUG(dbgs() << "Widen skipped (load does not dominate store) for IV in "
                       << Header->getName() << '\n');
     return false;
   }
 
-  // Validate the stored value without mutating. Accept load, cast(load),
-  // select(load,0), or phi of those.
+  // Validate the stored value without mutating.
   Value *Stored = peelLoadThroughTrivialSelects(SI->getValueOperand(), LI);
-  PHINode *StorePhi = dyn_cast<PHINode>(Stored);
-  if (StorePhi) {
+  if (auto *Phi = dyn_cast<PHINode>(Stored)) {
+    StorePhi = Phi;
     Value *IncomingLoad = nullptr;
-    for (Value *Inc : StorePhi->incoming_values()) {
+    for (Value *Inc : Phi->incoming_values()) {
       if (isa<Constant>(Inc) || isZeroFloat(Inc))
         continue;
       Value *Src = peelLoadThroughTrivialSelects(Inc, LI);
@@ -2235,9 +2310,15 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     if (!IncomingLoad)
       return false;
   } else if (Stored != LI) {
+    StorePhi = nullptr;
     if (!(isa<CastInst>(Stored) &&
-          cast<CastInst>(Stored)->getOperand(0) == LI))
-      return false;
+          cast<CastInst>(Stored)->getOperand(0) == LI)) {
+      // Direct store of load, or select peeled to load already handled.
+      if (findUniqueFloatLoad(SI->getValueOperand()) != LI)
+        return false;
+    }
+  } else {
+    StorePhi = nullptr;
   }
 
   SmallVector<Instruction *, 8> Rems;
@@ -2249,9 +2330,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     return false;
   }
 
-  // After retargeting the store to LI, the load must not have other users —
-  // otherwise widenLoadStoreToFloat4 must refuse and we would have already
-  // rewritten indices (partial mutation).
+  // After retargeting, the load should only feed this store (and a transient
+  // phi/select we are about to drop).
   for (User *U : LI->users()) {
     if (U == SI || U == StorePhi)
       continue;
@@ -2270,14 +2350,15 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   }
 
   // --- Commit mutations (no early return after this point) ---
-  // Only rewrite the store's value operand — do not RAUW a shared phi/select
-  // that may have users outside LI's dominance frontier.
-  if (SI->getValueOperand() != LI) {
+  if (!MaterializeAtStore && SI->getValueOperand() != LI) {
     Value *Op = SI->getValueOperand();
     if (Op == StorePhi || peelLoadThroughTrivialSelects(Op, LI) == LI ||
-        (isa<CastInst>(Op) && cast<CastInst>(Op)->getOperand(0) == LI))
+        (isa<CastInst>(Op) && cast<CastInst>(Op)->getOperand(0) == LI) ||
+        findUniqueFloatLoad(Op) == LI)
       SI->setOperand(0, LI);
   }
+  if (!MaterializeAtStore && StorePhi && StorePhi->use_empty())
+    StorePhi->eraseFromParent();
 
   SmallVector<Instruction *, 8> DeadIdx;
   bool Rewritten = rewriteIndexForFloat4(IV, Init, Modulus, StepC->getZExtValue(),
@@ -2333,9 +2414,13 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     }
   }
 
-  bool Widened = widenLoadStoreToFloat4(LI, SI);
+  bool Widened = widenLoadStoreToFloat4(LI, SI, MaterializeAtStore);
   assert(Widened && "prevalidated load/store widen failed");
   (void)Widened;
+  if (StorePhi && StorePhi->use_empty())
+    StorePhi->eraseFromParent();
+  if (LI->getParent() && LI->use_empty())
+    LI->eraseFromParent();
 
   for (Instruction *I : DeadIdx) {
     if (I->use_empty())
