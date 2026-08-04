@@ -1,7 +1,7 @@
 ; REQUIRES: asserts
 
 ; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes='loop-simplify,lcssa,amdgpu-interior-tile-split' \
-; RUN:   -debug-only=amdgpu-interior-tile-split -S %s 2>&1 \
+; RUN:   -amdgpu-interior-tile-vectorize -debug-only=amdgpu-interior-tile-split -S %s 2>&1 \
 ; RUN:   | FileCheck %s
 
 declare i32 @llvm.amdgcn.workgroup.id.x()

@@ -80,7 +80,7 @@ constexpr unsigned VectorWidth = 4;
 static cl::opt<bool> EnableInteriorTileVectorize(
     "amdgpu-interior-tile-vectorize",
     cl::desc("Rewrite proven-interior GEMM staging to <4 x float> loads/stores"),
-    cl::init(true), cl::Hidden);
+    cl::init(false), cl::Hidden);
 
 enum IDDependency : unsigned {
   DependsOnNone = 0,
@@ -2226,8 +2226,18 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   auto *BoundC = dyn_cast<ConstantInt>(CmpBound);
   if (!BoundC)
     return false;
-  uint64_t Bound = BoundC->getZExtValue();
-  if (Bound < VectorWidth || (Bound % VectorWidth) != 0)
+  const uint64_t Step = StepC->getZExtValue();
+  uint64_t CmpLimit = BoundC->getZExtValue();
+  // HIP often emits `idx + Step < N` as `idx < N-Step` (e.g. 3840 for N=4096,
+  // Step=256). Float4 rewrite must use the true element limit N.
+  uint64_t ElementLimit = CmpLimit;
+  if (CmpIV == IV && Step != 0 && CmpLimit % Step == 0)
+    ElementLimit = CmpLimit + Step;
+  else if (CmpIV == Add)
+    ElementLimit = CmpLimit;
+  if (ElementLimit < VectorWidth || (ElementLimit % VectorWidth) != 0)
+    return false;
+  if (Step % VectorWidth != 0)
     return false;
 
   Value *Init = nullptr;
@@ -2286,12 +2296,12 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
       break;
     }
   }
-  if (!HasRem && Init && (StepC->getZExtValue() % Modulus) == 0)
+  if (!HasRem && Init && (Step % Modulus) == 0)
     HasRem = true;
   if (!HasRem) {
     LLVM_DEBUG(dbgs() << "Widen skipped (no rem on IV or invariant Init) for IV in "
                       << Header->getName() << " modulus " << Modulus
-                      << " step " << StepC->getZExtValue() << '\n');
+                      << " step " << Step << '\n');
     return false;
   }
 
@@ -2393,8 +2403,7 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
 
   SmallVector<Instruction *, 8> Rems;
   SmallVector<Instruction *, 8> Divs;
-  if (!collectFloat4IndexOps(IV, Init, Modulus, StepC->getZExtValue(), Rems,
-                             Divs)) {
+  if (!collectFloat4IndexOps(IV, Init, Modulus, Step, Rems, Divs)) {
     LLVM_DEBUG(dbgs() << "Widen skipped (collect rem/div failed) for IV in "
                       << Header->getName() << '\n');
     return false;
@@ -2431,14 +2440,14 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     StorePhi->eraseFromParent();
 
   SmallVector<Instruction *, 8> DeadIdx;
-  bool Rewritten = rewriteIndexForFloat4(IV, Init, Modulus, StepC->getZExtValue(),
-                                         Visited, DeadIdx);
+  bool Rewritten =
+      rewriteIndexForFloat4(IV, Init, Modulus, Step, Visited, DeadIdx);
   assert(Rewritten && "collectFloat4IndexOps succeeded but rewrite failed");
   (void)Rewritten;
 
-  // Shrink the trip count: each iteration now covers 4 elements.
+  // Shrink the trip count using the true element limit (not N-Step).
   Constant *NewBound =
-      ConstantInt::get(BoundC->getType(), Bound / VectorWidth);
+      ConstantInt::get(BoundC->getType(), ElementLimit / VectorWidth);
   if (Cmp->getOperand(0) == CmpBound)
     Cmp->setOperand(0, NewBound);
   else
@@ -2499,8 +2508,9 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
 
   ++NumInteriorStagingVectorWidens;
   LLVM_DEBUG(dbgs() << "Widened interior cooperative staging loop with IV "
-                    << IV->getName() << " modulus " << Modulus << " bound "
-                    << Bound << " -> " << (Bound / VectorWidth) << '\n');
+                    << IV->getName() << " modulus " << Modulus
+                    << " element-limit " << ElementLimit << " -> "
+                    << (ElementLimit / VectorWidth) << '\n');
   return true;
 }
 
