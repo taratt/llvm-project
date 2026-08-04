@@ -17,6 +17,7 @@
 
 #include "AMDGPU.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -47,6 +48,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 #define DEBUG_TYPE "amdgpu-interior-tile-split"
@@ -2047,6 +2049,52 @@ static bool pointerAvailableAt(Value *Ptr, Instruction *At, DominatorTree &DT) {
   return false;
 }
 
+/// Clone address math that does not dominate Before into Before's block, then
+/// emit a new load there. Needed for the HIP diamond:
+///   load_bb: ptr = gep ...; v = load ptr; br merge
+///   merge:   p = phi [v, 0]; store p
+/// where neither the load nor its gep dominate the store.
+static LoadInst *reconstituteLoadBefore(LoadInst *LI, Instruction *Before,
+                                        DominatorTree &DT,
+                                        const SmallPtrSetImpl<BasicBlock *> &Region) {
+  DenseMap<Value *, Value *> Mapped;
+  std::function<Value *(Value *)> MapValue = [&](Value *V) -> Value * {
+    if (auto It = Mapped.find(V); It != Mapped.end())
+      return It->second;
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      if (DT.dominates(I, Before))
+        return Mapped[V] = I;
+      if (!Region.count(I->getParent()))
+        return nullptr;
+      SmallVector<Value *, 4> NewOps;
+      NewOps.reserve(I->getNumOperands());
+      for (Value *Op : I->operands()) {
+        Value *MappedOp = MapValue(Op);
+        if (!MappedOp)
+          return nullptr;
+        NewOps.push_back(MappedOp);
+      }
+      Instruction *Cloned = I->clone();
+      for (unsigned Idx = 0, E = NewOps.size(); Idx != E; ++Idx)
+        Cloned->setOperand(Idx, NewOps[Idx]);
+      Cloned->insertBefore(Before);
+      Cloned->setName(I->getName() + ".atstore");
+      return Mapped[V] = Cloned;
+    }
+    return Mapped[V] = V;
+  };
+
+  Value *NewPtr = MapValue(LI->getPointerOperand());
+  if (!NewPtr)
+    return nullptr;
+  IRBuilder<> B(Before);
+  LoadInst *NewLI = B.CreateAlignedLoad(LI->getType(), NewPtr, LI->getAlign(),
+                                        LI->getName() + ".atstore");
+  NewLI->setOrdering(LI->getOrdering());
+  NewLI->setSyncScopeID(LI->getSyncScopeID());
+  return NewLI;
+}
+
 static bool valueDependsOn(Value *V, Value *Target,
                            SmallPtrSetImpl<Value *> &Seen) {
   if (V == Target)
@@ -2282,16 +2330,6 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   if (!LI || !SI || !Visited.count(LI->getParent()))
     return false;
 
-  const bool LoadDomStore = DT.dominates(LI, SI);
-  const bool MaterializeAtStore =
-      !LoadDomStore && pointerAvailableAt(LI->getPointerOperand(), SI, DT) &&
-      pointerAvailableAt(SI->getPointerOperand(), SI, DT);
-  if (!LoadDomStore && !MaterializeAtStore) {
-    LLVM_DEBUG(dbgs() << "Widen skipped (load does not dominate store) for IV in "
-                      << Header->getName() << '\n');
-    return false;
-  }
-
   // Validate the stored value without mutating.
   Value *Stored = peelLoadThroughTrivialSelects(SI->getValueOperand(), LI);
   if (auto *Phi = dyn_cast<PHINode>(Stored)) {
@@ -2313,12 +2351,44 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     StorePhi = nullptr;
     if (!(isa<CastInst>(Stored) &&
           cast<CastInst>(Stored)->getOperand(0) == LI)) {
-      // Direct store of load, or select peeled to load already handled.
       if (findUniqueFloatLoad(SI->getValueOperand()) != LI)
         return false;
     }
   } else {
     StorePhi = nullptr;
+  }
+
+  // Diamond CFG after guard strip: load/gep live in a side block and feed a
+  // phi at the store. Reconstitute address+load immediately before the store
+  // so the widen has a dominated scalar load to replace.
+  if (!DT.dominates(LI, SI)) {
+    Instruction *InsertBefore = StorePhi ? static_cast<Instruction *>(StorePhi)
+                                         : static_cast<Instruction *>(SI);
+    LoadInst *LocalLI =
+        reconstituteLoadBefore(LI, InsertBefore, DT, Visited);
+    if (!LocalLI) {
+      LLVM_DEBUG(dbgs() << "Widen skipped (cannot reconstitute load at store) for IV in "
+                        << Header->getName() << '\n');
+      return false;
+    }
+    if (StorePhi) {
+      StorePhi->replaceAllUsesWith(LocalLI);
+      if (StorePhi->use_empty()) {
+        StorePhi->eraseFromParent();
+        StorePhi = nullptr;
+      }
+    } else if (SI->getValueOperand() != LocalLI) {
+      SI->setOperand(0, LocalLI);
+    }
+    if (LI->use_empty())
+      LI->eraseFromParent();
+    LI = LocalLI;
+    DT.recalculate(*Header->getParent());
+    if (!DT.dominates(LI, SI)) {
+      LLVM_DEBUG(dbgs() << "Widen skipped (reconstituted load still does not dominate) for IV in "
+                        << Header->getName() << '\n');
+      return false;
+    }
   }
 
   SmallVector<Instruction *, 8> Rems;
@@ -2350,14 +2420,14 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   }
 
   // --- Commit mutations (no early return after this point) ---
-  if (!MaterializeAtStore && SI->getValueOperand() != LI) {
+  if (SI->getValueOperand() != LI) {
     Value *Op = SI->getValueOperand();
     if (Op == StorePhi || peelLoadThroughTrivialSelects(Op, LI) == LI ||
         (isa<CastInst>(Op) && cast<CastInst>(Op)->getOperand(0) == LI) ||
         findUniqueFloatLoad(Op) == LI)
       SI->setOperand(0, LI);
   }
-  if (!MaterializeAtStore && StorePhi && StorePhi->use_empty())
+  if (StorePhi && StorePhi->use_empty())
     StorePhi->eraseFromParent();
 
   SmallVector<Instruction *, 8> DeadIdx;
@@ -2414,7 +2484,7 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     }
   }
 
-  bool Widened = widenLoadStoreToFloat4(LI, SI, MaterializeAtStore);
+  bool Widened = widenLoadStoreToFloat4(LI, SI, /*MaterializeAtStore=*/false);
   assert(Widened && "prevalidated load/store widen failed");
   (void)Widened;
   if (StorePhi && StorePhi->use_empty())
