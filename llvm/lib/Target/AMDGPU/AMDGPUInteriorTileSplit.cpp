@@ -2056,7 +2056,7 @@ static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
 /// (IV / Modulus, IV % Modulus) feeding one float load (global) and one float
 /// store (LDS). Rewrites the trip count to Bound/4 and replaces rem/div so each
 /// iteration owns a unique <4 x float> chunk.
-static bool widenOneCooperativeStagingLoop(PHINode *IV) {
+static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   BasicBlock *Header = IV->getParent();
   if (IV->getNumIncomingValues() != 2)
     return false;
@@ -2208,10 +2208,10 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (!isGlobalPointer(LI->getPointerOperand()) ||
       !isLocalOrLDSPointer(SI->getPointerOperand()))
     return false;
-  // Keep load/store in one block so the vector load dominates the store without
-  // needing a DT refresh after cloning (stale DT crashes CodeSinking later).
-  if (LI->getParent() != SI->getParent()) {
-    LLVM_DEBUG(dbgs() << "Widen skipped (load/store in different blocks) for IV in "
+  // Fresh DT (rebuilt after cloning) — allow cross-block widen when the load
+  // dominates the store so the vector load is available at the store.
+  if (!DT.dominates(LI, SI)) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (load does not dominate store) for IV in "
                       << Header->getName() << '\n');
     return false;
   }
@@ -2351,6 +2351,10 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
 
 static unsigned widenCooperativeStagingLoops(
     ArrayRef<BasicBlock *> Blocks) {
+  if (Blocks.empty())
+    return 0;
+  // Cloned interior blocks are not in the pass's DT yet; build a fresh tree.
+  DominatorTree DT(*Blocks.front()->getParent());
   unsigned Widened = 0;
   SmallPtrSet<PHINode *, 8> Seen;
   for (BasicBlock *BB : Blocks) {
@@ -2359,7 +2363,7 @@ static unsigned widenCooperativeStagingLoops(
         continue;
       if (!PN.getType()->isIntegerTy())
         continue;
-      if (widenOneCooperativeStagingLoop(&PN))
+      if (widenOneCooperativeStagingLoop(&PN, DT))
         ++Widened;
     }
   }

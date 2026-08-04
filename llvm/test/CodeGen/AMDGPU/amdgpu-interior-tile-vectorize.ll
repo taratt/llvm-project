@@ -151,6 +151,9 @@ stage.load:
   %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk
   %val = load float, ptr addrspace(1) %a.ptr.k, align 4
   %sel = select i1 true, float %val, float 0.000000e+00
+  br label %stage.store
+
+stage.store:
   %lds.row = mul i32 %lm, 32
   %lds.off = add i32 %lds.row, %lk
   %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
