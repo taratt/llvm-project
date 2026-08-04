@@ -35,6 +35,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
 #include "llvm/Support/Alignment.h"
@@ -1985,8 +1986,17 @@ static bool rewriteIndexForFloat4(PHINode *IV, Value *Init, unsigned Modulus,
     }
   }
   for (Instruction *Div : Divs) {
-    Div->replaceAllUsesWith(NewDiv);
-    ToErase.push_back(Div);
+    SmallVector<Use *, 8> Uses;
+    for (Use &U : Div->uses())
+      Uses.push_back(&U);
+    for (Use *U : Uses) {
+      auto *UserI = dyn_cast<Instruction>(U->getUser());
+      if (!UserI || !LoopBlocks.count(UserI->getParent()))
+        continue;
+      U->set(NewDiv);
+    }
+    if (Div->use_empty())
+      ToErase.push_back(Div);
   }
   return true;
 }
@@ -2004,8 +2014,18 @@ static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
       !isLocalOrLDSPointer(SI->getPointerOperand()))
     return false;
 
-  // Prefer naturally aligned bases; still emit align(16) so isel can form b128
-  // when the interior proof / allocator alignment holds in practice.
+  // Refuse to widen if the load has other non-store users; replacing those
+  // with poison breaks later passes (CodeSinking under LTO).
+  for (User *U : LI->users()) {
+    if (U == SI)
+      continue;
+    if (auto *Cast = dyn_cast<CastInst>(U)) {
+      if (Cast->hasOneUse() && Cast->user_back() == SI)
+        continue;
+    }
+    return false;
+  }
+
   Align LoadAlign = std::max(LI->getAlign(), Align(16));
   Align StoreAlign = std::max(SI->getAlign(), Align(16));
 
@@ -2024,8 +2044,8 @@ static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI) {
   NewStore->setSyncScopeID(SI->getSyncScopeID());
 
   SI->eraseFromParent();
-  LI->replaceAllUsesWith(PoisonValue::get(LI->getType()));
-  LI->eraseFromParent();
+  if (LI->use_empty())
+    LI->eraseFromParent();
   return true;
 }
 
@@ -2188,6 +2208,13 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
   if (!isGlobalPointer(LI->getPointerOperand()) ||
       !isLocalOrLDSPointer(SI->getPointerOperand()))
     return false;
+  // Keep load/store in one block so the vector load dominates the store without
+  // needing a DT refresh after cloning (stale DT crashes CodeSinking later).
+  if (LI->getParent() != SI->getParent()) {
+    LLVM_DEBUG(dbgs() << "Widen skipped (load/store in different blocks) for IV in "
+                      << Header->getName() << '\n');
+    return false;
+  }
 
   // Validate the stored value without mutating. Accept load, cast(load),
   // select(load,0), or phi of those.
@@ -2222,15 +2249,32 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV) {
     return false;
   }
 
-  // --- Commit mutations (no early return after this point) ---
-  if (StorePhi) {
-    StorePhi->replaceAllUsesWith(LI);
-    if (StorePhi->use_empty())
-      StorePhi->eraseFromParent();
+  // After retargeting the store to LI, the load must not have other users —
+  // otherwise widenLoadStoreToFloat4 must refuse and we would have already
+  // rewritten indices (partial mutation).
+  for (User *U : LI->users()) {
+    if (U == SI || U == StorePhi)
+      continue;
+    if (auto *Cast = dyn_cast<CastInst>(U)) {
+      if (Cast->hasOneUse() &&
+          (Cast->user_back() == SI || Cast->user_back() == StorePhi))
+        continue;
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(U)) {
+      if (Sel->hasOneUse() && Sel->user_back() == SI)
+        continue;
+    }
+    LLVM_DEBUG(dbgs() << "Widen skipped (load has extra users) for IV in "
+                      << Header->getName() << '\n');
+    return false;
   }
+
+  // --- Commit mutations (no early return after this point) ---
+  // Only rewrite the store's value operand — do not RAUW a shared phi/select
+  // that may have users outside LI's dominance frontier.
   if (SI->getValueOperand() != LI) {
     Value *Op = SI->getValueOperand();
-    if (peelLoadThroughTrivialSelects(Op, LI) == LI ||
+    if (Op == StorePhi || peelLoadThroughTrivialSelects(Op, LI) == LI ||
         (isa<CastInst>(Op) && cast<CastInst>(Op)->getOperand(0) == LI))
       SI->setOperand(0, LI);
   }
@@ -2522,6 +2566,11 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   for (BasicBlock *BB : RegionBlocks)
     InteriorBlocks.push_back(cast<BasicBlock>(VMap[BB]));
   const unsigned MemoryOpts = optimizeInteriorMemoryPaths(InteriorBlocks);
+#ifndef NDEBUG
+  if (MemoryOpts && verifyFunction(F, &dbgs()))
+    report_fatal_error(
+        "AMDGPUInteriorTileSplit: memory opts produced invalid IR");
+#endif
 
   ++NumPreparedInteriorTileSplits;
   LLVM_DEBUG(dbgs() << "Cloned canonical interior-tile staging region in "
