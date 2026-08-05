@@ -1,8 +1,15 @@
 ; REQUIRES: asserts
 
+; Check the transformed IR and the pass remarks from separate streams. Reading
+; both from one pipe forces the checks into whatever order stdout and stderr
+; happen to interleave in, which has nothing to do with what is being tested.
 ; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes='loop-simplify,lcssa,amdgpu-interior-tile-split' \
-; RUN:   -amdgpu-interior-tile-vectorize -debug-only=amdgpu-interior-tile-split -S %s 2>&1 \
+; RUN:   -amdgpu-interior-tile-vectorize -S %s 2>/dev/null \
 ; RUN:   | FileCheck %s
+
+; RUN: opt -mtriple=amdgcn-amd-amdhsa -passes='loop-simplify,lcssa,amdgpu-interior-tile-split' \
+; RUN:   -amdgpu-interior-tile-vectorize -debug-only=amdgpu-interior-tile-split \
+; RUN:   -disable-output %s 2>&1 | FileCheck %s --check-prefix=DEBUG
 
 declare i32 @llvm.amdgcn.workgroup.id.x()
 declare i32 @llvm.amdgcn.workgroup.id.y()
@@ -11,11 +18,11 @@ declare void @llvm.amdgcn.s.barrier()
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
 
-; -debug-only writes to stderr, so every debug line lands ahead of the -S
-; output. Check them here as one group rather than per function.
-; CHECK-COUNT-5: Widened interior cooperative staging loop
-; CHECK: Cloned nested-loop staging region in coop_staging_float4
-; CHECK: Widen skipped (staging access is predicated)
+; Which path each kernel took. The <4 x float> traffic itself is checked per
+; function below.
+; DEBUG-DAG: Cloned nested-loop staging region in coop_staging_float4
+; DEBUG-DAG: Widened already-interior staging in already_interior_staging
+; DEBUG-DAG: Widen skipped (staging access is predicated)
 
 ; A batched-GEMM-style outer K loop with a nested cooperative global→LDS
 ; staging loop.  After the interior clone strips the M/N lane guards, the
