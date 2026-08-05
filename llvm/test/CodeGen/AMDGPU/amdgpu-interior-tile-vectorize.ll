@@ -15,6 +15,7 @@ declare i32 @llvm.smin.i32(i32, i32)
 ; output. Check them here as one group rather than per function.
 ; CHECK-COUNT-5: Widened interior cooperative staging loop
 ; CHECK: Cloned nested-loop staging region in coop_staging_float4
+; CHECK: Widen skipped (staging access is predicated)
 
 ; A batched-GEMM-style outer K loop with a nested cooperative global→LDS
 ; staging loop.  After the interior clone strips the M/N lane guards, the
@@ -421,7 +422,7 @@ k.header:
   br label %staging
 
 staging:
-  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
+  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %staging ]
   %lm = lshr i32 %idx, 5
   %gk = add i32 %i, %lk
   %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %lm
@@ -431,6 +432,62 @@ staging:
   %lds.off = add i32 %lds.row, %lk
   %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
   store float %val, ptr addrspace(3) %lds.ptr, align 4
+  %idx.next = add nuw i32 %idx, 256
+  %stage.more = icmp ult i32 %idx.next, 4096
+  br i1 %stage.more, label %staging, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  ret void
+}
+
+; A staged load predicated on a bound this pass does not model. Widening would
+; speculate three neighbours of every in-bounds element, so the loop must stay
+; scalar: an unrecognized guard is not a missing guard.
+; CHECK-LABEL: define amdgpu_kernel void @guarded_staging_not_widened(
+; CHECK-NOT: load <4 x float>
+define amdgpu_kernel void @guarded_staging_not_widened(ptr addrspace(1) %a,
+                                                       ptr addrspace(3) %lds,
+                                                       i32 %k) {
+entry:
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %lk = and i32 %tid, 31
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %entry ], [ %next, %k.latch ]
+  br label %staging
+
+staging:
+  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
+  %lm = lshr i32 %idx, 5
+  %gk = add i32 %i, %lk
+  %in.bounds = icmp slt i32 %gk, %k
+  br i1 %in.bounds, label %stage.load, label %stage.merge
+
+stage.load:
+  %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %lm
+  %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk
+  %val = load float, ptr addrspace(1) %a.ptr.k, align 4
+  br label %stage.merge
+
+stage.merge:
+  %staged = phi float [ %val, %stage.load ], [ 0.000000e+00, %staging ]
+  %lds.row = mul i32 %lm, 32
+  %lds.off = add i32 %lds.row, %lk
+  %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
+  store float %staged, ptr addrspace(3) %lds.ptr, align 4
+  br label %stage.latch
+
+stage.latch:
   %idx.next = add nuw i32 %idx, 256
   %stage.more = icmp ult i32 %idx.next, 4096
   br i1 %stage.more, label %staging, label %k.barrier

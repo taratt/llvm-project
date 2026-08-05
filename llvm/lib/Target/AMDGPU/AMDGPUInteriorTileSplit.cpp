@@ -1799,27 +1799,36 @@ struct OuterKLoopInfo {
 };
 
 /// Recover TileK from `IV * C` / `IV << log2(C)` uses inside the loop body.
+/// The scale often sits behind a widening cast, because the tile offset is used
+/// to index with 64-bit arithmetic.
 static uint64_t inferTileKFromIndexUses(PHINode *IV) {
-  for (User *U : IV->users()) {
-    auto *BO = dyn_cast<BinaryOperator>(U);
-    if (!BO)
-      continue;
-    if (BO->getOpcode() == Instruction::Mul) {
-      Value *Other = BO->getOperand(0) == IV ? BO->getOperand(1)
-                                             : BO->getOperand(0);
-      if (auto *C = dyn_cast<ConstantInt>(Other))
-        if (isSupportedTileK(C->getZExtValue()))
-          return C->getZExtValue();
-    }
-    if (BO->getOpcode() == Instruction::Shl && BO->getOperand(0) == IV)
-      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-        uint64_t Shift = C->getZExtValue();
-        if (Shift >= 3 && Shift <= 7) {
-          uint64_t TileK = 1ull << Shift;
-          if (isSupportedTileK(TileK))
-            return TileK;
-        }
+  SmallVector<Value *, 4> Sources = {IV};
+  for (User *U : IV->users())
+    if (isa<SExtInst>(U) || isa<ZExtInst>(U) || isa<TruncInst>(U))
+      Sources.push_back(U);
+
+  for (Value *Src : Sources) {
+    for (User *U : Src->users()) {
+      auto *BO = dyn_cast<BinaryOperator>(U);
+      if (!BO)
+        continue;
+      if (BO->getOpcode() == Instruction::Mul) {
+        Value *Other =
+            BO->getOperand(0) == Src ? BO->getOperand(1) : BO->getOperand(0);
+        if (auto *C = dyn_cast<ConstantInt>(Other))
+          if (isSupportedTileK(C->getZExtValue()))
+            return C->getZExtValue();
       }
+      if (BO->getOpcode() == Instruction::Shl && BO->getOperand(0) == Src)
+        if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+          uint64_t Shift = C->getZExtValue();
+          if (Shift >= 3 && Shift <= 7) {
+            uint64_t TileK = 1ull << Shift;
+            if (isSupportedTileK(TileK))
+              return TileK;
+          }
+        }
+    }
   }
   return 0;
 }
@@ -1831,11 +1840,19 @@ static uint64_t inferTileKFromIndexUses(PHINode *IV) {
 ///               (skips the possibly-partial last tile — always safe).
 static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
                                    OuterKLoopInfo &Info) {
+  // Every rejection is reported: without it, "not a canonical outer K loop"
+  // gives no way to tell an unsupported loop shape from a matcher bug.
+  auto Reject = [&](const char *Why) {
+    LLVM_DEBUG(dbgs() << "Outer K loop rejected at "
+                      << L->getHeader()->getName() << ": " << Why << '\n');
+    return false;
+  };
+
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exiting = L->getExitingBlock();
   if (!L->isLoopSimplifyForm() || !Preheader || !Exiting ||
       Exiting != L->getLoopLatch())
-    return false;
+    return Reject("not simplify form, or exiting block is not the latch");
 
   auto *ExitBranch = dyn_cast<BranchInst>(Exiting->getTerminator());
   auto *ExitCmp =
@@ -1843,19 +1860,25 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
           ? dyn_cast<ICmpInst>(ExitBranch->getCondition())
           : nullptr;
   if (!ExitCmp)
-    return false;
+    return Reject("latch does not branch on an icmp");
   BasicBlock *Continue = ExitBranch->getSuccessor(0) == L->getHeader()
                              ? ExitBranch->getSuccessor(0)
                              : ExitBranch->getSuccessor(1) == L->getHeader()
                                    ? ExitBranch->getSuccessor(1)
                                    : nullptr;
   if (!Continue)
-    return false;
+    return Reject("latch does not branch back to the header");
   ICmpInst::Predicate Pred = ExitBranch->getSuccessor(0) == Continue
                                   ? ExitCmp->getPredicate()
                                   : ExitCmp->getInversePredicate();
-  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
-    return false;
+  // A unit-step counted loop is canonicalized to `continue while iv.next !=
+  // bound`, since equality is provable there. Treat that as the less-than it
+  // came from, but only once SCEV agrees the loop is finite — `!=` alone does
+  // not bound the counter.
+  const bool IsNotEqualForm = Pred == ICmpInst::ICMP_NE;
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT &&
+      !IsNotEqualForm)
+    return Reject("latch predicate is not a less-than or not-equal");
 
   Value *IVNext = ExitCmp->getOperand(0);
   Value *Bound = ExitCmp->getOperand(1);
@@ -1866,11 +1889,19 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
   }
   auto *Step = AR ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
                   : nullptr;
-  if (!Step || AR->getLoop() != L || !L->isLoopInvariant(Bound) ||
+  if (!Step || AR->getLoop() != L)
+    return Reject("latch compares no affine IV of this loop");
+  if (!L->isLoopInvariant(Bound) ||
       !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
       !Bound->getType()->isIntegerTy())
-    return false;
+    return Reject("trip bound is not an integer available at loop entry");
   const uint64_t StepVal = Step->getAPInt().getZExtValue();
+  if (IsNotEqualForm) {
+    if (StepVal != 1)
+      return Reject("not-equal latch on a non-unit step");
+    if (isa<SCEVCouldNotCompute>(SE.getBackedgeTakenCount(L)))
+      return Reject("not-equal latch with an unknown backedge count");
+  }
 
   PHINode *IV = nullptr;
   for (PHINode &PN : L->getHeader()->phis()) {
@@ -1879,15 +1910,15 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
     auto *Initial =
         dyn_cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader));
     if (!Initial || !Initial->isZero())
-      return false;
+      return Reject("K induction variable does not start at zero");
     auto *Inc = dyn_cast<BinaryOperator>(IVNext);
     if (!Inc || Inc->getOpcode() != Instruction::Add)
-      return false;
+      return Reject("K induction variable is not advanced by an add");
     IV = &PN;
     break;
   }
   if (!IV)
-    return false;
+    return Reject("no header phi feeds the latch compare");
 
   if (isSupportedTileK(StepVal)) {
     Info = {IV, Bound, StepVal, OuterKForm::OffsetStep};
@@ -1896,10 +1927,12 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
   if (StepVal == 1) {
     uint64_t TileK = inferTileKFromIndexUses(IV);
     if (!TileK)
-      return false;
+      return Reject("unit-step K counter with no recognizable tile-K scale");
     Info = {IV, Bound, TileK, OuterKForm::TileCount};
     return true;
   }
+  LLVM_DEBUG(dbgs() << "Outer K loop rejected at " << L->getHeader()->getName()
+                    << ": step " << StepVal << " is not a supported tile K\n");
   return false;
 }
 
@@ -2410,7 +2443,13 @@ static bool widenLoadStoreToFloat4(LoadInst *LI, StoreInst *SI,
 /// (IV / Modulus, IV % Modulus) feeding one float load (global) and one float
 /// store (LDS). Rewrites the trip count to Bound/4 and replaces rem/div so each
 /// iteration owns a unique <4 x float> chunk.
-static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
+///
+/// \p RequireUnguarded rejects any loop whose staging access is predicated.
+/// Widening makes one load cover four elements, so it is only sound where all
+/// four are known in bounds.  A cloned interior region has that by
+/// construction; anywhere else the loop must be proven guard-free.
+static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT,
+                                           bool RequireUnguarded) {
   BasicBlock *Header = IV->getParent();
   if (IV->getNumIncomingValues() != 2)
     return false;
@@ -2582,6 +2621,24 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   if (!LI || !SI || !Visited.count(LI->getParent()))
     return false;
 
+  // Positive proof of an already-interior staging loop: the only conditional
+  // branch is the loop's own back edge, so nothing predicates the access. A
+  // kernel whose bounds checks simply do not match the M/N tile matcher must
+  // not be mistaken for one that has no bounds checks at all.
+  if (RequireUnguarded) {
+    for (BasicBlock *BB : Visited) {
+      if (BB == Latch)
+        continue;
+      auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!Br || Br->isConditional()) {
+        LLVM_DEBUG(dbgs()
+                   << "Widen skipped (staging access is predicated) for IV in "
+                   << Header->getName() << '\n');
+        return false;
+      }
+    }
+  }
+
   // Validate the stored value without mutating.
   Value *Stored = peelLoadThroughTrivialSelects(SI->getValueOperand(), LI);
   if (auto *Phi = dyn_cast<PHINode>(Stored)) {
@@ -2608,6 +2665,15 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
     }
   } else {
     StorePhi = nullptr;
+  }
+
+  // A merge with zero, or a load that does not already reach the store, both
+  // mean the value was predicated. Reconstituting the load would speculate it.
+  if (RequireUnguarded && (StorePhi || !DT.dominates(LI, SI))) {
+    LLVM_DEBUG(dbgs()
+               << "Widen skipped (staged value is predicated) for IV in "
+               << Header->getName() << '\n');
+    return false;
   }
 
   // Diamond CFG after guard strip: load/gep live in a side block and feed a
@@ -2809,8 +2875,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   return true;
 }
 
-static unsigned widenCooperativeStagingLoops(
-    ArrayRef<BasicBlock *> Blocks) {
+static unsigned widenCooperativeStagingLoops(ArrayRef<BasicBlock *> Blocks,
+                                             bool RequireUnguarded) {
   if (Blocks.empty())
     return 0;
   // Cloned interior blocks are not in the pass's DT yet; build a fresh tree.
@@ -2829,7 +2895,7 @@ static unsigned widenCooperativeStagingLoops(
                              "loops scalar\n");
         return Widened;
       }
-      if (widenOneCooperativeStagingLoop(&PN, DT))
+      if (widenOneCooperativeStagingLoop(&PN, DT, RequireUnguarded))
         ++Widened;
     }
   }
@@ -2950,11 +3016,14 @@ static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
   return Vectorized;
 }
 
-static unsigned optimizeInteriorMemoryPaths(ArrayRef<BasicBlock *> Blocks) {
+/// \p RequireUnguarded must be set whenever \p Blocks are not a region whose
+/// bounds checks this pass already proved away.
+static unsigned optimizeInteriorMemoryPaths(ArrayRef<BasicBlock *> Blocks,
+                                            bool RequireUnguarded) {
   if (!EnableInteriorTileVectorize)
     return 0;
   unsigned Changed = 0;
-  Changed += widenCooperativeStagingLoops(Blocks);
+  Changed += widenCooperativeStagingLoops(Blocks, RequireUnguarded);
   Changed += vectorizeAdjacentFloatChains(Blocks);
   return Changed;
 }
@@ -3035,7 +3104,8 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   SmallVector<BasicBlock *, 8> InteriorBlocks;
   for (BasicBlock *BB : RegionBlocks)
     InteriorBlocks.push_back(cast<BasicBlock>(VMap[BB]));
-  const unsigned MemoryOpts = optimizeInteriorMemoryPaths(InteriorBlocks);
+  const unsigned MemoryOpts =
+      optimizeInteriorMemoryPaths(InteriorBlocks, /*RequireUnguarded=*/false);
 #ifndef NDEBUG
   if (MemoryOpts && verifyFunction(F, &dbgs()))
     report_fatal_error(
@@ -3328,20 +3398,6 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
   return false;
 }
 
-static bool functionHasDirectMNTileGuards(Function &F, UniformityInfo &UI,
-                                          ScalarEvolution &SE, LoopInfo &LI) {
-  for (BasicBlock &BB : F) {
-    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!Branch || !Branch->isConditional())
-      continue;
-    CanonicalTileRemainder Rem;
-    if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE, LI, Rem) ||
-        getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE, LI, Rem))
-      return true;
-  }
-  return false;
-}
-
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
@@ -3351,15 +3407,14 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
   bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT, SE);
 
   // Already-interior kernels (e.g. interior_split_stress_interior) have no
-  // M/N lane guards to strip, so the clone never runs. Still try float4
-  // widen on the whole function when vectorize is enabled — the widen's own
-  // matchers refuse anything that is not a cooperative staging loop.
-  if (EnableInteriorTileVectorize &&
-      !functionHasDirectMNTileGuards(F, UI, SE, LI)) {
+  // M/N lane guards to strip, so the clone never runs. Still try float4 widen
+  // on the whole function when vectorize is enabled; each candidate loop has to
+  // prove for itself that its staging access is unpredicated.
+  if (EnableInteriorTileVectorize) {
     SmallVector<BasicBlock *, 16> Blocks;
     for (BasicBlock &BB : F)
       Blocks.push_back(&BB);
-    if (optimizeInteriorMemoryPaths(Blocks)) {
+    if (optimizeInteriorMemoryPaths(Blocks, /*RequireUnguarded=*/true)) {
       Changed = true;
       LLVM_DEBUG(dbgs() << "Widened already-interior staging in "
                         << F.getName() << " without a prior clone\n");
@@ -3491,7 +3546,7 @@ static bool removeFullTileChecks(Function &F) {
     SmallVector<BasicBlock *, 16> Blocks;
     for (BasicBlock &BB : F)
       Blocks.push_back(&BB);
-    optimizeInteriorMemoryPaths(Blocks);
+    optimizeInteriorMemoryPaths(Blocks, /*RequireUnguarded=*/true);
   }
   return Changed;
 }
