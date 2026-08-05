@@ -11,12 +11,15 @@ declare void @llvm.amdgcn.s.barrier()
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
 
+; -debug-only writes to stderr, so every debug line lands ahead of the -S
+; output. Check them here as one group rather than per function.
+; CHECK-COUNT-3: Widened interior cooperative staging loop
+; CHECK: Cloned nested-loop staging region in coop_staging_float4
+
 ; A batched-GEMM-style outer K loop with a nested cooperative global→LDS
 ; staging loop.  After the interior clone strips the M/N lane guards, the
 ; staging loop must be rewritten to <4 x float> traffic with trip count 1024.
 
-; CHECK: Widened interior cooperative staging loop
-; CHECK: Cloned nested-loop staging region in coop_staging_float4
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4(
 ; SplitBlock may rename the staging entry (e.g. staging1.interior).
 ; CHECK: br i1 %interior.staging.full, label %{{[^,]*}}staging{{[^,]*}}.interior, label %{{[^,]*}}staging{{[^,]*}}
@@ -108,7 +111,6 @@ k.exit:
 ; lk = idx%32 sinks to the invariant tid%32; only lm = idx>>5 uses the IV.
 ; The invariant column is already folded into the staging bases, so re-tiling
 ; has to correct the addresses rather than rewrite the (out-of-loop) rem.
-; CHECK: Widened interior cooperative staging loop
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4_bmm_idx(
 ; CHECK: udiv i32 %{{.*}}, 8
 ; CHECK: interior.col4.delta = sub i32 %{{.*}}, %lk
@@ -193,7 +195,6 @@ k.exit:
 ; The latch form real HIP emits: `idx < N-Step` (3840) instead of
 ; `idx.next < N` (4096). The float4 bound has to stay in that form (768); using
 ; the element limit directly buys an extra trip that stages a row past the tile.
-; CHECK: Widened interior cooperative staging loop
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4_iv_latch(
 ; CHECK: udiv i32 %{{.*}}, 8
 ; CHECK: load <4 x float>, ptr addrspace(1)
