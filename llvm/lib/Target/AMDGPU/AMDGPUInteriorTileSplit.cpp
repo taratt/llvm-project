@@ -2019,6 +2019,78 @@ static unsigned rewriteRowForFloat4(PHINode *IV, unsigned Modulus,
   return Replaced;
 }
 
+/// Node budget for the address-expression walks below. Exceeding it is
+/// reported as "inconclusive" so callers refuse the transform.
+static constexpr unsigned AddressWalkBudget = 256;
+static constexpr unsigned InconclusiveCount = ~0u;
+
+/// Count occurrences of `Target` anywhere in the expression rooted at `V`.
+static unsigned countOccurrencesAnywhere(Value *V, Value *Target) {
+  SmallVector<Value *, 32> Worklist = {V};
+  unsigned Count = 0, Visited = 0;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (Cur == Target) {
+      ++Count;
+      continue;
+    }
+    if (++Visited > AddressWalkBudget)
+      return InconclusiveCount;
+    if (auto *I = dyn_cast<Instruction>(Cur))
+      if (!isa<PHINode>(I) && !I->mayReadOrWriteMemory())
+        for (Value *Op : I->operands())
+          Worklist.push_back(Op);
+  }
+  return Count;
+}
+
+/// Count occurrences of `Target` reachable from `V` through operations that
+/// contribute it to the address with coefficient exactly +1: GEP indices,
+/// add, disjoint-or, and widening casts. Anything else (mul, shl, sub, and)
+/// scales or negates, so it is deliberately not traversed.
+static unsigned countUnitCoefficientOccurrences(Value *V, Value *Target) {
+  SmallVector<Value *, 32> Worklist = {V};
+  unsigned Count = 0, Visited = 0;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (Cur == Target) {
+      ++Count;
+      continue;
+    }
+    if (++Visited > AddressWalkBudget)
+      return InconclusiveCount;
+    auto *I = dyn_cast<Instruction>(Cur);
+    if (!I)
+      continue;
+    switch (I->getOpcode()) {
+    case Instruction::GetElementPtr:
+    case Instruction::Add:
+    case Instruction::Or:
+    case Instruction::SExt:
+    case Instruction::ZExt:
+    case Instruction::Trunc:
+    case Instruction::BitCast:
+    case Instruction::AddrSpaceCast:
+      for (Value *Op : I->operands())
+        Worklist.push_back(Op);
+      break;
+    default:
+      break;
+    }
+  }
+  return Count;
+}
+
+/// The float4 re-tiling replaces the per-thread column by correcting the final
+/// address with `col4 - ColOld`. That cancels only if `ColOld` contributes to
+/// the address exactly once and with coefficient +1.
+static bool columnCancelsInAddress(Value *Ptr, Value *ColOld) {
+  unsigned Total = countOccurrencesAnywhere(Ptr, ColOld);
+  if (Total != 1)
+    return false;
+  return countUnitCoefficientOccurrences(Ptr, ColOld) == 1;
+}
+
 /// Rebase a staging memory op by `Delta` float elements.
 static void offsetMemoryPointer(Instruction *MemI, Value *Delta) {
   IRBuilder<> B(MemI);
@@ -2463,17 +2535,24 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   // four contiguous columns at `(IV % (Modulus/4)) * 4`.
   Rems.clear();
   collectColumnRems(IV, Init, Modulus, Step, Visited, Rems);
+  // Cloning reshaped the CFG, so the cached tree may be stale here.
+  DT.recalculate(*Header->getParent());
   Instruction *ColOld = nullptr;
   for (Instruction *Rem : Rems) {
     if (Rem->getType() != IV->getType())
       continue;
     if (!DT.dominates(Rem, LI) || !DT.dominates(Rem, SI))
       continue;
+    // Both addresses must contain exactly this column, exactly once, with
+    // coefficient +1, or the correction will not cancel.
+    if (!columnCancelsInAddress(LI->getPointerOperand(), Rem) ||
+        !columnCancelsInAddress(SI->getPointerOperand(), Rem))
+      continue;
     ColOld = Rem;
     break;
   }
   if (!Rems.empty() && !ColOld) {
-    LLVM_DEBUG(dbgs() << "Widen skipped (column rem does not dominate staging memory ops) for IV in "
+    LLVM_DEBUG(dbgs() << "Widen skipped (no column rem cancels in both staging addresses) for IV in "
                       << Header->getName() << '\n');
     return false;
   }
