@@ -2364,6 +2364,13 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   if (Step % VectorWidth != 0)
     return false;
   const uint64_t Float4Bound = ElementLimit / VectorWidth;
+  // The replacement constant has to keep the form of the original compare. For
+  // `idx < N-Step` it is Float4Bound-Step; using Float4Bound there would buy an
+  // extra trip that stages a row past the end of the tile.
+  if (CmpIV == IV && Float4Bound < Step)
+    return false;
+  const uint64_t NewCmpLimit =
+      CmpIV == IV ? Float4Bound - Step : Float4Bound;
 
   Value *Init = nullptr;
   for (unsigned I = 0; I != IV->getNumIncomingValues(); ++I)
@@ -2609,8 +2616,8 @@ static bool widenOneCooperativeStagingLoop(PHINode *IV, DominatorTree &DT) {
   const unsigned Inner4 = Modulus / VectorWidth;
   rewriteRowForFloat4(IV, Modulus, Visited, DeadIdx);
 
-  // Shrink the trip count using the true element limit (not N-Step).
-  Constant *NewBound = ConstantInt::get(BoundC->getType(), Float4Bound);
+  // Shrink the trip count, keeping the compare in its original form.
+  Constant *NewBound = ConstantInt::get(BoundC->getType(), NewCmpLimit);
   if (Cmp->getOperand(0) == CmpBound)
     Cmp->setOperand(0, NewBound);
   else
