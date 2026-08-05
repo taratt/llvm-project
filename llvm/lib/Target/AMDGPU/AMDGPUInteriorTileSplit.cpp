@@ -431,13 +431,28 @@ static bool getLoopBoundedShiftedOffsetMaximum(Value *Offset, uint64_t Limit,
                                                 LoopInfo &LI,
                                                 uint64_t &Maximum) {
   auto *Shift = dyn_cast<BinaryOperator>(Offset);
-  if (!Shift || Shift->getOpcode() != Instruction::LShr)
+  if (!Shift)
     return false;
-  auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
-  auto *Phi = dyn_cast<PHINode>(Shift->getOperand(0));
-  if (!Amount || !Phi || Amount->getZExtValue() >= 64)
+  PHINode *Phi = nullptr;
+  uint64_t ShiftAmount = 0;
+  if (Shift->getOpcode() == Instruction::LShr) {
+    auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+    Phi = dyn_cast<PHINode>(Shift->getOperand(0));
+    if (!Amount || !Phi || Amount->getZExtValue() >= 64)
+      return false;
+    ShiftAmount = Amount->getZExtValue();
+  } else if (Shift->getOpcode() == Instruction::UDiv) {
+    // `idx / TileK` is the same row index as `idx >> log2(TileK)` when TileK
+    // is a power of two (gemm_small_k uses TileK=8).
+    auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+    Phi = dyn_cast<PHINode>(Shift->getOperand(0));
+    if (!Amount || !Phi || !Amount->getValue().isPowerOf2() ||
+        Amount->getValue().countr_zero() >= 64)
+      return false;
+    ShiftAmount = Amount->getValue().countr_zero();
+  } else {
     return false;
-  uint64_t ShiftAmount = Amount->getZExtValue();
+  }
   if (Limit > (UINT64_MAX >> ShiftAmount))
     return false;
   uint64_t PreShiftLimit = Limit << ShiftAmount;
@@ -536,7 +551,8 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
                                     LoopInfo &LI,
                                     CanonicalTileRemainder &Remainder) {
   // InstCombine represents a short-circuit conjunction as
-  // `select guard, bound-check, false`.  The tile-bound conjunct remains a
+  // `select guard, bound-check, false`.  Plain `and i1` is equally common
+  // (gemm_small_k / tall_skinny).  The tile-bound conjunct remains a
   // sufficient source for the uniform M/N dispatch proof, but the other
   // conjunct must still be retained in the cloned staging path.
   if (auto *Select = dyn_cast<SelectInst>(V)) {
@@ -546,6 +562,14 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
                                      SE, LI, Remainder) ||
              getDirectTileBoundCheck(Select->getCondition(), Dimension, UI,
                                      SE, LI, Remainder);
+  }
+  if (auto *And = dyn_cast<BinaryOperator>(V)) {
+    if (And->getOpcode() == Instruction::And &&
+        And->getType()->isIntegerTy(1))
+      return getDirectTileBoundCheck(And->getOperand(0), Dimension, UI, SE, LI,
+                                     Remainder) ||
+             getDirectTileBoundCheck(And->getOperand(1), Dimension, UI, SE, LI,
+                                     Remainder);
   }
 
   auto *Cmp = dyn_cast<ICmpInst>(V);
@@ -563,7 +587,16 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
       !Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(Bound))
     return false;
 
-  auto *Add = dyn_cast<BinaryOperator>(Index);
+  // Peel a widening cast on the compared index so
+  // `sext(base + lane) < extent` still matches. Keep Bound as the icmp's
+  // operand so later guard stripping can identity-match the same compare.
+  Value *RawIndex = Index;
+  if (auto *Cast = dyn_cast<CastInst>(Index))
+    if (Cast->getOpcode() == Instruction::SExt ||
+        Cast->getOpcode() == Instruction::ZExt)
+      RawIndex = Cast->getOperand(0);
+
+  auto *Add = dyn_cast<BinaryOperator>(RawIndex);
   if (!Add || (Add->getOpcode() != Instruction::Add &&
                Add->getOpcode() != Instruction::Or))
     return false;
@@ -1033,27 +1066,42 @@ static bool getRemovablePrefixGuardOutcome(
   return getRemovableSafetyBranchOutcome(Branch, FullChecks, SE, Outcome);
 }
 
-/// Return the non-M/N conjunct of `select(lhs, rhs, false)`.  Direct-bound
+/// Return the non-M/N conjunct of a staging safety predicate.  Direct-bound
 /// analysis has already proved every value in DirectGuards is a tile-bound
 /// check covered by the uniform interior dispatch; the remaining conjunct
 /// (normally the K check) must stay in the cloned path.
+///
+/// Accepts both InstCombine spellings of a 2-way conjunction:
+///   select direct, other, false
+///   and i1 direct, other
 static Value *getInteriorConjunctionRemainder(
     Value *V, ArrayRef<Value *> DirectGuards) {
-  auto *Select = dyn_cast<SelectInst>(V);
-  auto *FalseValue = Select ? dyn_cast<ConstantInt>(Select->getFalseValue())
-                            : nullptr;
-  if (!FalseValue || !FalseValue->isZero())
-    return nullptr;
   auto IsDirectGuard = [&](Value *Candidate) {
     for (Value *Guard : DirectGuards)
       if (Candidate == Guard)
         return true;
     return false;
   };
-  if (IsDirectGuard(Select->getCondition()))
-    return Select->getTrueValue();
-  if (IsDirectGuard(Select->getTrueValue()))
-    return Select->getCondition();
+
+  if (auto *Select = dyn_cast<SelectInst>(V)) {
+    auto *FalseValue = dyn_cast<ConstantInt>(Select->getFalseValue());
+    if (!FalseValue || !FalseValue->isZero())
+      return nullptr;
+    if (IsDirectGuard(Select->getCondition()))
+      return Select->getTrueValue();
+    if (IsDirectGuard(Select->getTrueValue()))
+      return Select->getCondition();
+    return nullptr;
+  }
+
+  auto *And = dyn_cast<BinaryOperator>(V);
+  if (!And || And->getOpcode() != Instruction::And ||
+      !And->getType()->isIntegerTy(1))
+    return nullptr;
+  if (IsDirectGuard(And->getOperand(0)))
+    return And->getOperand(1);
+  if (IsDirectGuard(And->getOperand(1)))
+    return And->getOperand(0);
   return nullptr;
 }
 
@@ -3018,12 +3066,17 @@ static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
 
 /// \p RequireUnguarded must be set whenever \p Blocks are not a region whose
 /// bounds checks this pass already proved away.
+/// \p WidenedOut receives the number of cooperative staging loops rewritten
+/// to float4 (as opposed to adjacent-chain vectorization).
 static unsigned optimizeInteriorMemoryPaths(ArrayRef<BasicBlock *> Blocks,
-                                            bool RequireUnguarded) {
+                                            bool RequireUnguarded,
+                                            unsigned *WidenedOut = nullptr) {
   if (!EnableInteriorTileVectorize)
     return 0;
-  unsigned Changed = 0;
-  Changed += widenCooperativeStagingLoops(Blocks, RequireUnguarded);
+  unsigned Widened = widenCooperativeStagingLoops(Blocks, RequireUnguarded);
+  if (WidenedOut)
+    *WidenedOut = Widened;
+  unsigned Changed = Widened;
   Changed += vectorizeAdjacentFloatChains(Blocks);
   return Changed;
 }
@@ -3414,10 +3467,13 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
     SmallVector<BasicBlock *, 16> Blocks;
     for (BasicBlock &BB : F)
       Blocks.push_back(&BB);
-    if (optimizeInteriorMemoryPaths(Blocks, /*RequireUnguarded=*/true)) {
+    unsigned Widened = 0;
+    if (optimizeInteriorMemoryPaths(Blocks, /*RequireUnguarded=*/true,
+                                    &Widened)) {
       Changed = true;
-      LLVM_DEBUG(dbgs() << "Widened already-interior staging in "
-                        << F.getName() << " without a prior clone\n");
+      if (Widened)
+        LLVM_DEBUG(dbgs() << "Widened already-interior staging in "
+                          << F.getName() << " without a prior clone\n");
     }
   }
 

@@ -21,6 +21,8 @@ declare i32 @llvm.smin.i32(i32, i32)
 ; Which path each kernel took. The <4 x float> traffic itself is checked per
 ; function below.
 ; DEBUG-DAG: Cloned nested-loop staging region in coop_staging_float4
+; DEBUG-DAG: Cloned nested-loop staging region in coop_staging_tile_count_k
+; DEBUG-DAG: Cloned nested-loop staging region in coop_staging_and_mk_guard
 ; DEBUG-DAG: Widened already-interior staging in already_interior_staging
 ; DEBUG-DAG: Widen skipped (staging access is predicated)
 
@@ -406,6 +408,109 @@ k.barrier:
 k.latch:
   %t.next = add nuw i32 %t, 1
   %more = icmp ult i32 %t.next, %k.tile.max
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  ret void
+}
+
+; gemm_small_k spelling: one branch on `and (gm < M), (gk < K)`, with M on
+; workgroup.x. The M conjunct must still seed the CTA-uniform dispatch; the K
+; conjunct stays in the cloned path.
+; CHECK-LABEL: define amdgpu_kernel void @coop_staging_and_mk_guard(
+; CHECK: br i1 %interior.staging.full
+; CHECK: load <4 x float>, ptr addrspace(1)
+; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
+define amdgpu_kernel void @coop_staging_and_mk_guard(ptr addrspace(1) %a,
+                                                     ptr addrspace(1) %b,
+                                                     ptr addrspace(3) %lds.a,
+                                                     ptr addrspace(3) %lds.b,
+                                                     i32 %m, i32 %n, i32 %k) {
+entry:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %m.base = mul i32 %workgroup.x, 128
+  %n.base = mul i32 %workgroup.y, 128
+  %k.tile.max = add i32 %k, 7
+  %k.tile.max.s = lshr i32 %k.tile.max, 3
+  br label %k.header
+
+k.header:
+  %t = phi i32 [ 0, %entry ], [ %t.next, %k.latch ]
+  %k0 = mul i32 %t, 8
+  br label %stage.a
+
+stage.a:
+  %idx.a = phi i32 [ %tid, %k.header ], [ %idx.a.next, %stage.a.latch ]
+  %lm = udiv i32 %idx.a, 8
+  %lk.a = urem i32 %idx.a, 8
+  %gm = add i32 %m.base, %lm
+  %gk.a = add i32 %k0, %lk.a
+  %m.ok = icmp slt i32 %gm, %m
+  %k.ok.a = icmp slt i32 %gk.a, %k
+  %a.in.bounds = and i1 %m.ok, %k.ok.a
+  br i1 %a.in.bounds, label %stage.a.load, label %stage.a.merge
+
+stage.a.load:
+  %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %gm
+  %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk.a
+  %a.val = load float, ptr addrspace(1) %a.ptr.k, align 4
+  br label %stage.a.merge
+
+stage.a.merge:
+  %a.staged = phi float [ %a.val, %stage.a.load ], [ 0.000000e+00, %stage.a ]
+  %lds.a.row = mul i32 %lm, 8
+  %lds.a.off = add i32 %lds.a.row, %lk.a
+  %lds.a.ptr = getelementptr float, ptr addrspace(3) %lds.a, i32 %lds.a.off
+  store float %a.staged, ptr addrspace(3) %lds.a.ptr, align 4
+  br label %stage.a.latch
+
+stage.a.latch:
+  %idx.a.next = add nuw i32 %idx.a, 256
+  %a.more = icmp ult i32 %idx.a.next, 1024
+  br i1 %a.more, label %stage.a, label %stage.b.pre
+
+stage.b.pre:
+  br label %stage.b
+
+stage.b:
+  %idx.b = phi i32 [ %tid, %stage.b.pre ], [ %idx.b.next, %stage.b.latch ]
+  %ln = udiv i32 %idx.b, 8
+  %lk.b = urem i32 %idx.b, 8
+  %gn = add i32 %n.base, %ln
+  %gk.b = add i32 %k0, %lk.b
+  %n.ok = icmp slt i32 %gn, %n
+  %k.ok.b = icmp slt i32 %gk.b, %k
+  %b.in.bounds = and i1 %n.ok, %k.ok.b
+  br i1 %b.in.bounds, label %stage.b.load, label %stage.b.merge
+
+stage.b.load:
+  %b.ptr = getelementptr float, ptr addrspace(1) %b, i32 %gk.b
+  %b.ptr.n = getelementptr float, ptr addrspace(1) %b.ptr, i32 %gn
+  %b.val = load float, ptr addrspace(1) %b.ptr.n, align 4
+  br label %stage.b.merge
+
+stage.b.merge:
+  %b.staged = phi float [ %b.val, %stage.b.load ], [ 0.000000e+00, %stage.b ]
+  %lds.b.row = mul i32 %ln, 8
+  %lds.b.off = add i32 %lds.b.row, %lk.b
+  %lds.b.ptr = getelementptr float, ptr addrspace(3) %lds.b, i32 %lds.b.off
+  store float %b.staged, ptr addrspace(3) %lds.b.ptr, align 4
+  br label %stage.b.latch
+
+stage.b.latch:
+  %idx.b.next = add nuw i32 %idx.b, 256
+  %b.more = icmp ult i32 %idx.b.next, 1024
+  br i1 %b.more, label %stage.b, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %t.next = add nuw i32 %t, 1
+  %more = icmp ult i32 %t.next, %k.tile.max.s
   br i1 %more, label %k.header, label %k.exit
 
 k.exit:
