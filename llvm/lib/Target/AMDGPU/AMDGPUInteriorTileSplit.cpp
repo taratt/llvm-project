@@ -143,6 +143,53 @@ static Value *getWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
   if (auto *Cast = dyn_cast<CastInst>(V))
     if (isWorkgroupShiftBy7(Cast->getOperand(0), Dimension))
       return V;
+  // Host launches sometimes bias the workgroup id. Accept:
+  //   (wg.id + offset) << 7
+  //   (wg.id << 7) + offset
+  //   (wg.id + offset) * 128
+  // The biased base is still CTA-uniform (interior_split_stress edge kernel).
+  Value *Raw = V;
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    Raw = Cast->getOperand(0);
+  if (auto *BO = dyn_cast<BinaryOperator>(Raw)) {
+    if (BO->getOpcode() == Instruction::Shl) {
+      auto *Amount = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (Amount && Amount->equalsInt(7)) {
+        if (auto *Add = dyn_cast<BinaryOperator>(BO->getOperand(0)))
+          if (Add->getOpcode() == Instruction::Add &&
+              (isWorkgroupID(Add->getOperand(0), Dimension) ||
+               isWorkgroupID(Add->getOperand(1), Dimension)))
+            return V;
+      }
+    }
+    if (BO->getOpcode() == Instruction::Add) {
+      if (isWorkgroupShiftBy7(BO->getOperand(0), Dimension) ||
+          isWorkgroupShiftBy7(BO->getOperand(1), Dimension))
+        return V;
+    }
+    if (BO->getOpcode() == Instruction::Mul) {
+      Value *Other = nullptr;
+      Value *Addend = nullptr;
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        if (C->equalsInt(128)) {
+          Other = BO->getOperand(0);
+        }
+      } else if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
+        if (C->equalsInt(128))
+          Other = BO->getOperand(1);
+      }
+      if (Other) {
+        if (isWorkgroupID(Other, Dimension))
+          return V;
+        if (auto *Add = dyn_cast<BinaryOperator>(Other))
+          if (Add->getOpcode() == Instruction::Add &&
+              (isWorkgroupID(Add->getOperand(0), Dimension) ||
+               isWorkgroupID(Add->getOperand(1), Dimension)))
+            return V;
+        (void)Addend;
+      }
+    }
+  }
   return nullptr;
 }
 
@@ -1731,11 +1778,59 @@ static bool canCloneStagingRegion(
   return HasRemovableSafetyBranch;
 }
 
-/// Return the induction and bound for the only outer K loop this POC accepts.
-/// The no-wrap, zero-origin recurrence is what makes the per-iteration signed
-/// `IV <= K - 32` selector equivalent to a full 32-wide K tile.
-static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE, PHINode *&IV,
-                                   Value *&Bound) {
+/// Supported K-tile widths. BMM uses 32; gemm_small_k / tall_skinny use 8.
+static bool isSupportedTileK(uint64_t TileK) {
+  return TileK == 8 || TileK == 16 || TileK == 32 || TileK == 64 ||
+         TileK == 128;
+}
+
+enum class OuterKForm : unsigned {
+  /// `for (k0 = 0; k0 < K; k0 += TileK)` — IV is the K offset.
+  OffsetStep = 0,
+  /// `for (t = 0; t < ceil(K/TileK); ++t)` — IV is the tile index; k0 = t*TileK.
+  TileCount = 1,
+};
+
+struct OuterKLoopInfo {
+  PHINode *IV = nullptr;
+  Value *Bound = nullptr;
+  uint64_t TileK = 0;
+  OuterKForm Form = OuterKForm::OffsetStep;
+};
+
+/// Recover TileK from `IV * C` / `IV << log2(C)` uses inside the loop body.
+static uint64_t inferTileKFromIndexUses(PHINode *IV) {
+  for (User *U : IV->users()) {
+    auto *BO = dyn_cast<BinaryOperator>(U);
+    if (!BO)
+      continue;
+    if (BO->getOpcode() == Instruction::Mul) {
+      Value *Other = BO->getOperand(0) == IV ? BO->getOperand(1)
+                                             : BO->getOperand(0);
+      if (auto *C = dyn_cast<ConstantInt>(Other))
+        if (isSupportedTileK(C->getZExtValue()))
+          return C->getZExtValue();
+    }
+    if (BO->getOpcode() == Instruction::Shl && BO->getOperand(0) == IV)
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        uint64_t Shift = C->getZExtValue();
+        if (Shift >= 3 && Shift <= 7) {
+          uint64_t TileK = 1ull << Shift;
+          if (isSupportedTileK(TileK))
+            return TileK;
+        }
+      }
+  }
+  return 0;
+}
+
+/// Return the induction, bound, and tile width for an accepted outer K loop.
+/// Two forms are recognized:
+///   OffsetStep: `k0 += TileK`, Bound is K; full-tile when `k0 <= K - TileK`
+///   TileCount:  `t += 1`, Bound is ceil(K/TileK); full-tile when `t+1 < Bound`
+///               (skips the possibly-partial last tile — always safe).
+static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
+                                   OuterKLoopInfo &Info) {
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Exiting = L->getExitingBlock();
   if (!L->isLoopSimplifyForm() || !Preheader || !Exiting ||
@@ -1763,7 +1858,7 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE, PHINode *&IV,
     return false;
 
   Value *IVNext = ExitCmp->getOperand(0);
-  Bound = ExitCmp->getOperand(1);
+  Value *Bound = ExitCmp->getOperand(1);
   const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNext));
   if (!AR) {
     std::swap(IVNext, Bound);
@@ -1771,23 +1866,38 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE, PHINode *&IV,
   }
   auto *Step = AR ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
                   : nullptr;
-  if (!Step || Step->getAPInt().getZExtValue() != 32 ||
-      AR->getLoop() != L || !L->isLoopInvariant(Bound) ||
+  if (!Step || AR->getLoop() != L || !L->isLoopInvariant(Bound) ||
       !SE.isAvailableAtLoopEntry(SE.getSCEV(Bound), L) ||
       !Bound->getType()->isIntegerTy())
     return false;
+  const uint64_t StepVal = Step->getAPInt().getZExtValue();
 
-  IV = nullptr;
+  PHINode *IV = nullptr;
   for (PHINode &PN : L->getHeader()->phis()) {
     if (PN.getIncomingValueForBlock(Exiting) != IVNext)
       continue;
-    auto *Initial = dyn_cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader));
+    auto *Initial =
+        dyn_cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader));
     if (!Initial || !Initial->isZero())
       return false;
     auto *Inc = dyn_cast<BinaryOperator>(IVNext);
-    if (!Inc || Inc->getOpcode() != Instruction::Add || !Inc->hasNoUnsignedWrap())
+    if (!Inc || Inc->getOpcode() != Instruction::Add)
       return false;
     IV = &PN;
+    break;
+  }
+  if (!IV)
+    return false;
+
+  if (isSupportedTileK(StepVal)) {
+    Info = {IV, Bound, StepVal, OuterKForm::OffsetStep};
+    return true;
+  }
+  if (StepVal == 1) {
+    uint64_t TileK = inferTileKFromIndexUses(IV);
+    if (!TileK)
+      return false;
+    Info = {IV, Bound, TileK, OuterKForm::TileCount};
     return true;
   }
   return false;
@@ -2954,15 +3064,17 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
                                LoopInfo &LI, DominatorTree &DT,
                                ScalarEvolution &SE) {
   BasicBlock *Preheader = L->getLoopPreheader();
-  PHINode *IV;
-  Value *Bound;
-  if (!getCanonicalOuterKLoop(L, SE, IV, Bound) || !Preheader) {
+  OuterKLoopInfo KInfo;
+  if (!getCanonicalOuterKLoop(L, SE, KInfo) || !Preheader) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << (L->getHeader() ? L->getHeader()->getName()
                                          : "<no-header>")
                       << ": not a canonical outer K loop\n");
     return false;
   }
+  PHINode *IV = KInfo.IV;
+  Value *Bound = KInfo.Bound;
+  const uint64_t TileK = KInfo.TileK;
 
   CanonicalTileRemainder M, N;
   SmallVector<Value *, 4> Alignments;
@@ -2970,8 +3082,8 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   bool HasDirectM = false, HasDirectN = false;
   bool HasCanonicalSetup =
       collectInteriorTileSetup(Preheader, UI, M, N, Alignments, HasM, HasN);
+  // Direct lane bounds are enough on their own (no preheader clamps needed).
   bool HasDirectSetup =
-      HasCanonicalSetup &&
       collectDirectInteriorTileBounds(L, UI, SE, LI, M, N, HasM, HasN,
                                       HasDirectM, HasDirectN);
   LLVM_DEBUG(dbgs() << "Interior staging setup for "
@@ -2980,18 +3092,31 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
                     << " M=" << HasM << " N=" << HasN
                     << " direct-M=" << HasDirectM
                     << " direct-N=" << HasDirectN
-                    << " alignments=" << Alignments.size() << '\n');
-  if (!HasCanonicalSetup || !HasDirectSetup ||
-      !HasM || !HasN ||
-      (Alignments.empty() && !(HasDirectM && HasDirectN))) {
+                    << " alignments=" << Alignments.size()
+                    << " tileK=" << TileK
+                    << " k-form="
+                    << (KInfo.Form == OuterKForm::TileCount ? "tile-count"
+                                                            : "offset-step")
+                    << '\n');
+  // Accept either clamped extents or direct lane M/N proofs. Alignments are
+  // optional when both direct M and N are present.
+  if ((!HasM || !HasN) ||
+      (Alignments.empty() && !(HasDirectM && HasDirectN) &&
+       !(HasCanonicalSetup && HasM && HasN))) {
     LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << L->getHeader()->getName()
                       << ": missing or ambiguous M/N tile/alignment setup\n");
     return false;
   }
+  if (!HasDirectSetup) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
+                      << L->getHeader()->getName()
+                      << ": conflicting direct M/N tile bounds\n");
+    return false;
+  }
   SmallVector<FullTileBoundCheck, 2> FullChecks{
-      {1, M.Bound, M.Base, /*IsSigned=*/true},
-      {0, N.Bound, N.Base, /*IsSigned=*/true}};
+      {M.Dimension, M.Bound, M.Base, /*IsSigned=*/true},
+      {N.Dimension, N.Bound, N.Base, /*IsSigned=*/true}};
   SmallVector<Value *, 2> DirectGuards{M.Difference, N.Difference};
 
   // First prove the old CFG, before changing it.  The candidate must end at a
@@ -3083,14 +3208,26 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   // The new block is inside the outer loop, so this full-K predicate is
   // evaluated once per iteration rather than only at loop entry.
   IRBuilder<> Builder(DispatchBranch);
-  Value *KAtLeastTile = Builder.CreateICmpSGE(
-      Bound, ConstantInt::get(Bound->getType(), 32), "interior.k.nonnegative");
-  Value *KFull = Builder.CreateICmpSLE(
-      IV, Builder.CreateSub(Bound, ConstantInt::get(Bound->getType(), 32)),
-      "interior.k.tile");
-  Value *RunFast = Builder.CreateAnd(
-      MNFull, Builder.CreateAnd(KAtLeastTile, KFull, "interior.k.full"),
-      "interior.staging.full");
+  Value *KFull = nullptr;
+  if (KInfo.Form == OuterKForm::OffsetStep) {
+    // IV is k0; a full tile needs k0 + TileK <= Bound.
+    Value *KAtLeastTile = Builder.CreateICmpSGE(
+        Bound, ConstantInt::get(Bound->getType(), TileK),
+        "interior.k.nonnegative");
+    KFull = Builder.CreateICmpSLE(
+        IV,
+        Builder.CreateSub(Bound, ConstantInt::get(Bound->getType(), TileK)),
+        "interior.k.tile");
+    KFull = Builder.CreateAnd(KAtLeastTile, KFull, "interior.k.full");
+  } else {
+    // IV is the tile index; skip the last (possibly partial) tile.
+    KFull = Builder.CreateICmpULT(
+        Builder.CreateAdd(IV, ConstantInt::get(IV->getType(), 1),
+                          "interior.k.next", /*HasNUW=*/true),
+        Bound, "interior.k.full");
+  }
+  Value *RunFast =
+      Builder.CreateAnd(MNFull, KFull, "interior.staging.full");
   // cloneStagingRegion replaces the first edge to StagingEntry with the clone,
   // yielding `RunFast ? staging.interior : staging`.
   BranchInst::Create(StagingEntry, StagingEntry, RunFast, DispatchBranch);
@@ -3191,13 +3328,43 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
   return false;
 }
 
+static bool functionHasDirectMNTileGuards(Function &F, UniformityInfo &UI,
+                                          ScalarEvolution &SE, LoopInfo &LI) {
+  for (BasicBlock &BB : F) {
+    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
+    CanonicalTileRemainder Rem;
+    if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE, LI, Rem) ||
+        getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE, LI, Rem))
+      return true;
+  }
+  return false;
+}
+
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
   if (!AMDGPU::isEntryFunctionCC(F.getCallingConv()))
     return false;
 
-  const bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT, SE);
+  bool Changed = splitCanonicalInteriorTile(F, UI, LI, DT, SE);
+
+  // Already-interior kernels (e.g. interior_split_stress_interior) have no
+  // M/N lane guards to strip, so the clone never runs. Still try float4
+  // widen on the whole function when vectorize is enabled — the widen's own
+  // matchers refuse anything that is not a cooperative staging loop.
+  if (EnableInteriorTileVectorize &&
+      !functionHasDirectMNTileGuards(F, UI, SE, LI)) {
+    SmallVector<BasicBlock *, 16> Blocks;
+    for (BasicBlock &BB : F)
+      Blocks.push_back(&BB);
+    if (optimizeInteriorMemoryPaths(Blocks)) {
+      Changed = true;
+      LLVM_DEBUG(dbgs() << "Widened already-interior staging in "
+                        << F.getName() << " without a prior clone\n");
+    }
+  }
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());

@@ -13,7 +13,7 @@ declare i32 @llvm.smin.i32(i32, i32)
 
 ; -debug-only writes to stderr, so every debug line lands ahead of the -S
 ; output. Check them here as one group rather than per function.
-; CHECK-COUNT-3: Widened interior cooperative staging loop
+; CHECK-COUNT-5: Widened interior cooperative staging loop
 ; CHECK: Cloned nested-loop staging region in coop_staging_float4
 
 ; A batched-GEMM-style outer K loop with a nested cooperative global→LDS
@@ -334,5 +334,116 @@ edge:
   br label %exit
 
 exit:
+  ret void
+}
+
+; Tile-count outer K loop: `for (t = 0; t < ceil(K/8); ++t)` with k0 = t*8
+; (gemm_small_k / tall_skinny). Must still clone + widen.
+; CHECK-LABEL: define amdgpu_kernel void @coop_staging_tile_count_k(
+; CHECK: load <4 x float>, ptr addrspace(1)
+; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
+define amdgpu_kernel void @coop_staging_tile_count_k(ptr addrspace(1) %a,
+                                                     ptr addrspace(3) %lds,
+                                                     i32 %m, i32 %n, i32 %k) {
+entry:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  ; Swapped grid vs BMM: M on blockIdx.x, N on blockIdx.y (gemm_small_k).
+  %m.base = shl i32 %workgroup.x, 7
+  %n.base = shl i32 %workgroup.y, 7
+  %lk = and i32 %tid, 7
+  %k.tile.max = lshr i32 %k, 3
+  br label %k.header
+
+k.header:
+  %t = phi i32 [ 0, %entry ], [ %t.next, %k.latch ]
+  %k0 = mul i32 %t, 8
+  br label %staging
+
+staging:
+  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
+  %lm = lshr i32 %idx, 3
+  %gm = add i32 %m.base, %lm
+  %gn = add i32 %n.base, %lk
+  %m.in.bounds = icmp slt i32 %gm, %m
+  br i1 %m.in.bounds, label %stage.n.check, label %stage.latch
+
+stage.n.check:
+  %n.in.bounds = icmp slt i32 %gn, %n
+  br i1 %n.in.bounds, label %stage.load, label %stage.latch
+
+stage.load:
+  %gk = add i32 %k0, %lk
+  %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %gm
+  %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk
+  %val = load float, ptr addrspace(1) %a.ptr.k, align 4
+  br label %stage.latch
+
+stage.latch:
+  %merged = phi float [ %val, %stage.load ], [ 0.000000e+00, %stage.n.check ],
+                      [ 0.000000e+00, %staging ]
+  %lds.row = mul i32 %lm, 8
+  %lds.off = add i32 %lds.row, %lk
+  %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
+  store float %merged, ptr addrspace(3) %lds.ptr, align 4
+  %idx.next = add nuw i32 %idx, 256
+  %stage.more = icmp ult i32 %idx.next, 1024
+  br i1 %stage.more, label %staging, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %t.next = add nuw i32 %t, 1
+  %more = icmp ult i32 %t.next, %k.tile.max
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
+  ret void
+}
+
+; Already-interior kernel: no M/N lane guards. Widen must run without a clone.
+; CHECK-LABEL: define amdgpu_kernel void @already_interior_staging(
+; CHECK: load <4 x float>, ptr addrspace(1)
+; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
+define amdgpu_kernel void @already_interior_staging(ptr addrspace(1) %a,
+                                                    ptr addrspace(3) %lds,
+                                                    i32 %k) {
+entry:
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %lk = and i32 %tid, 31
+  br label %k.header
+
+k.header:
+  %i = phi i32 [ 0, %entry ], [ %next, %k.latch ]
+  br label %staging
+
+staging:
+  %idx = phi i32 [ %tid, %k.header ], [ %idx.next, %stage.latch ]
+  %lm = lshr i32 %idx, 5
+  %gk = add i32 %i, %lk
+  %a.ptr = getelementptr float, ptr addrspace(1) %a, i32 %lm
+  %a.ptr.k = getelementptr float, ptr addrspace(1) %a.ptr, i32 %gk
+  %val = load float, ptr addrspace(1) %a.ptr.k, align 4
+  %lds.row = mul i32 %lm, 32
+  %lds.off = add i32 %lds.row, %lk
+  %lds.ptr = getelementptr float, ptr addrspace(3) %lds, i32 %lds.off
+  store float %val, ptr addrspace(3) %lds.ptr, align 4
+  %idx.next = add nuw i32 %idx, 256
+  %stage.more = icmp ult i32 %idx.next, 4096
+  br i1 %stage.more, label %staging, label %k.barrier
+
+k.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %k.latch
+
+k.latch:
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, %k
+  br i1 %more, label %k.header, label %k.exit
+
+k.exit:
   ret void
 }
