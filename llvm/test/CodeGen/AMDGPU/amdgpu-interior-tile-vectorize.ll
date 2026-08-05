@@ -517,6 +517,35 @@ k.exit:
   ret void
 }
 
+; Not a GEMM: mixed-address-space float traffic and stored values defined
+; between the stores. Merging adjacent accesses across a whole arbitrary
+; function used to assert in the compiler here, once on the differing pointer
+; index widths and once on an insertelement chain built before its operands.
+; CHECK-LABEL: define amdgpu_kernel void @mixed_addrspace_no_crash(
+; CHECK-NOT: store <4 x float>
+define amdgpu_kernel void @mixed_addrspace_no_crash(ptr addrspace(1) %g,
+                                                    ptr addrspace(3) %l,
+                                                    float %x) {
+entry:
+  %g0 = getelementptr float, ptr addrspace(1) %g, i32 0
+  %g1 = getelementptr float, ptr addrspace(1) %g, i32 1
+  %l0 = getelementptr float, ptr addrspace(3) %l, i32 0
+  %l1 = getelementptr float, ptr addrspace(3) %l, i32 1
+  %a = load float, ptr addrspace(1) %g0, align 4
+  %b = load float, ptr addrspace(3) %l0, align 4
+  %c = load float, ptr addrspace(1) %g1, align 4
+  %d = load float, ptr addrspace(3) %l1, align 4
+  %s0 = fadd float %a, %x
+  store float %s0, ptr addrspace(1) %g0, align 4
+  %s1 = fadd float %b, %s0
+  store float %s1, ptr addrspace(1) %g1, align 4
+  %s2 = fadd float %c, %s1
+  store float %s2, ptr addrspace(3) %l0, align 4
+  %s3 = fadd float %d, %s2
+  store float %s3, ptr addrspace(3) %l1, align 4
+  ret void
+}
+
 ; Already-interior kernel: no M/N lane guards. Widen must run without a clone.
 ; CHECK-LABEL: define amdgpu_kernel void @already_interior_staging(
 ; CHECK: load <4 x float>, ptr addrspace(1)

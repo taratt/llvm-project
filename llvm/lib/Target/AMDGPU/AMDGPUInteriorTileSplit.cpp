@@ -2953,6 +2953,10 @@ static unsigned widenCooperativeStagingLoops(ArrayRef<BasicBlock *> Blocks,
 static std::optional<int64_t> constantByteOffsetBetween(Value *PtrA, Value *PtrB,
                                                         const DataLayout &DL) {
   unsigned AS = cast<PointerType>(PtrA->getType())->getAddressSpace();
+  // Index width is per address space on AMDGPU (64-bit global, 32-bit LDS), so
+  // two pointers are only comparable when they share one.
+  if (cast<PointerType>(PtrB->getType())->getAddressSpace() != AS)
+    return std::nullopt;
   unsigned IndexWidth = DL.getIndexSizeInBits(AS);
   APInt OffA(IndexWidth, 0), OffB(IndexWidth, 0);
   Value *BaseA = PtrA->stripAndAccumulateConstantOffsets(DL, OffA,
@@ -3020,17 +3024,15 @@ static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
             if (Chain.size() != VectorWidth)
               continue;
 
-            IRBuilder<> B(Chain.front());
             Type *VecTy = getFloat4Ty(BB->getContext());
-            Value *BasePtr =
-                IsLoad ? cast<LoadInst>(Chain.front())->getPointerOperand()
-                       : cast<StoreInst>(Chain.front())->getPointerOperand();
-            Align A = Align(16);
             if (IsLoad) {
-              for (Instruction *C : Chain)
-                A = std::max(A, cast<LoadInst>(C)->getAlign());
-              LoadInst *NewLI = B.CreateAlignedLoad(VecTy, BasePtr, A,
-                                                    "interior.f32x4");
+              IRBuilder<> B(Chain.front());
+              auto *First = cast<LoadInst>(Chain.front());
+              // The merged access starts at the first element's address, so it
+              // is only as aligned as that pointer was already known to be.
+              LoadInst *NewLI =
+                  B.CreateAlignedLoad(VecTy, First->getPointerOperand(),
+                                      First->getAlign(), "interior.f32x4");
               for (unsigned K = 0; K != VectorWidth; ++K) {
                 Value *Ext = B.CreateExtractElement(NewLI, B.getInt32(K));
                 Chain[K]->replaceAllUsesWith(Ext);
@@ -3039,8 +3041,10 @@ static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
               for (Instruction *C : Chain)
                 cast<LoadInst>(C)->eraseFromParent();
             } else {
-              for (Instruction *C : Chain)
-                A = std::max(A, cast<StoreInst>(C)->getAlign());
+              // Build the vector at the last store: the values stored by the
+              // later chain members are not defined yet at the first one.
+              IRBuilder<> B(Chain.back());
+              auto *First = cast<StoreInst>(Chain.front());
               Value *Vec = PoisonValue::get(VecTy);
               for (unsigned K = 0; K != VectorWidth; ++K) {
                 Vec = B.CreateInsertElement(
@@ -3048,8 +3052,8 @@ static unsigned vectorizeAdjacentFloatChains(ArrayRef<BasicBlock *> Blocks) {
                     B.getInt32(K));
                 Used.insert(Chain[K]);
               }
-              B.SetInsertPoint(Chain.back());
-              B.CreateAlignedStore(Vec, BasePtr, A);
+              B.CreateAlignedStore(Vec, First->getPointerOperand(),
+                                   First->getAlign());
               for (Instruction *C : llvm::reverse(Chain))
                 cast<StoreInst>(C)->eraseFromParent();
             }
@@ -3077,7 +3081,11 @@ static unsigned optimizeInteriorMemoryPaths(ArrayRef<BasicBlock *> Blocks,
   if (WidenedOut)
     *WidenedOut = Widened;
   unsigned Changed = Widened;
-  Changed += vectorizeAdjacentFloatChains(Blocks);
+  // Merging adjacent scalar accesses is only in scope for a region this pass
+  // proved interior. Run over a whole arbitrary function it just duplicates
+  // the generic load/store vectorizer on kernels that are not GEMMs at all.
+  if (!RequireUnguarded)
+    Changed += vectorizeAdjacentFloatChains(Blocks);
   return Changed;
 }
 
@@ -3474,6 +3482,11 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
       if (Widened)
         LLVM_DEBUG(dbgs() << "Widened already-interior staging in "
                           << F.getName() << " without a prior clone\n");
+#ifndef NDEBUG
+      if (verifyFunction(F, &dbgs()))
+        report_fatal_error(
+            "AMDGPUInteriorTileSplit: no-clone widen produced invalid IR");
+#endif
     }
   }
 
@@ -3603,6 +3616,11 @@ static bool removeFullTileChecks(Function &F) {
     for (BasicBlock &BB : F)
       Blocks.push_back(&BB);
     optimizeInteriorMemoryPaths(Blocks, /*RequireUnguarded=*/true);
+#ifndef NDEBUG
+    if (verifyFunction(F, &dbgs()))
+      report_fatal_error(
+          "AMDGPUInteriorTileSplit: full-tile check removal produced invalid IR");
+#endif
   }
   return Changed;
 }
