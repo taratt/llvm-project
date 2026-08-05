@@ -82,6 +82,12 @@ static cl::opt<bool> EnableInteriorTileVectorize(
     cl::desc("Rewrite proven-interior GEMM staging to <4 x float> loads/stores"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<int> InteriorVectorizeLimit(
+    "amdgpu-interior-tile-vectorize-limit",
+    cl::desc("Widen at most N staging loops per region (-1 = no limit). For "
+             "bisecting which staging loop a bad widen came from"),
+    cl::init(-1), cl::Hidden);
+
 enum IDDependency : unsigned {
   DependsOnNone = 0,
   DependsOnWorkgroupID = 1u << 0,
@@ -2700,6 +2706,12 @@ static unsigned widenCooperativeStagingLoops(
         continue;
       if (!PN.getType()->isIntegerTy())
         continue;
+      if (InteriorVectorizeLimit >= 0 &&
+          Widened >= static_cast<unsigned>(InteriorVectorizeLimit)) {
+        LLVM_DEBUG(dbgs() << "Widen limit reached; leaving remaining staging "
+                             "loops scalar\n");
+        return Widened;
+      }
       if (widenOneCooperativeStagingLoop(&PN, DT))
         ++Widened;
     }
