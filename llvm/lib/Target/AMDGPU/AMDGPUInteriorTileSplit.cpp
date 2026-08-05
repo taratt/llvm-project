@@ -3328,13 +3328,24 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
   BasicBlock *SharedBarrier = nullptr;
+  // Re-derive the region on the just-split CFG. The preflight above proved it
+  // on the original blocks, but SplitBlock/SplitEdge can perturb the shape
+  // enough that it no longer reproduces (e.g. header-split GEMMs). Both splits
+  // are semantics-preserving, so if the region no longer matches we decline the
+  // transform instead of aborting the compiler. The split blocks stay behind,
+  // so we must still report the function as changed for analysis invalidation;
+  // later CFG simplification folds the now-empty dispatch away.
   if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier,
                                /*AllowNestedLoops=*/true) ||
       SharedBarrier != Barrier ||
       !hasOnlySharedBarrierExits(L, Region, SharedBarrier) ||
       !canCloneStagingRegion(StagingEntry, Region, SharedBarrier, FullChecks,
-                             DirectGuards, Alignments, IV, Bound, SE))
-    llvm_unreachable("preflighted staging CFG changed unexpectedly");
+                             DirectGuards, Alignments, IV, Bound, SE)) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight abandoned at "
+                      << L->getHeader()->getName()
+                      << ": region did not reproduce after CFG split\n");
+    return true;
+  }
 
   // The new block is inside the outer loop, so this full-K predicate is
   // evaluated once per iteration rather than only at loop entry.
