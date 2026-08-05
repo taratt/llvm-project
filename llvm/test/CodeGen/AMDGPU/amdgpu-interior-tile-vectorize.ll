@@ -20,7 +20,12 @@ declare i32 @llvm.smin.i32(i32, i32)
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4(
 ; SplitBlock may rename the staging entry (e.g. staging1.interior).
 ; CHECK: br i1 %interior.staging.full, label %{{[^,]*}}staging{{[^,]*}}.interior, label %{{[^,]*}}staging{{[^,]*}}
+; The row advances 4x (idx/8 instead of idx/32) and each thread's single column
+; is replaced by four contiguous ones via an address correction.
+; CHECK: udiv i32 %{{.*}}, 8
 ; CHECK-LABEL: stage.load.interior:
+; CHECK: urem i32 %{{.*}}, 8
+; CHECK: interior.col4.delta = sub i32
 ; CHECK: load <4 x float>, ptr addrspace(1)
 ; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
 ; CHECK: icmp ult i32 %{{.*}}, 1024
@@ -101,10 +106,15 @@ k.exit:
 
 ; Real HIP BMM after InstCombine: step 256 is a multiple of 32, so
 ; lk = idx%32 sinks to the invariant tid%32; only lm = idx>>5 uses the IV.
+; The invariant column is already folded into the staging bases, so re-tiling
+; has to correct the addresses rather than rewrite the (out-of-loop) rem.
 ; CHECK: Widened interior cooperative staging loop
 ; CHECK-LABEL: define amdgpu_kernel void @coop_staging_float4_bmm_idx(
+; CHECK: udiv i32 %{{.*}}, 8
+; CHECK: interior.col4.delta = sub i32 %{{.*}}, %lk
 ; CHECK: load <4 x float>, ptr addrspace(1)
 ; CHECK: store <4 x float> {{.*}}, ptr addrspace(3)
+; CHECK: icmp ult i32 %{{.*}}, 1024
 define amdgpu_kernel void @coop_staging_float4_bmm_idx(ptr addrspace(1) %a,
                                                        ptr addrspace(3) %lds,
                                                        i32 %m, i32 %n, i32 %k) {
