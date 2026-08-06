@@ -10,6 +10,8 @@
 /// Clones a deliberately narrow GEMM staging shape behind a workgroup-uniform
 /// interior dispatch, then rewrites proven-interior global→LDS staging into
 /// unguarded <4 x float> traffic (and merges adjacent scalar float chains).
+/// The same machinery specializes conv halo footprints: CTA-uniform
+/// Base(+Extent)<=Bound selectors strip per-element H/W staging guards.
 /// The proof rejects shapes which could accidentally clone an outer loop or a
 /// barrier.
 ///
@@ -74,6 +76,12 @@ static cl::opt<unsigned> MaxStagingCloneBlocks(
     "amdgpu-interior-tile-max-staging-blocks",
     cl::desc("Max blocks allowed when cloning an interior staging region"),
     cl::init(96), cl::Hidden);
+
+static cl::opt<unsigned> MinConvFootprintStrippedBranches(
+    "amdgpu-interior-conv-min-stripped-branches",
+    cl::desc("Minimum removable bounds branches required before cloning a "
+             "conv footprint interior staging region"),
+    cl::init(2), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
@@ -353,12 +361,8 @@ static bool getAffineLaneMaximum(Value *V, uint64_t &Maximum) {
   return false;
 }
 
-/// Match a signed or unsigned `Base + LaneOffset < Bound`.  The static M/N
-/// selector is built from the same Base/Bound pair and proves a 128-wide tile.
-/// Prove that Offset is nonnegative and strictly less than Limit.  This uses
-/// SCEV rather than a syntactic loop match so the proof survives the casts and
-/// affine adds that Clang emits for the nested staging loops.  A full range is
-/// deliberately not accepted.
+/// Match a signed or unsigned `Base + LaneOffset < Bound`.  Prove that Offset
+/// is nonnegative and strictly less than Limit via SCEV (and affine fallbacks).
 static bool isUnsignedOffsetBelow(Value *Offset, uint64_t Limit,
                                   ScalarEvolution &SE) {
   if (!Offset->getType()->isIntegerTy())
@@ -562,6 +566,16 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   // less-than spelling against the same Bound/Base pair.
   if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_ULT)
     return false;
+
+  // Peel widening casts so `zext/sext(base + off) < bound` still matches.
+  if (auto *Cast = dyn_cast<CastInst>(Index))
+    if (Cast->getOpcode() == Instruction::SExt ||
+        Cast->getOpcode() == Instruction::ZExt)
+      Index = Cast->getOperand(0);
+
+  // Offset 0: `base < bound` is covered by a full-tile Base + Extent proof.
+  if (Index == Full.Base)
+    return true;
 
   auto *Add = dyn_cast<BinaryOperator>(Index);
   if (!Add || (Add->getOpcode() != Instruction::Add &&
@@ -793,19 +807,44 @@ static bool isUniformFullTileTautology(Value *V,
          MatchSub(RHS, LHS, ICmpInst::getSwappedPredicate(Pred));
 }
 
+static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
+                                    ScalarEvolution &SE);
+
+static void collectConjuncts(Value *V, SmallVectorImpl<Value *> &Conjuncts);
+
+static bool isRemovableFootprintConjunct(Value *V,
+                                         ArrayRef<FullTileBoundCheck> FullChecks,
+                                         ScalarEvolution &SE) {
+  for (const FullTileBoundCheck &Full : FullChecks)
+    if (isPerLaneTileBoundCheck(V, Full, SE) ||
+        isUniformFullTileTautology(V, Full))
+      return true;
+  return false;
+}
+
 static bool getRemovableSafetyBranchOutcome(
     const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks,
     ScalarEvolution &SE, GuardOutcome &Outcome) {
   if (!Branch->isConditional())
     return false;
-  for (const FullTileBoundCheck &Full : FullChecks) {
-    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE) ||
-        isUniformFullTileTautology(Branch->getCondition(), Full)) {
-      Outcome = GuardOutcome::True;
-      return true;
-    }
+  Value *Cond = Branch->getCondition();
+  if (isRemovableFootprintConjunct(Cond, FullChecks, SE)) {
+    Outcome = GuardOutcome::True;
+    return true;
   }
-  return false;
+
+  // Conv staging often ANDs independent H/W (or x0..x3) validity tests.
+  // If every conjunct is proven by the CTA-uniform footprint selector, the
+  // whole branch is unconditionally taken on the interior clone.
+  SmallVector<Value *, 8> Conjuncts;
+  collectConjuncts(Cond, Conjuncts);
+  if (Conjuncts.size() < 2)
+    return false;
+  for (Value *Conjunct : Conjuncts)
+    if (!isRemovableFootprintConjunct(Conjunct, FullChecks, SE))
+      return false;
+  Outcome = GuardOutcome::True;
+  return true;
 }
 
 static bool isWorkgroupTileBase(Value *V, unsigned Dimension) {
@@ -3588,6 +3627,318 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   return Changed;
 }
 
+/// Halo / input-tile footprints are typically tens to low hundreds of elements
+/// (e.g. IN_TILE_H = TILE_OY*STRIDE+KH-1), not the GEMM 32/64/128 tile set.
+static bool isSupportedConvFootprintExtent(uint64_t Extent) {
+  return Extent >= 2 && Extent <= 256;
+}
+
+/// Match a CTA-uniform footprint lane guard `Base(+Off) < Bound`.
+static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
+                                        ScalarEvolution &SE, LoopInfo &LI,
+                                        Value *&BaseOut, Value *&BoundOut,
+                                        uint64_t &OffMaxOut) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return false;
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *Index = Cmp->getOperand(0);
+  Value *Bound = Cmp->getOperand(1);
+  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT) {
+    Pred = ICmpInst::getSwappedPredicate(Pred);
+    std::swap(Index, Bound);
+  }
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
+    return false;
+  if (!Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(Bound))
+    return false;
+
+  if (auto *Cast = dyn_cast<CastInst>(Index))
+    if (Cast->getOpcode() == Instruction::SExt ||
+        Cast->getOpcode() == Instruction::ZExt)
+      Index = Cast->getOperand(0);
+
+  constexpr uint64_t FootprintLimit = 256;
+  if (UI.isUniformAtDef(Index)) {
+    BaseOut = Index;
+    BoundOut = Bound;
+    OffMaxOut = 0;
+    return true;
+  }
+
+  auto *Add = dyn_cast<BinaryOperator>(Index);
+  if (!Add || (Add->getOpcode() != Instruction::Add &&
+               Add->getOpcode() != Instruction::Or))
+    return false;
+  Value *LHS = Add->getOperand(0);
+  Value *RHS = Add->getOperand(1);
+  Value *Base = nullptr;
+  Value *Offset = nullptr;
+  if (UI.isUniformAtDef(LHS)) {
+    Base = LHS;
+    Offset = RHS;
+  } else if (UI.isUniformAtDef(RHS)) {
+    Base = RHS;
+    Offset = LHS;
+  } else {
+    return false;
+  }
+
+  uint64_t Maximum = 0;
+  if (!((getAffineLaneMaximum(Offset, Maximum) && Maximum < FootprintLimit) ||
+        getUnsignedOffsetMaximumBelow(Offset, FootprintLimit, SE, Maximum) ||
+        getLoopBoundedShiftedOffsetMaximum(Offset, FootprintLimit, LI,
+                                           Maximum)))
+    return false;
+  BaseOut = Base;
+  BoundOut = Bound;
+  OffMaxOut = Maximum;
+  return true;
+}
+
+static void
+recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
+                         LoopInfo &LI,
+                         DenseMap<std::pair<Value *, Value *>, uint64_t> &Extents) {
+  SmallVector<Value *, 8> Conjuncts;
+  collectConjuncts(V, Conjuncts);
+  for (Value *Conjunct : Conjuncts) {
+    // InstCombine: select guard, true-ish, false — peel the true arm.
+    if (auto *Select = dyn_cast<SelectInst>(Conjunct)) {
+      auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
+      if (False && False->isZero())
+        Conjunct = Select->getTrueValue();
+    }
+    Value *Base = nullptr;
+    Value *Bound = nullptr;
+    uint64_t OffMax = 0;
+    if (!matchConvFootprintLaneGuard(Conjunct, UI, SE, LI, Base, Bound, OffMax))
+      continue;
+    uint64_t Extent = OffMax + 1;
+    auto &Slot = Extents[{Base, Bound}];
+    Slot = std::max(Slot, Extent);
+  }
+}
+
+static bool
+collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
+                           UniformityInfo &UI, ScalarEvolution &SE, LoopInfo &LI,
+                           SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
+  DenseMap<std::pair<Value *, Value *>, uint64_t> Extents;
+  for (BasicBlock *BB : Region) {
+    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
+    recordConvFootprintGuard(Branch->getCondition(), UI, SE, LI, Extents);
+  }
+
+  FullChecks.clear();
+  for (const auto &Entry : Extents) {
+    if (!isSupportedConvFootprintExtent(Entry.second))
+      continue;
+    // Entry: (Base, Bound) -> Extent
+    FullChecks.push_back({/*Dimension=*/0, Entry.first.second, Entry.first.first,
+                          /*IsSigned=*/true, Entry.second});
+  }
+  // Need independent H and W (or analogous) footprint proofs.
+  if (FullChecks.size() < 2)
+    return false;
+  SmallPtrSet<Value *, 4> Bases;
+  for (const FullTileBoundCheck &Check : FullChecks)
+    Bases.insert(Check.Base);
+  return Bases.size() >= 2;
+}
+
+static unsigned countRemovableFootprintBranches(
+    const SmallPtrSetImpl<BasicBlock *> &Region,
+    ArrayRef<FullTileBoundCheck> FullChecks, ScalarEvolution &SE) {
+  unsigned Count = 0;
+  for (BasicBlock *BB : Region) {
+    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
+    GuardOutcome Outcome;
+    if (getRemovableSafetyBranchOutcome(Branch, FullChecks, SE, Outcome))
+      ++Count;
+  }
+  return Count;
+}
+
+static Value *
+synthesizeConvFootprintSelector(BasicBlock *InsertBB,
+                                ArrayRef<FullTileBoundCheck> Checks) {
+  if (Checks.empty())
+    return nullptr;
+  IRBuilder<> Builder(InsertBB->getTerminator());
+  Value *All = ConstantInt::getTrue(InsertBB->getContext());
+  for (const FullTileBoundCheck &C : Checks) {
+    if (C.Bound->getType() != C.Base->getType() || !C.TileMN)
+      return nullptr;
+    Type *Ty = C.Base->getType();
+    Value *Extent = ConstantInt::get(Ty, C.TileMN);
+    Value *Zero = ConstantInt::get(Ty, 0);
+    // Pad makes Base negative on halo CTAs; unsigned lane guards treat that as
+    // out-of-bounds, so the interior selector must reject Base < 0.
+    Value *NonNeg =
+        Builder.CreateICmpSGE(C.Base, Zero, "interior.conv.base.nonneg");
+    Value *BoundOk =
+        Builder.CreateICmpSGE(C.Bound, Extent, "interior.conv.bound.ok");
+    Value *Full = Builder.CreateICmpSLE(
+        C.Base, Builder.CreateSub(C.Bound, Extent), "interior.conv.dim.full");
+    Value *Dim = Builder.CreateAnd(NonNeg, BoundOk, "interior.conv.dim.prep");
+    Dim = Builder.CreateAnd(Dim, Full, "interior.conv.dim");
+    All = Builder.CreateAnd(All, Dim, "interior.conv.full");
+  }
+  return All;
+}
+
+/// Barrier exits must leave the cloned staging region (compute / epilogue).
+static bool hasOnlySharedBarrierExitsOutsideRegion(
+    const SmallPtrSetImpl<BasicBlock *> &Region, const BasicBlock *Barrier) {
+  bool HasSuccessor = false;
+  for (const BasicBlock *Successor : successors(Barrier)) {
+    HasSuccessor = true;
+    if (Region.contains(Successor))
+      return false;
+  }
+  return HasSuccessor;
+}
+
+/// Specialize conv (and similar) cooperative staging: insert a CTA-uniform
+/// "whole input footprint in bounds" selector, clone the pre-barrier staging
+/// region, and strip proven per-element H/W guards on the interior path.
+static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
+                                       LoopInfo &LI, DominatorTree &DT,
+                                       ScalarEvolution &SE) {
+  BasicBlock *StagingEntry = nullptr;
+  BasicBlock *StagingPredecessor = nullptr;
+  BasicBlock *Barrier = nullptr;
+  bool SplitEntryForDispatch = false;
+  SmallVector<FullTileBoundCheck, 4> FullChecks;
+  unsigned BestStripped = 0;
+
+  for (BasicBlock &BBRef : F) {
+    BasicBlock *BB = &BBRef;
+    const bool IsEntry = BB == &F.getEntryBlock();
+    BasicBlock *Dispatch = IsEntry ? nullptr : BB->getSinglePredecessor();
+    if (!IsEntry && !Dispatch)
+      continue;
+
+    SmallPtrSet<BasicBlock *, 8> Candidate;
+    BasicBlock *CandidateBarrier = nullptr;
+    bool CandidateHasLoop = false;
+    if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
+                                 /*AllowNestedLoops=*/true, &CandidateHasLoop,
+                                 /*AllowEntryExternalPredecessors=*/IsEntry) ||
+        !hasOnlySharedBarrierExitsOutsideRegion(Candidate, CandidateBarrier) ||
+        Candidate.size() > MaxStagingCloneBlocks)
+      continue;
+
+    SmallVector<FullTileBoundCheck, 4> CandidateChecks;
+    if (!collectConvFootprintChecks(Candidate, UI, SE, LI, CandidateChecks))
+      continue;
+    if (!canCloneStagingRegion(BB, Candidate, CandidateBarrier, CandidateChecks,
+                               /*DirectGuards=*/{}, /*Alignments=*/{},
+                               /*IV=*/nullptr, /*Bound=*/nullptr, SE,
+                               /*IgnoreEntryInstructions=*/IsEntry))
+      continue;
+
+    unsigned Stripped =
+        countRemovableFootprintBranches(Candidate, CandidateChecks, SE);
+    if (Stripped < MinConvFootprintStrippedBranches)
+      continue;
+    // Prefer nested cooperative load loops with more removable guards.
+    if (Stripped < BestStripped ||
+        (Stripped == BestStripped && StagingEntry && !CandidateHasLoop))
+      continue;
+
+    StagingEntry = BB;
+    StagingPredecessor = Dispatch;
+    Barrier = CandidateBarrier;
+    SplitEntryForDispatch = IsEntry;
+    FullChecks = std::move(CandidateChecks);
+    BestStripped = Stripped;
+  }
+
+  if (!StagingEntry) {
+    LLVM_DEBUG(dbgs() << "Conv footprint preflight rejected " << F.getName()
+                      << ": no profitable closed staging footprint region\n");
+    return false;
+  }
+
+  BasicBlock *Dispatch = nullptr;
+  if (SplitEntryForDispatch) {
+    Dispatch = StagingEntry;
+    StagingEntry = SplitBlock(Dispatch, Dispatch->getTerminator(), &DT, &LI,
+                              nullptr, "conv.staging");
+    StagingPredecessor = Dispatch;
+  } else {
+    Dispatch = SplitEdge(StagingPredecessor, StagingEntry, &DT, &LI);
+    if (!Dispatch)
+      return false;
+  }
+
+  auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
+  SmallPtrSet<BasicBlock *, 8> Region;
+  BasicBlock *SharedBarrier = nullptr;
+  const bool RegionOk = findClosedStagingRegion(
+      StagingEntry, Dispatch, Region, SharedBarrier, /*AllowNestedLoops=*/true);
+  const bool BarrierOk = RegionOk && SharedBarrier == Barrier;
+  const bool ExitsOk =
+      BarrierOk &&
+      hasOnlySharedBarrierExitsOutsideRegion(Region, SharedBarrier);
+  const bool CloneOk =
+      ExitsOk &&
+      canCloneStagingRegion(StagingEntry, Region, SharedBarrier, FullChecks, {},
+                            {}, nullptr, nullptr, SE);
+  if (!CloneOk) {
+    LLVM_DEBUG(dbgs() << "Conv footprint aborted after dispatch split at "
+                      << StagingEntry->getName() << '\n');
+    if (StagingEntry->getSinglePredecessor() == Dispatch &&
+        Dispatch->getSingleSuccessor() == StagingEntry)
+      MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,
+                                /*MSSAU=*/nullptr, /*MemDep=*/nullptr,
+                                /*PredecessorWithTwoSuccessors=*/false, &DT);
+    return false;
+  }
+
+  // Re-collect after the split so Base SSA values still match region guards.
+  FullChecks.clear();
+  if (!collectConvFootprintChecks(Region, UI, SE, LI, FullChecks) ||
+      countRemovableFootprintBranches(Region, FullChecks, SE) <
+          MinConvFootprintStrippedBranches) {
+    if (StagingEntry->getSinglePredecessor() == Dispatch &&
+        Dispatch->getSingleSuccessor() == StagingEntry)
+      MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,
+                                /*MSSAU=*/nullptr, /*MemDep=*/nullptr,
+                                /*PredecessorWithTwoSuccessors=*/false, &DT);
+    return false;
+  }
+
+  Value *RunFast = synthesizeConvFootprintSelector(Dispatch, FullChecks);
+  if (!RunFast) {
+    if (StagingEntry->getSinglePredecessor() == Dispatch &&
+        Dispatch->getSingleSuccessor() == StagingEntry)
+      MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,
+                                /*MSSAU=*/nullptr, /*MemDep=*/nullptr,
+                                /*PredecessorWithTwoSuccessors=*/false, &DT);
+    return false;
+  }
+
+  BranchInst::Create(StagingEntry, StagingEntry, RunFast, DispatchBranch);
+  DispatchBranch->eraseFromParent();
+
+  bool Changed = cloneStagingRegion(
+      F, cast<BranchInst>(Dispatch->getTerminator()), StagingEntry, Region,
+      SharedBarrier, FullChecks, {}, {}, nullptr, nullptr, SE);
+  if (Changed)
+    LLVM_DEBUG(dbgs() << "Cloned conv footprint interior staging in "
+                      << F.getName() << "; footprint dims " << FullChecks.size()
+                      << "; preflight stripped-branch estimate " << BestStripped
+                      << '\n');
+  return Changed;
+}
+
 /// Clone the store epilogue after the outer K loop behind \p MNFull and strip
 /// proven M/N lane guards on the interior copy.
 static bool specializeInteriorEpilogueStores(
@@ -3780,6 +4131,11 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
     if (splitOuterKStaging(F, L, UI, LI, DT, SE))
       return true;
   }
+
+  // Conv / halo staging: no outer-K tile setup, but CTA-uniform input
+  // footprint bases with per-element H/W guards before the shared barrier.
+  if (splitInteriorConvFootprint(F, UI, LI, DT, SE))
+    return true;
 
   for (BasicBlock &BB : F) {
     auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
