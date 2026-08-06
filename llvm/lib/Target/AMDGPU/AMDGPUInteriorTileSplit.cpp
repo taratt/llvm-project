@@ -258,6 +258,7 @@ struct CanonicalTileRemainder {
   Value *Base;
   Value *Difference;
   uint64_t TileMN = 128;
+  bool IsSigned = true;
 };
 
 static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
@@ -554,9 +555,12 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
     Pred = ICmpInst::getSwappedPredicate(Pred);
     std::swap(Index, Bound);
   }
-  if (Bound != Full.Bound ||
-      (Full.IsSigned ? Pred != ICmpInst::ICMP_SLT
-                     : Pred != ICmpInst::ICMP_ULT))
+  if (Bound != Full.Bound)
+    return false;
+  // Staging guards are sometimes emitted unsigned even when the CTA selector
+  // was synthesized with signed arithmetic (and the reverse). Accept either
+  // less-than spelling against the same Bound/Base pair.
+  if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_ULT)
     return false;
 
   auto *Add = dyn_cast<BinaryOperator>(Index);
@@ -652,11 +656,10 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
         getLoopBoundedShiftedOffsetMaximum(Offset, TileMN, LI, Maximum)))
     return false;
 
-  Remainder = {Dimension, Bound, Base, Cmp, TileMN};
+  Remainder = {Dimension, Bound, Base, Cmp, TileMN,
+               Pred == ICmpInst::ICMP_SLT};
   return true;
 }
-
-/// Match a CTA-uniform full-tile predicate already written in source, e.g.
 /// `block_row + TILE_M <= M` / `Base <= Bound - TileMN`.  cuda_only large-K
 /// GEMMs expose this form instead of (or in addition to) per-lane guards.
 static bool getUniformFullTileBoundCheck(Value *V, unsigned Dimension,
@@ -708,7 +711,8 @@ static bool getUniformFullTileBoundCheck(Value *V, unsigned Dimension,
     // Bound is adjusted; only accept non-strict <= / signed equivalents).
     if (P == ICmpInst::ICMP_ULT || P == ICmpInst::ICMP_SLT)
       return false;
-    Remainder = {Dimension, Bound, Base, Cmp, TileMN};
+    Remainder = {Dimension, Bound, Base, Cmp, TileMN,
+                 P == ICmpInst::ICMP_SLE};
     return true;
   };
 
@@ -724,7 +728,8 @@ static bool getUniformFullTileBoundCheck(Value *V, unsigned Dimension,
     Value *Base = getWorkgroupTileBase(BaseCand, Dimension, TileMN);
     if (!Base || !TileC || TileC->getZExtValue() != TileMN)
       return false;
-    Remainder = {Dimension, Sub->getOperand(0), Base, Cmp, TileMN};
+    Remainder = {Dimension, Sub->getOperand(0), Base, Cmp, TileMN,
+                 P == ICmpInst::ICMP_SLE};
     return true;
   };
 
@@ -903,7 +908,8 @@ static bool getClampedTileExtent(Value *V, unsigned Dimension,
       BaseTileMN != TileMN)
     return false;
 
-  Remainder = {Dimension, Sub->getOperand(0), Sub->getOperand(1), Sub, TileMN};
+  Remainder = {Dimension, Sub->getOperand(0), Sub->getOperand(1), Sub, TileMN,
+               /*IsSigned=*/true};
   return true;
 }
 
@@ -1825,8 +1831,9 @@ static bool findClosedStagingRegion(BasicBlock *Entry, BasicBlock *Dispatch,
           !(AllowEntryExternalPredecessors && BB == Entry))
         return false;
 
-    if (isa<CondBrInst>(BB->getTerminator()))
-      HasSafetyBranch = true;
+    if (auto *Br = dyn_cast<BranchInst>(BB->getTerminator()))
+      if (Br->isConditional())
+        HasSafetyBranch = true;
 
     for (BasicBlock *Successor : successors(BB)) {
       if (Successor == Barrier)
@@ -1977,15 +1984,37 @@ struct OuterKLoopInfo {
 
 /// Recover TileK from `IV * C` / `IV << log2(C)` uses inside the loop body.
 /// The scale often sits behind a widening cast, because the tile offset is used
-/// to index with 64-bit arithmetic.
+/// to index with 64-bit arithmetic. Also accept `(IV + const) * C`, which is
+/// how double-buffered GEMMs write the next-tile column (`(t+1) * TILE_K`).
 static uint64_t inferTileKFromIndexUses(PHINode *IV) {
-  SmallVector<Value *, 4> Sources = {IV};
-  for (User *U : IV->users())
+  SmallVector<Value *, 8> Sources = {IV};
+  for (User *U : IV->users()) {
     if (isa<SExtInst>(U) || isa<ZExtInst>(U) || isa<TruncInst>(U))
       Sources.push_back(U);
+    // Peel `iv + C` / `C + iv` so `(t+1)*TileK` still reveals TileK.
+    if (auto *Add = dyn_cast<BinaryOperator>(U))
+      if (Add->getOpcode() == Instruction::Add &&
+          (isa<ConstantInt>(Add->getOperand(0)) ||
+           isa<ConstantInt>(Add->getOperand(1))))
+        Sources.push_back(Add);
+  }
 
   for (Value *Src : Sources) {
     for (User *U : Src->users()) {
+      if (isa<SExtInst>(U) || isa<ZExtInst>(U) || isa<TruncInst>(U)) {
+        for (User *UU : U->users()) {
+          auto *BO = dyn_cast<BinaryOperator>(UU);
+          if (!BO)
+            continue;
+          if (BO->getOpcode() == Instruction::Mul) {
+            Value *Other = BO->getOperand(0) == U ? BO->getOperand(1)
+                                                  : BO->getOperand(0);
+            if (auto *C = dyn_cast<ConstantInt>(Other))
+              if (isSupportedTileK(C->getZExtValue()))
+                return C->getZExtValue();
+          }
+        }
+      }
       auto *BO = dyn_cast<BinaryOperator>(U);
       if (!BO)
         continue;
@@ -2059,10 +2088,26 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
 
   Value *IVNext = ExitCmp->getOperand(0);
   Value *Bound = ExitCmp->getOperand(1);
-  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNext));
+  // Latch compares are often on a widened copy of the IV bump
+  // (`sext i32 %k.next to i64`), especially in cuda_only GEMMs with 64-bit
+  // index arithmetic. Peel those casts before asking SCEV for an addrec.
+  auto PeelWideningCast = [](Value *V) -> Value * {
+    while (auto *Cast = dyn_cast<CastInst>(V)) {
+      if (Cast->getOpcode() != Instruction::SExt &&
+          Cast->getOpcode() != Instruction::ZExt)
+        break;
+      V = Cast->getOperand(0);
+    }
+    return V;
+  };
+  Value *IVNextRaw = PeelWideningCast(IVNext);
+  Value *BoundRaw = PeelWideningCast(Bound);
+  const SCEVAddRecExpr *AR =
+      dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNextRaw));
   if (!AR) {
     std::swap(IVNext, Bound);
-    AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNext));
+    std::swap(IVNextRaw, BoundRaw);
+    AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IVNextRaw));
   }
   auto *Step = AR ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
                   : nullptr;
@@ -2082,13 +2127,16 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
 
   PHINode *IV = nullptr;
   for (PHINode &PN : L->getHeader()->phis()) {
-    if (PN.getIncomingValueForBlock(Exiting) != IVNext)
+    Value *Incoming = PN.getIncomingValueForBlock(Exiting);
+    if (Incoming != IVNext && Incoming != IVNextRaw &&
+        PeelWideningCast(Incoming) != IVNextRaw)
       continue;
     auto *Initial =
         dyn_cast<ConstantInt>(PN.getIncomingValueForBlock(Preheader));
     if (!Initial || !Initial->isZero())
       return Reject("K induction variable does not start at zero");
-    auto *Inc = dyn_cast<BinaryOperator>(IVNext);
+    Value *IncVal = PeelWideningCast(Incoming);
+    auto *Inc = dyn_cast<BinaryOperator>(IncVal);
     if (!Inc || Inc->getOpcode() != Instruction::Add)
       return Reject("K induction variable is not advanced by an add");
     IV = &PN;
@@ -2097,6 +2145,9 @@ static bool getCanonicalOuterKLoop(Loop *L, ScalarEvolution &SE,
   if (!IV)
     return Reject("no header phi feeds the latch compare");
 
+  // Prefer the raw integer trip bound when the icmp widened it.
+  if (Bound != BoundRaw && BoundRaw->getType() == IV->getType())
+    Bound = BoundRaw;
   if (isSupportedTileK(StepVal)) {
     Info = {IV, Bound, StepVal, OuterKForm::OffsetStep};
     return true;
@@ -3380,8 +3431,8 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
   SmallVector<FullTileBoundCheck, 2> FullChecks{
-      {M.Dimension, M.Bound, M.Base, /*IsSigned=*/true, M.TileMN},
-      {N.Dimension, N.Bound, N.Base, /*IsSigned=*/true, N.TileMN}};
+      {M.Dimension, M.Bound, M.Base, M.IsSigned, M.TileMN},
+      {N.Dimension, N.Bound, N.Base, N.IsSigned, N.TileMN}};
   SmallVector<Value *, 2> DirectGuards{M.Difference, N.Difference};
 
   // First prove the old CFG, before changing it.  The candidate must end at a
@@ -3731,8 +3782,8 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
   }
 
   for (BasicBlock &BB : F) {
-    auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
-    if (!Branch || !UI.isUniformTerminator(Branch))
+    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Branch || !Branch->isConditional() || !UI.isUniformTerminator(Branch))
       continue;
 
     SmallPtrSet<Value *, 16> Visited;
@@ -3793,8 +3844,8 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
   }
 
   for (BasicBlock &BB : F) {
-    auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator());
-    if (!Branch || UI.isUniformTerminator(Branch))
+    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Branch || !Branch->isConditional() || UI.isUniformTerminator(Branch))
       continue;
 
     SmallPtrSet<Value *, 16> Visited;
