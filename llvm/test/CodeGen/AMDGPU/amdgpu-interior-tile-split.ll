@@ -687,10 +687,85 @@ k.exit:
   ret void
 }
 
+; 32-wide CTA tile with a source-level uniform full-N predicate and a per-lane
+; M guard, plus a guarded store epilogue after the outer K loop.  Matches the
+; cuda_only standard/square GEMM shape that the 128-only matchers previously
+; ignored, while keeping the existing BMM float4 widen path untouched.
+define amdgpu_kernel void @tile32_uniform_full_n_staging(
+    ptr addrspace(1) %a, ptr addrspace(1) %c, i32 %m, i32 %n, i32 %k) {
+entry:
+  %workgroup.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %workgroup.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %n.base = mul i32 %workgroup.x, 32
+  %m.base = mul i32 %workgroup.y, 32
+  %n.extent = add i32 %n.base, 32
+  %full.n.tile = icmp ule i32 %n.extent, %n
+  %lane = and i32 %tid, 31
+  br label %k.preheader
+
+k.preheader:
+  br label %k.header
+
+k.header:
+  %k0 = phi i32 [ 0, %k.preheader ], [ %k.next, %k.latch ]
+  br label %staging
+
+staging:
+  br i1 %full.n.tile, label %stage.m, label %stage.edge
+
+stage.m:
+  %row = add i32 %m.base, %lane
+  %in.m = icmp ult i32 %row, %m
+  br i1 %in.m, label %stage.load, label %barrier
+
+stage.load:
+  %ptr = getelementptr float, ptr addrspace(1) %a, i32 %row
+  %val = load float, ptr addrspace(1) %ptr, align 4
+  br label %barrier
+
+stage.edge:
+  br label %barrier
+
+barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %compute
+
+compute:
+  br label %k.latch
+
+k.latch:
+  %k.next = add i32 %k0, 32
+  %more.k = icmp ult i32 %k.next, %k
+  br i1 %more.k, label %k.header, label %k.exit
+
+k.exit:
+  br label %epilogue
+
+epilogue:
+  %out.row = add i32 %m.base, %lane
+  %out.in.m = icmp ult i32 %out.row, %m
+  br i1 %out.in.m, label %epilogue.n, label %ret
+
+epilogue.n:
+  %out.col = add i32 %n.base, %lane
+  %out.in.n = icmp ult i32 %out.col, %n
+  br i1 %out.in.n, label %epilogue.store, label %ret
+
+epilogue.store:
+  %out.ptr = getelementptr float, ptr addrspace(1) %c, i32 %out.row
+  store float 1.0, ptr addrspace(1) %out.ptr, align 4
+  br label %ret
+
+ret:
+  ret void
+}
+
 ; CHECK: Potential interior-tile boundary check in candidate:
 ; At least one outer-K staging clone must retain a nested staging loop.
-; CHECK-DAG: Cloned nested-loop staging region in {{staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop}}; outer K latch and shared barrier were retained
-; CHECK-DAG: Cloned canonical interior-tile staging region in {{canonical_staging|staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop}}
+; CHECK-DAG: Cloned nested-loop staging region in {{staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop|tile32_uniform_full_n_staging}}; outer K latch and shared barrier were retained
+; CHECK-DAG: Cloned canonical interior-tile staging region in {{canonical_staging|staging_only_outer_k_loop|batched_style_direct_bounds_outer_k_loop|tile32_uniform_full_n_staging}}
+; CHECK-DAG: Specialized interior store epilogue in tile32_uniform_full_n_staging
 
 ; CFG-LABEL: define amdgpu_kernel void @canonical_staging(
 ; CFG: br i1 %full, label %staging.interior, label %edge

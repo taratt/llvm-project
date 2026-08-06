@@ -73,7 +73,7 @@ namespace {
 static cl::opt<unsigned> MaxStagingCloneBlocks(
     "amdgpu-interior-tile-max-staging-blocks",
     cl::desc("Max blocks allowed when cloning an interior staging region"),
-    cl::init(24), cl::Hidden);
+    cl::init(48), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
@@ -127,89 +127,121 @@ static bool isWorkgroupID(Value *V, unsigned Dimension) {
          (Dimension == 1 && Name == "llvm.amdgcn.workgroup.id.y");
 }
 
-static bool isWorkgroupShiftBy7(Value *V, unsigned Dimension) {
+/// Supported CTA tile extents in the M or N dimension. BMM / tall-skinny use
+/// 128; square and large-K cuda_only GEMMs use 32.
+static bool isSupportedTileMN(uint64_t TileMN) {
+  return TileMN == 32 || TileMN == 64 || TileMN == 128;
+}
+
+static bool isWorkgroupShiftByLogTile(Value *V, unsigned Dimension,
+                                      uint64_t &TileMN) {
   auto *Shift = dyn_cast<BinaryOperator>(V);
   if (!Shift || Shift->getOpcode() != Instruction::Shl ||
       !isWorkgroupID(Shift->getOperand(0), Dimension))
     return false;
 
   auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
-  return Amount && Amount->equalsInt(7);
+  if (!Amount || Amount->getZExtValue() > 7)
+    return false;
+  TileMN = 1ull << Amount->getZExtValue();
+  return isSupportedTileMN(TileMN);
 }
 
-static Value *getWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
-  if (isWorkgroupShiftBy7(V, Dimension))
+/// Recover a CTA-uniform tile base `workgroup.id * TileMN` (or biased forms)
+/// and the matched TileMN. Accepts shl-by-log2 and mul-by-TileMN spellings.
+static Value *getWorkgroupTileBase(Value *V, unsigned Dimension,
+                                   uint64_t &TileMN) {
+  if (isWorkgroupShiftByLogTile(V, Dimension, TileMN))
     return V;
   if (auto *Cast = dyn_cast<CastInst>(V))
-    if (isWorkgroupShiftBy7(Cast->getOperand(0), Dimension))
+    if (isWorkgroupShiftByLogTile(Cast->getOperand(0), Dimension, TileMN))
       return V;
+
   // Host launches sometimes bias the workgroup id. Accept:
-  //   (wg.id + offset) << 7
-  //   (wg.id << 7) + offset
-  //   (wg.id + offset) * 128
-  // The biased base is still CTA-uniform (interior_split_stress edge kernel).
+  //   (wg.id + offset) << log2(TileMN)
+  //   (wg.id << log2(TileMN)) + offset
+  //   (wg.id + offset) * TileMN
   Value *Raw = V;
   if (auto *Cast = dyn_cast<CastInst>(V))
     Raw = Cast->getOperand(0);
   if (auto *BO = dyn_cast<BinaryOperator>(Raw)) {
     if (BO->getOpcode() == Instruction::Shl) {
       auto *Amount = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (Amount && Amount->equalsInt(7)) {
-        if (auto *Add = dyn_cast<BinaryOperator>(BO->getOperand(0)))
-          if (Add->getOpcode() == Instruction::Add &&
-              (isWorkgroupID(Add->getOperand(0), Dimension) ||
-               isWorkgroupID(Add->getOperand(1), Dimension)))
-            return V;
+      if (Amount && Amount->getZExtValue() <= 7) {
+        uint64_t Candidate = 1ull << Amount->getZExtValue();
+        if (isSupportedTileMN(Candidate)) {
+          if (auto *Add = dyn_cast<BinaryOperator>(BO->getOperand(0)))
+            if (Add->getOpcode() == Instruction::Add &&
+                (isWorkgroupID(Add->getOperand(0), Dimension) ||
+                 isWorkgroupID(Add->getOperand(1), Dimension))) {
+              TileMN = Candidate;
+              return V;
+            }
+        }
       }
     }
     if (BO->getOpcode() == Instruction::Add) {
-      if (isWorkgroupShiftBy7(BO->getOperand(0), Dimension) ||
-          isWorkgroupShiftBy7(BO->getOperand(1), Dimension))
+      uint64_t Candidate = 0;
+      if (isWorkgroupShiftByLogTile(BO->getOperand(0), Dimension, Candidate) ||
+          isWorkgroupShiftByLogTile(BO->getOperand(1), Dimension, Candidate)) {
+        TileMN = Candidate;
         return V;
+      }
     }
     if (BO->getOpcode() == Instruction::Mul) {
       Value *Other = nullptr;
-      Value *Addend = nullptr;
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-        if (C->equalsInt(128)) {
+        if (isSupportedTileMN(C->getZExtValue()))
           Other = BO->getOperand(0);
-        }
       } else if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
-        if (C->equalsInt(128))
+        if (isSupportedTileMN(C->getZExtValue()))
           Other = BO->getOperand(1);
       }
       if (Other) {
-        if (isWorkgroupID(Other, Dimension))
+        auto *C = dyn_cast<ConstantInt>(
+            BO->getOperand(0) == Other ? BO->getOperand(1) : BO->getOperand(0));
+        uint64_t Candidate = C->getZExtValue();
+        if (isWorkgroupID(Other, Dimension)) {
+          TileMN = Candidate;
           return V;
+        }
         if (auto *Add = dyn_cast<BinaryOperator>(Other))
           if (Add->getOpcode() == Instruction::Add &&
               (isWorkgroupID(Add->getOperand(0), Dimension) ||
-               isWorkgroupID(Add->getOperand(1), Dimension)))
+               isWorkgroupID(Add->getOperand(1), Dimension))) {
+            TileMN = Candidate;
             return V;
-        (void)Addend;
+          }
       }
     }
   }
   return nullptr;
 }
 
-static Value *getShiftPlusLastLaneBase(Value *V, unsigned Dimension) {
+static Value *getShiftPlusLastLaneBase(Value *V, unsigned Dimension,
+                                       uint64_t &TileMN) {
   auto *Add = dyn_cast<BinaryOperator>(V);
   if (!Add || Add->getOpcode() != Instruction::Add)
     return nullptr;
 
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
-  if (auto *C = dyn_cast<ConstantInt>(LHS)) {
-    if (!C->equalsInt(127))
-      return nullptr;
-    LHS = RHS;
-  } else {
-    auto *LastLane = dyn_cast<ConstantInt>(RHS);
-    if (!LastLane || !LastLane->equalsInt(127))
-      return nullptr;
+  ConstantInt *LastLane = dyn_cast<ConstantInt>(LHS);
+  Value *BaseOperand = RHS;
+  if (!LastLane) {
+    LastLane = dyn_cast<ConstantInt>(RHS);
+    BaseOperand = LHS;
   }
-  return getWorkgroupShiftBy7OrExtend(LHS, Dimension);
+  if (!LastLane)
+    return nullptr;
+  uint64_t Last = LastLane->getZExtValue();
+  if (!isSupportedTileMN(Last + 1))
+    return nullptr;
+  if (!getWorkgroupTileBase(BaseOperand, Dimension, TileMN))
+    return nullptr;
+  if (TileMN != Last + 1)
+    return nullptr;
+  return getWorkgroupTileBase(BaseOperand, Dimension, TileMN);
 }
 
 struct FullTileBoundCheck {
@@ -217,6 +249,7 @@ struct FullTileBoundCheck {
   Value *Bound;
   Value *Base;
   bool IsSigned;
+  uint64_t TileMN = 128;
 };
 
 struct CanonicalTileRemainder {
@@ -224,6 +257,7 @@ struct CanonicalTileRemainder {
   Value *Bound;
   Value *Base;
   Value *Difference;
+  uint64_t TileMN = 128;
 };
 
 static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
@@ -231,14 +265,15 @@ static bool getFullTileBoundCheck(Value *V, unsigned Dimension,
   auto *Cmp = dyn_cast<ICmpInst>(V);
   if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
     return false;
-  Value *Base = getShiftPlusLastLaneBase(Cmp->getOperand(0), Dimension);
+  uint64_t TileMN = 0;
+  Value *Base = getShiftPlusLastLaneBase(Cmp->getOperand(0), Dimension, TileMN);
   if (!Base)
     return false;
 
   SmallPtrSet<Value *, 16> Visited;
   if (getIDDependencies(Cmp->getOperand(1), Visited) != DependsOnNone)
     return false;
-  Check = {Dimension, Cmp->getOperand(1), Base, false};
+  Check = {Dimension, Cmp->getOperand(1), Base, false, TileMN};
   return true;
 }
 
@@ -533,8 +568,9 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   Value *RHS = Add->getOperand(1);
   auto IsBoundedOffset = [&](Value *Offset) {
     uint64_t Maximum;
-    return (getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
-           getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum);
+    return (getAffineLaneMaximum(Offset, Maximum) &&
+            Maximum < Full.TileMN) ||
+           getUnsignedOffsetMaximumBelow(Offset, Full.TileMN, SE, Maximum);
   };
   return (LHS == Full.Base && IsBoundedOffset(RHS)) ||
          (RHS == Full.Base && IsBoundedOffset(LHS));
@@ -542,10 +578,10 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
 
 /// Recover a full-tile M/N proof directly from a per-lane guard.  Some HIP
 /// GEMMs do not materialize a min/max tile extent: their staging loops retain
-/// only `workgroup.id * 128 + offset < extent`.  The same bounded-offset
-/// proof used to remove the guard makes `base <= bound - 128` sufficient for
-/// every such lane.  Keep the base spelling exact and require a uniform bound
-/// so this cannot turn a lane-varying predicate into a CTA dispatch.
+/// only `workgroup.id * TileMN + offset < extent`.  The same bounded-offset
+/// proof used to remove the guard makes `base <= bound - TileMN` sufficient
+/// for every such lane.  Keep the base spelling exact and require a uniform
+/// bound so this cannot turn a lane-varying predicate into a CTA dispatch.
 static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
                                     UniformityInfo &UI, ScalarEvolution &SE,
                                     LoopInfo &LI,
@@ -602,21 +638,105 @@ static bool getDirectTileBoundCheck(Value *V, unsigned Dimension,
     return false;
   Value *LHS = Add->getOperand(0);
   Value *RHS = Add->getOperand(1);
-  Value *Base = getWorkgroupShiftBy7OrExtend(LHS, Dimension);
+  uint64_t TileMN = 0;
+  Value *Base = getWorkgroupTileBase(LHS, Dimension, TileMN);
   Value *Offset = RHS;
   if (!Base) {
-    Base = getWorkgroupShiftBy7OrExtend(RHS, Dimension);
+    Base = getWorkgroupTileBase(RHS, Dimension, TileMN);
     Offset = LHS;
   }
   uint64_t Maximum;
   if (!Base ||
-      !((getAffineLaneMaximum(Offset, Maximum) && Maximum < 128) ||
-        getUnsignedOffsetMaximumBelow(Offset, 128, SE, Maximum) ||
-        getLoopBoundedShiftedOffsetMaximum(Offset, 128, LI, Maximum)))
+      !((getAffineLaneMaximum(Offset, Maximum) && Maximum < TileMN) ||
+        getUnsignedOffsetMaximumBelow(Offset, TileMN, SE, Maximum) ||
+        getLoopBoundedShiftedOffsetMaximum(Offset, TileMN, LI, Maximum)))
     return false;
 
-  Remainder = {Dimension, Bound, Base, Cmp};
+  Remainder = {Dimension, Bound, Base, Cmp, TileMN};
   return true;
+}
+
+/// Match a CTA-uniform full-tile predicate already written in source, e.g.
+/// `block_row + TILE_M <= M` / `Base <= Bound - TileMN`.  cuda_only large-K
+/// GEMMs expose this form instead of (or in addition to) per-lane guards.
+static bool getUniformFullTileBoundCheck(Value *V, unsigned Dimension,
+                                          UniformityInfo &UI,
+                                          CanonicalTileRemainder &Remainder) {
+  if (auto *Select = dyn_cast<SelectInst>(V)) {
+    auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
+    if (False && False->isZero())
+      return getUniformFullTileBoundCheck(Select->getTrueValue(), Dimension,
+                                           UI, Remainder) ||
+             getUniformFullTileBoundCheck(Select->getCondition(), Dimension,
+                                           UI, Remainder);
+  }
+  if (auto *And = dyn_cast<BinaryOperator>(V)) {
+    if (And->getOpcode() == Instruction::And &&
+        And->getType()->isIntegerTy(1))
+      return getUniformFullTileBoundCheck(And->getOperand(0), Dimension, UI,
+                                           Remainder) ||
+             getUniformFullTileBoundCheck(And->getOperand(1), Dimension, UI,
+                                           Remainder);
+  }
+
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp || !UI.isUniformAtDef(Cmp))
+    return false;
+
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *LHS = Cmp->getOperand(0);
+  Value *RHS = Cmp->getOperand(1);
+
+  auto MatchBasePlusTile = [&](Value *Sum, Value *Bound,
+                               ICmpInst::Predicate P) -> bool {
+    if (P != ICmpInst::ICMP_ULE && P != ICmpInst::ICMP_SLE &&
+        P != ICmpInst::ICMP_ULT && P != ICmpInst::ICMP_SLT)
+      return false;
+    auto *Add = dyn_cast<BinaryOperator>(Sum);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      return false;
+    uint64_t TileMN = 0;
+    Value *Base = getWorkgroupTileBase(Add->getOperand(0), Dimension, TileMN);
+    auto *TileC = dyn_cast<ConstantInt>(Add->getOperand(1));
+    if (!Base) {
+      Base = getWorkgroupTileBase(Add->getOperand(1), Dimension, TileMN);
+      TileC = dyn_cast<ConstantInt>(Add->getOperand(0));
+    }
+    if (!Base || !TileC || TileC->getZExtValue() != TileMN)
+      return false;
+    // base+TileMN <= Bound  (or < Bound+1 — reject the strict form unless
+    // Bound is adjusted; only accept non-strict <= / signed equivalents).
+    if (P == ICmpInst::ICMP_ULT || P == ICmpInst::ICMP_SLT)
+      return false;
+    Remainder = {Dimension, Bound, Base, Cmp, TileMN};
+    return true;
+  };
+
+  auto MatchBaseLeBoundMinusTile = [&](Value *BaseCand, Value *BoundMinus,
+                                        ICmpInst::Predicate P) -> bool {
+    if (P != ICmpInst::ICMP_ULE && P != ICmpInst::ICMP_SLE)
+      return false;
+    auto *Sub = dyn_cast<BinaryOperator>(BoundMinus);
+    if (!Sub || Sub->getOpcode() != Instruction::Sub)
+      return false;
+    auto *TileC = dyn_cast<ConstantInt>(Sub->getOperand(1));
+    uint64_t TileMN = 0;
+    Value *Base = getWorkgroupTileBase(BaseCand, Dimension, TileMN);
+    if (!Base || !TileC || TileC->getZExtValue() != TileMN)
+      return false;
+    Remainder = {Dimension, Sub->getOperand(0), Base, Cmp, TileMN};
+    return true;
+  };
+
+  if (MatchBasePlusTile(LHS, RHS, Pred))
+    return true;
+  if (MatchBasePlusTile(RHS, LHS, ICmpInst::getSwappedPredicate(Pred)))
+    return true;
+  if (MatchBaseLeBoundMinusTile(LHS, RHS, Pred))
+    return true;
+  if (MatchBaseLeBoundMinusTile(RHS, LHS, ICmpInst::getSwappedPredicate(Pred)))
+    return true;
+  return false;
 }
 
 /// The successor selected by a predicate proven in the cloned prefix.  Keep
@@ -627,13 +747,55 @@ enum class GuardOutcome : unsigned {
   False = 1,
 };
 
+static bool isUniformFullTileTautology(Value *V,
+                                         const FullTileBoundCheck &Full) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return false;
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *LHS = Cmp->getOperand(0);
+  Value *RHS = Cmp->getOperand(1);
+
+  auto MatchAdd = [&](Value *Sum, Value *Bound, ICmpInst::Predicate P) {
+    if (P != ICmpInst::ICMP_ULE && P != ICmpInst::ICMP_SLE)
+      return false;
+    auto *Add = dyn_cast<BinaryOperator>(Sum);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      return false;
+    auto *TileC = dyn_cast<ConstantInt>(Add->getOperand(1));
+    Value *Base = Add->getOperand(0);
+    if (!TileC) {
+      TileC = dyn_cast<ConstantInt>(Add->getOperand(0));
+      Base = Add->getOperand(1);
+    }
+    return Base == Full.Base && Bound == Full.Bound && TileC &&
+           TileC->getZExtValue() == Full.TileMN;
+  };
+  auto MatchSub = [&](Value *BaseCand, Value *BoundMinus,
+                      ICmpInst::Predicate P) {
+    if (P != ICmpInst::ICMP_ULE && P != ICmpInst::ICMP_SLE)
+      return false;
+    auto *Sub = dyn_cast<BinaryOperator>(BoundMinus);
+    if (!Sub || Sub->getOpcode() != Instruction::Sub)
+      return false;
+    auto *TileC = dyn_cast<ConstantInt>(Sub->getOperand(1));
+    return BaseCand == Full.Base && Sub->getOperand(0) == Full.Bound &&
+           TileC && TileC->getZExtValue() == Full.TileMN;
+  };
+  return MatchAdd(LHS, RHS, Pred) ||
+         MatchAdd(RHS, LHS, ICmpInst::getSwappedPredicate(Pred)) ||
+         MatchSub(LHS, RHS, Pred) ||
+         MatchSub(RHS, LHS, ICmpInst::getSwappedPredicate(Pred));
+}
+
 static bool getRemovableSafetyBranchOutcome(
     const BranchInst *Branch, ArrayRef<FullTileBoundCheck> FullChecks,
     ScalarEvolution &SE, GuardOutcome &Outcome) {
   if (!Branch->isConditional())
     return false;
   for (const FullTileBoundCheck &Full : FullChecks) {
-    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE)) {
+    if (isPerLaneTileBoundCheck(Branch->getCondition(), Full, SE) ||
+        isUniformFullTileTautology(Branch->getCondition(), Full)) {
       Outcome = GuardOutcome::True;
       return true;
     }
@@ -641,8 +803,9 @@ static bool getRemovableSafetyBranchOutcome(
   return false;
 }
 
-static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
-  return getWorkgroupShiftBy7OrExtend(V, Dimension);
+static bool isWorkgroupTileBase(Value *V, unsigned Dimension) {
+  uint64_t TileMN = 0;
+  return getWorkgroupTileBase(V, Dimension, TileMN) != nullptr;
 }
 
 /// Generic scalar optimization can lower min/max to selects, but the
@@ -650,7 +813,7 @@ static bool isWorkgroupShiftBy7OrExtend(Value *V, unsigned Dimension) {
 static bool isTileRelativeDifference(Value *V, unsigned Dimension) {
   auto *Sub = dyn_cast<BinaryOperator>(V);
   return Sub && Sub->getOpcode() == Instruction::Sub &&
-         isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension);
+         isWorkgroupTileBase(Sub->getOperand(1), Dimension);
 }
 
 static bool isNamedCall(Value *V, StringRef Name) {
@@ -659,15 +822,16 @@ static bool isNamedCall(Value *V, StringRef Name) {
          Call->getCalledFunction()->getName().starts_with(Name);
 }
 
-/// Match the select lowering of `smin(smax(Difference, 0), 128)`.  Scalar
+/// Match the select lowering of `smin(smax(Difference, 0), TileMN)`.  Scalar
 /// optimization commonly replaces the intrinsic form before this pass runs;
 /// accept only its exact signed, ordered select spelling.
-static bool getSelectClampedTileExtent(Value *V, Value *&Difference) {
+static bool getSelectClampedTileExtent(Value *V, Value *&Difference,
+                                       uint64_t &TileMN) {
   auto *Min = dyn_cast<SelectInst>(V);
   auto *MinCmp = Min ? dyn_cast<ICmpInst>(Min->getCondition()) : nullptr;
   auto *TileSize =
       Min ? dyn_cast<ConstantInt>(Min->getFalseValue()) : nullptr;
-  if (!MinCmp || !TileSize || !TileSize->equalsInt(128) ||
+  if (!MinCmp || !TileSize || !isSupportedTileMN(TileSize->getZExtValue()) ||
       MinCmp->getPredicate() != ICmpInst::ICMP_SLT ||
       MinCmp->getOperand(1) != TileSize ||
       Min->getTrueValue() != MinCmp->getOperand(0))
@@ -684,23 +848,26 @@ static bool getSelectClampedTileExtent(Value *V, Value *&Difference) {
     return false;
 
   Difference = Max->getTrueValue();
+  TileMN = TileSize->getZExtValue();
   return true;
 }
 
-/// Match min(max(Bound - (workgroup.id << 7), 0), 128), which is the
-/// clamp form emitted by Clang for a 128-row or 128-column tile extent.
+/// Match min(max(Bound - (workgroup.id * TileMN), 0), TileMN), the clamp form
+/// emitted by Clang for a TileMN-row or TileMN-column tile extent.
 static bool getClampedTileExtent(Value *V, unsigned Dimension,
                                  CanonicalTileRemainder &Remainder) {
   Value *Difference = nullptr;
+  uint64_t TileMN = 0;
   if (isNamedCall(V, "llvm.smin.") || isNamedCall(V, "llvm.umin.")) {
     auto *Min = cast<CallBase>(V);
     Value *Extent = nullptr;
     bool HasTileSize = false;
     for (Value *Operand : Min->args()) {
       if (auto *C = dyn_cast<ConstantInt>(Operand)) {
-        if (!C->equalsInt(128) || HasTileSize)
+        if (!isSupportedTileMN(C->getZExtValue()) || HasTileSize)
           return false;
         HasTileSize = true;
+        TileMN = C->getZExtValue();
       } else {
         if (Extent)
           return false;
@@ -725,16 +892,18 @@ static bool getClampedTileExtent(Value *V, unsigned Dimension,
     }
     if (!HasZero)
       return false;
-  } else if (!getSelectClampedTileExtent(V, Difference)) {
+  } else if (!getSelectClampedTileExtent(V, Difference, TileMN)) {
     return false;
   }
 
   auto *Sub = dyn_cast<BinaryOperator>(Difference);
+  uint64_t BaseTileMN = 0;
   if (!Sub || Sub->getOpcode() != Instruction::Sub ||
-      !isWorkgroupShiftBy7OrExtend(Sub->getOperand(1), Dimension))
+      !getWorkgroupTileBase(Sub->getOperand(1), Dimension, BaseTileMN) ||
+      BaseTileMN != TileMN)
     return false;
 
-  Remainder = {Dimension, Sub->getOperand(0), Sub->getOperand(1), Sub};
+  Remainder = {Dimension, Sub->getOperand(0), Sub->getOperand(1), Sub, TileMN};
   return true;
 }
 
@@ -997,12 +1166,12 @@ static bool isAlignmentCheck(Value *V, UniformityInfo &UI) {
 }
 
 /// Match the real-GEMM N-edge predicate:
-///   select alignment, (trunc(clamp(N - nbase, 0, 128)) & 252), 0 < 128
+///   select alignment, (trunc(clamp(N - nbase, 0, TileMN)) & ~3), 0 < TileMN
 ///
-/// The synthesized full-N selector proves the clamp is exactly 128, and the
+/// The synthesized full-N selector proves the clamp is exactly TileMN, and the
 /// select's exact alignment input is one of the selector's conjuncts.  Thus
-/// the selected value is 128, not below 128, so the conditional branch takes
-/// its false successor in the cloned prefix.
+/// the selected value is TileMN, not below TileMN, so the conditional branch
+/// takes its false successor in the cloned prefix.
 static bool isFullNEdgeFallbackCheck(
     Value *V, ArrayRef<FullTileBoundCheck> FullChecks,
     ArrayRef<Value *> Alignments) {
@@ -1011,8 +1180,9 @@ static bool isFullNEdgeFallbackCheck(
     return false;
   auto *Limit = dyn_cast<ConstantInt>(Cmp->getOperand(1));
   auto *Select = dyn_cast<SelectInst>(Cmp->getOperand(0));
-  if (!Limit || !Limit->equalsInt(128) || !Select)
+  if (!Limit || !Select || !isSupportedTileMN(Limit->getZExtValue()))
     return false;
+  const uint64_t TileMN = Limit->getZExtValue();
   bool IsSelectorAlignment = false;
   for (Value *Alignment : Alignments)
     IsSelectorAlignment |= Alignment == Select->getCondition();
@@ -1031,15 +1201,18 @@ static bool isFullNEdgeFallbackCheck(
     Mask = dyn_cast<ConstantInt>(Masked->getOperand(0));
   }
   auto *Trunc = dyn_cast<TruncInst>(ExtentTrunc);
-  if (!Mask || !Mask->equalsInt(252) || !Trunc)
+  // 252 = TileMN-4 for TileMN=128; for smaller tiles accept any mask that
+  // clears the low 2 bits of a value known to equal TileMN.
+  if (!Mask || (Mask->getZExtValue() & 3) != 0 || !Trunc)
     return false;
 
   for (const FullTileBoundCheck &Full : FullChecks) {
-    if (Full.Dimension != 0)
+    if (Full.Dimension != 0 || Full.TileMN != TileMN)
       continue;
     CanonicalTileRemainder NExtent;
     if (getClampedTileExtent(Trunc->getOperand(0), 0, NExtent) &&
-        NExtent.Bound == Full.Bound && NExtent.Base == Full.Base)
+        NExtent.Bound == Full.Bound && NExtent.Base == Full.Base &&
+        NExtent.TileMN == TileMN)
       return true;
   }
   return false;
@@ -1408,7 +1581,8 @@ static bool collectDirectInteriorTileBounds(
                    CanonicalTileRemainder &Recorded, bool &HasRecorded) {
     if (HasRecorded)
       return Recorded.Bound == Remainder.Bound &&
-             Recorded.Base == Remainder.Base;
+             Recorded.Base == Remainder.Base &&
+             Recorded.TileMN == Remainder.TileMN;
     Recorded = Remainder;
     HasRecorded = true;
     return true;
@@ -1417,64 +1591,19 @@ static bool collectDirectInteriorTileBounds(
     auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
     if (!Branch || !Branch->isConditional())
       continue;
-    SmallPtrSet<Value *, 16> Visited;
-    if (getIDDependencies(Branch->getCondition(), Visited) &
-        DependsOnWorkgroupID) {
-      LLVM_DEBUG(dbgs() << "Interior direct-bound candidate: "
-                        << *Branch->getCondition() << '\n');
-      if (auto *Select = dyn_cast<SelectInst>(Branch->getCondition())) {
-        if (auto *Guard = dyn_cast<Instruction>(Select->getCondition())) {
-          LLVM_DEBUG(dbgs() << "  conjunction guard: " << *Guard << '\n');
-          if (auto *Cmp = dyn_cast<ICmpInst>(Guard))
-            if (auto *Index = dyn_cast<Instruction>(Cmp->getOperand(0))) {
-              LLVM_DEBUG(dbgs() << "  guard index: " << *Index << '\n');
-              if (auto *Binary = dyn_cast<BinaryOperator>(Index)) {
-                for (Value *Operand : Binary->operands()) {
-                  if (auto *Definition = dyn_cast<Instruction>(Operand))
-                    LLVM_DEBUG(dbgs() << "  guard index operand: "
-                                      << *Definition << '\n');
-                  if (auto *Definition = dyn_cast<BinaryOperator>(Operand)) {
-                    for (Value *Input : Definition->operands()) {
-                      if (auto *InputDefinition =
-                              dyn_cast<Instruction>(Input))
-                        LLVM_DEBUG(dbgs() << "  guard index input: "
-                                          << *InputDefinition << '\n');
-                      if (auto *Phi = dyn_cast<PHINode>(Input))
-                        for (Value *Incoming : Phi->incoming_values())
-                          if (auto *IncomingDefinition =
-                                  dyn_cast<Instruction>(Incoming))
-                            LLVM_DEBUG(dbgs()
-                                       << "  guard index phi input: "
-                                       << *IncomingDefinition << '\n');
-                    }
-                  }
-                  if (auto *Phi = dyn_cast<PHINode>(Operand))
-                    for (Value *Incoming : Phi->incoming_values())
-                      if (auto *IncomingDefinition =
-                              dyn_cast<Instruction>(Incoming))
-                        LLVM_DEBUG(dbgs() << "  guard index phi input: "
-                                          << *IncomingDefinition << '\n');
-                }
-              }
-            }
-        }
-        if (auto *Check = dyn_cast<Instruction>(Select->getTrueValue())) {
-          LLVM_DEBUG(dbgs() << "  conjunction check: " << *Check << '\n');
-          if (auto *Cmp = dyn_cast<ICmpInst>(Check))
-            if (auto *Index = dyn_cast<Instruction>(Cmp->getOperand(0)))
-              LLVM_DEBUG(dbgs() << "  check index: " << *Index << '\n');
-        }
-      }
-    }
     CanonicalTileRemainder Remainder;
     if (getDirectTileBoundCheck(Branch->getCondition(), 1, UI, SE, LI,
-                                Remainder)) {
+                                Remainder) ||
+        getUniformFullTileBoundCheck(Branch->getCondition(), 1, UI,
+                                      Remainder)) {
       HasDirectM = true;
       if (!Record(Remainder, M, HasM))
         return false;
     }
     if (getDirectTileBoundCheck(Branch->getCondition(), 0, UI, SE, LI,
-                                Remainder)) {
+                                Remainder) ||
+        getUniformFullTileBoundCheck(Branch->getCondition(), 0, UI,
+                                      Remainder)) {
       HasDirectN = true;
       if (!Record(Remainder, N, HasN))
         return false;
@@ -1488,28 +1617,28 @@ static bool collectDirectInteriorTileBounds(
 static Value *synthesizeInteriorTileSelector(
     BasicBlock *Preheader, const CanonicalTileRemainder &M,
     const CanonicalTileRemainder &N, ArrayRef<Value *> Alignments) {
-  if (M.Bound->getType() != N.Bound->getType())
+  if (M.Bound->getType() != N.Bound->getType() || !M.TileMN || !N.TileMN)
     return nullptr;
 
   IRBuilder<> Builder(Preheader->getTerminator());
   // The source extents use signed min/max.  Do not infer signed arithmetic
   // facts from their wrapping subtraction: require a nonnegative bound and
-  // prove Base <= Bound - 128 directly.  This makes Base + every matched
-  // nonnegative lane offset below 128 a defined signed in-bounds index.
+  // prove Base <= Bound - TileMN directly.  This makes Base + every matched
+  // nonnegative lane offset below TileMN a defined signed in-bounds index.
   Value *MPositive = Builder.CreateICmpSGE(
-      M.Bound, ConstantInt::get(M.Bound->getType(), 128),
+      M.Bound, ConstantInt::get(M.Bound->getType(), M.TileMN),
       "interior.m.nonnegative");
   Value *MFull = Builder.CreateICmpSLE(
       M.Base, Builder.CreateSub(M.Bound,
-                                ConstantInt::get(M.Bound->getType(), 128)),
+                                ConstantInt::get(M.Bound->getType(), M.TileMN)),
       "interior.m.full");
   MFull = Builder.CreateAnd(MPositive, MFull, "interior.m.tile");
   Value *NPositive = Builder.CreateICmpSGE(
-      N.Bound, ConstantInt::get(N.Bound->getType(), 128),
+      N.Bound, ConstantInt::get(N.Bound->getType(), N.TileMN),
       "interior.n.nonnegative");
   Value *NFull = Builder.CreateICmpSLE(
       N.Base, Builder.CreateSub(N.Bound,
-                                ConstantInt::get(N.Bound->getType(), 128)),
+                                ConstantInt::get(N.Bound->getType(), N.TileMN)),
       "interior.n.full");
   NFull = Builder.CreateAnd(NPositive, NFull, "interior.n.tile");
   Value *MNFull = Builder.CreateAnd(MFull, NFull, "interior.mn.full");
@@ -3187,6 +3316,11 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
   return true;
 }
 
+static bool specializeInteriorEpilogueStores(
+    Function &F, Loop *L, Value *MNFull,
+    ArrayRef<FullTileBoundCheck> FullChecks, ArrayRef<Value *> DirectGuards,
+    DominatorTree &DT, LoopInfo &LI, ScalarEvolution &SE);
+
 /// Version only the guarded staging prefix of one outer-K iteration.  The
 /// shared barrier is the reconvergence point: both CTA-uniform dispatch paths
 /// execute it, then flow to the original compute and outer latch.  This is
@@ -3246,8 +3380,8 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
   SmallVector<FullTileBoundCheck, 2> FullChecks{
-      {M.Dimension, M.Bound, M.Base, /*IsSigned=*/true},
-      {N.Dimension, N.Bound, N.Base, /*IsSigned=*/true}};
+      {M.Dimension, M.Bound, M.Base, /*IsSigned=*/true, M.TileMN},
+      {N.Dimension, N.Bound, N.Base, /*IsSigned=*/true, N.TileMN}};
   SmallVector<Value *, 2> DirectGuards{M.Difference, N.Difference};
 
   // First prove the old CFG, before changing it.  The candidate must end at a
@@ -3341,6 +3475,13 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
                       << StagingEntry->getName()
                       << ": region=" << RegionOk << " barrier=" << BarrierOk
                       << " exits=" << ExitsOk << " clone=" << CloneOk << '\n');
+    // Undo the fallthrough split when it is still a trivial single-pred /
+    // single-succ edge so we do not leave a mutated CFG after declining.
+    if (StagingEntry->getSinglePredecessor() == Dispatch &&
+        Dispatch->getSingleSuccessor() == StagingEntry)
+      MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,
+                                /*MSSAU=*/nullptr, /*MemDep=*/nullptr,
+                                /*PredecessorWithTwoSuccessors=*/false, &DT);
     return false;
   }
 
@@ -3386,7 +3527,152 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   if (Changed && HasNestedStagingLoop)
     LLVM_DEBUG(dbgs() << "Cloned nested-loop staging region in " << F.getName()
                       << "; outer K latch and shared barrier were retained\n");
+  // Specialize the post-loop store epilogue behind the same CTA-uniform M/N
+  // selector. Staging clone alone leaves per-element exec-masked C stores on
+  // the common path — the gap the SASS comparisons rank as Priority-1 after
+  // staging is cleaned up.
+  if (Changed)
+    Changed |= specializeInteriorEpilogueStores(F, L, MNFull, FullChecks,
+                                                DirectGuards, DT, LI, SE);
   return Changed;
+}
+
+/// Clone the store epilogue after the outer K loop behind \p MNFull and strip
+/// proven M/N lane guards on the interior copy.
+static bool specializeInteriorEpilogueStores(
+    Function &F, Loop *L, Value *MNFull,
+    ArrayRef<FullTileBoundCheck> FullChecks, ArrayRef<Value *> DirectGuards,
+    DominatorTree &DT, LoopInfo &LI, ScalarEvolution &SE) {
+  BasicBlock *Exit = L->getUniqueExitBlock();
+  if (!Exit || !MNFull)
+    return false;
+
+  // Epilogue starts at the unique successor of the loop exit, when that edge
+  // is unambiguous.
+  auto *ExitBr = dyn_cast<BranchInst>(Exit->getTerminator());
+  if (!ExitBr || ExitBr->isConditional() || ExitBr->getNumSuccessors() != 1)
+    return false;
+  BasicBlock *EpilogueEntry = ExitBr->getSuccessor(0);
+  if (L->contains(EpilogueEntry))
+    return false;
+
+  SmallPtrSet<BasicBlock *, 8> Region;
+  SmallVector<BasicBlock *, 8> Worklist{EpilogueEntry};
+  Region.insert(EpilogueEntry);
+  bool HasStore = false;
+  bool HasRemovableGuard = false;
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.pop_back_val();
+    for (Instruction &I : *BB) {
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (SI->getValueOperand()->getType()->isFloatTy() ||
+            SI->getValueOperand()->getType()->isVectorTy())
+          HasStore = true;
+    }
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    if (Br && Br->isConditional()) {
+      GuardOutcome Outcome;
+      if (getRemovableSafetyBranchOutcome(Br, FullChecks, SE, Outcome) ||
+          getInteriorConjunctionRemainder(Br->getCondition(), DirectGuards))
+        HasRemovableGuard = true;
+    }
+    for (BasicBlock *Succ : successors(BB)) {
+      if (L->contains(Succ) || isa<ReturnInst>(Succ->getTerminator()))
+        continue;
+      // Stay within a simple forward region: no entries from outside.
+      bool ExternalPred = false;
+      for (BasicBlock *Pred : predecessors(Succ))
+        if (Pred != BB && !Region.contains(Pred) && Pred != Exit)
+          ExternalPred = true;
+      if (ExternalPred)
+        continue;
+      if (Region.insert(Succ).second)
+        Worklist.push_back(Succ);
+    }
+  }
+  if (!HasStore || !HasRemovableGuard || Region.size() > MaxStagingCloneBlocks)
+    return false;
+
+  // Reject if any region block has a PHI needing path merges from outside.
+  for (BasicBlock *BB : Region)
+    for (PHINode &PN : BB->phis())
+      for (unsigned I = 0, E = PN.getNumIncomingValues(); I != E; ++I)
+        if (!Region.contains(PN.getIncomingBlock(I)) &&
+            PN.getIncomingBlock(I) != Exit)
+          return false;
+
+  BasicBlock *Dispatch = SplitEdge(Exit, EpilogueEntry, &DT, &LI);
+  if (!Dispatch)
+    return false;
+  auto *DispatchBr = cast<BranchInst>(Dispatch->getTerminator());
+  BranchInst::Create(EpilogueEntry, EpilogueEntry, MNFull, DispatchBr);
+  DispatchBr->eraseFromParent();
+  auto *NewDispatch = cast<BranchInst>(Dispatch->getTerminator());
+
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 8> RegionBlocks(Region.begin(), Region.end());
+  // Stable order: function order.
+  RegionBlocks.clear();
+  for (BasicBlock &BB : F)
+    if (Region.contains(&BB))
+      RegionBlocks.push_back(&BB);
+
+  for (BasicBlock *BB : RegionBlocks) {
+    BasicBlock *Clone = CloneBasicBlock(BB, VMap, ".interior", &F);
+    VMap[BB] = Clone;
+  }
+  for (BasicBlock *BB : RegionBlocks) {
+    BasicBlock *Clone = cast<BasicBlock>(VMap[BB]);
+    for (Instruction &I : *Clone)
+      RemapInstruction(&I, VMap, RF_IgnoreMissingLocals);
+  }
+
+  unsigned Removed = 0;
+  for (BasicBlock *BB : RegionBlocks) {
+    auto *OriginalBranch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!OriginalBranch || !OriginalBranch->isConditional())
+      continue;
+    if (Value *Remainder = getInteriorConjunctionRemainder(
+            OriginalBranch->getCondition(), DirectGuards)) {
+      auto *ClonedBranch =
+          cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
+      Value *ClonedRemainder = Remainder;
+      if (Value *Mapped = VMap.lookup(Remainder))
+        ClonedRemainder = Mapped;
+      ClonedBranch->setCondition(ClonedRemainder);
+      ++Removed;
+      continue;
+    }
+    GuardOutcome Outcome;
+    if (!getRemovableSafetyBranchOutcome(OriginalBranch, FullChecks, SE,
+                                         Outcome))
+      continue;
+    auto *ClonedBranch =
+        cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
+    BranchInst::Create(
+        ClonedBranch->getSuccessor(static_cast<unsigned>(Outcome)),
+        ClonedBranch);
+    ClonedBranch->eraseFromParent();
+    ++Removed;
+  }
+  if (!Removed) {
+    // No guards stripped — delete clones and leave the fallthrough dispatch.
+    for (BasicBlock *BB : RegionBlocks)
+      if (auto *Clone = dyn_cast_or_null<BasicBlock>(VMap[BB]))
+        Clone->eraseFromParent();
+    if (EpilogueEntry->getSinglePredecessor() == Dispatch &&
+        Dispatch->getSingleSuccessor() == EpilogueEntry)
+      MergeBlockIntoPredecessor(EpilogueEntry, /*DTU=*/nullptr, &LI,
+                                /*MSSAU=*/nullptr, /*MemDep=*/nullptr,
+                                /*PredecessorWithTwoSuccessors=*/false, &DT);
+    return false;
+  }
+
+  NewDispatch->setSuccessor(0, cast<BasicBlock>(VMap[EpilogueEntry]));
+  LLVM_DEBUG(dbgs() << "Specialized interior store epilogue in " << F.getName()
+                    << "; removed " << Removed
+                    << " proven M/N store guard(s)\n");
+  return true;
 }
 
 static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
