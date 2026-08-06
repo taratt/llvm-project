@@ -648,7 +648,7 @@ static cl::opt<bool> EnableUniformIntrinsicCombine(
 static cl::opt<bool> EnableInteriorTileSplit(
     "amdgpu-enable-interior-tile-split",
     cl::desc("Identify and specialize AMDGPU interior tile regions"),
-    cl::init(true), cl::Hidden);
+    cl::init(false), cl::Hidden);
 
 static cl::opt<bool> EnableBMMInteriorSpecialization(
     "amdgpu-enable-bmm-interior-specialization",
