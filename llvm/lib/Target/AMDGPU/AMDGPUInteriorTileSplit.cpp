@@ -73,7 +73,7 @@ namespace {
 static cl::opt<unsigned> MaxStagingCloneBlocks(
     "amdgpu-interior-tile-max-staging-blocks",
     cl::desc("Max blocks allowed when cloning an interior staging region"),
-    cl::init(48), cl::Hidden);
+    cl::init(96), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
