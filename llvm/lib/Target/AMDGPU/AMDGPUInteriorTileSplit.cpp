@@ -3300,14 +3300,6 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
     return false;
   }
 
-  Value *MNFull = synthesizeInteriorTileSelector(Preheader, M, N, Alignments);
-  if (!MNFull) {
-    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
-                      << L->getHeader()->getName()
-                      << ": could not synthesize full M/N selector\n");
-    return false;
-  }
-
   // A real GEMM puts staging control in the outer K header.  Split the header
   // only at its terminator, retaining every PHI and setup instruction in the
   // shared dispatch.  This keeps header values used after the shared barrier
@@ -3328,23 +3320,36 @@ static bool splitOuterKStaging(Function &F, Loop *L, UniformityInfo &UI,
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
   BasicBlock *SharedBarrier = nullptr;
-  // Re-derive the region on the just-split CFG. The preflight above proved it
-  // on the original blocks, but SplitBlock/SplitEdge can perturb the shape
-  // enough that it no longer reproduces (e.g. header-split GEMMs). Both splits
-  // are semantics-preserving, so if the region no longer matches we decline the
-  // transform instead of aborting the compiler. The split blocks stay behind,
-  // so we must still report the function as changed for analysis invalidation;
-  // later CFG simplification folds the now-empty dispatch away.
-  if (!findClosedStagingRegion(StagingEntry, Dispatch, Region, SharedBarrier,
-                               /*AllowNestedLoops=*/true) ||
-      SharedBarrier != Barrier ||
-      !hasOnlySharedBarrierExits(L, Region, SharedBarrier) ||
-      !canCloneStagingRegion(StagingEntry, Region, SharedBarrier, FullChecks,
-                             DirectGuards, Alignments, IV, Bound, SE)) {
-    LLVM_DEBUG(dbgs() << "Interior staging preflight abandoned at "
+  // SplitBlock / SplitEdge can leave a CFG that no longer matches the
+  // preflight view: header-anchored candidates ignore entry live-outs and
+  // external predecessors until the terminator is peeled off, and nested
+  // staging graphs (tall/skinny GEMM) may then fail the closed-region or
+  // clone-safety recheck.  The inserted dispatch block is a no-op fallthrough,
+  // so bail out cleanly instead of aborting the compiler.
+  const bool RegionOk = findClosedStagingRegion(
+      StagingEntry, Dispatch, Region, SharedBarrier,
+      /*AllowNestedLoops=*/true);
+  const bool BarrierOk = RegionOk && SharedBarrier == Barrier;
+  const bool ExitsOk =
+      BarrierOk && hasOnlySharedBarrierExits(L, Region, SharedBarrier);
+  const bool CloneOk =
+      ExitsOk && canCloneStagingRegion(StagingEntry, Region, SharedBarrier,
+                                       FullChecks, DirectGuards, Alignments, IV,
+                                       Bound, SE);
+  if (!CloneOk) {
+    LLVM_DEBUG(dbgs() << "Interior staging aborted after dispatch split at "
+                      << StagingEntry->getName()
+                      << ": region=" << RegionOk << " barrier=" << BarrierOk
+                      << " exits=" << ExitsOk << " clone=" << CloneOk << '\n');
+    return false;
+  }
+
+  Value *MNFull = synthesizeInteriorTileSelector(Preheader, M, N, Alignments);
+  if (!MNFull) {
+    LLVM_DEBUG(dbgs() << "Interior staging preflight rejected "
                       << L->getHeader()->getName()
-                      << ": region did not reproduce after CFG split\n");
-    return true;
+                      << ": could not synthesize full M/N selector\n");
+    return false;
   }
 
   // The new block is inside the outer loop, so this full-K predicate is
