@@ -3850,16 +3850,69 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO) {
       // Inductive ix4 PHIs are self-referential; Visited recursion always fails.
-      // SCEV often still sees a tight unsigned range from rem-style updates.
+      // Prefer SCEV; if that is loose, accept a rem/and init incoming and treat
+      // PN-using updates as rem-induction backedges (hipcc cooperative loops).
       if (auto *PN = dyn_cast<PHINode>(V)) {
-        if (!SE.isSCEVable(PN->getType()))
-          return false;
-        APInt UMax = SE.getUnsignedRangeMax(SE.getSCEV(PN));
-        if (UMax.getBitWidth() <= 64 && UMax.ult(Limit) && UMax.ult(128)) {
-          Max = UMax.getZExtValue();
-          return true;
+        if (SE.isSCEVable(PN->getType())) {
+          APInt UMax = SE.getUnsignedRangeMax(SE.getSCEV(PN));
+          if (UMax.getBitWidth() <= 64 && UMax.ult(Limit) && UMax.ult(128)) {
+            Max = UMax.getZExtValue();
+            return true;
+          }
         }
-        return false;
+        auto UsesPN = [&](Value *In) -> bool {
+          SmallPtrSet<Value *, 8> Seen;
+          SmallVector<Value *, 4> Stack{In};
+          while (!Stack.empty()) {
+            Value *Cur = Stack.pop_back_val();
+            if (Cur == PN)
+              return true;
+            auto *I = dyn_cast<Instruction>(Cur);
+            if (!I || !Seen.insert(Cur).second)
+              continue;
+            if (!isa<BinaryOperator>(I) && !isa<SelectInst>(I) &&
+                !isa<CastInst>(I) && !isa<FreezeInst>(I))
+              continue;
+            for (Value *Op : I->operands())
+              Stack.push_back(Op);
+          }
+          return false;
+        };
+        uint64_t Worst = 0;
+        bool Any = false;
+        for (Value *In : PN->incoming_values()) {
+          if (UsesPN(In))
+            continue;
+          uint64_t Part = 0;
+          if (!Structural(In, Part))
+            return false;
+          Worst = std::max(Worst, Part);
+          Any = true;
+        }
+        if (!Any)
+          return false;
+        Max = Worst;
+        return Max < Limit && Max < 128;
+      }
+      // AMDGPU bitfield extract of a lane index: ubfe(src, 0, Width) < 2^Width.
+      if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+        Intrinsic::ID Id = II->getIntrinsicID();
+        if (Id == Intrinsic::amdgcn_ubfe) {
+          auto *WidthC = dyn_cast<ConstantInt>(II->getArgOperand(2));
+          if (!WidthC || WidthC->getZExtValue() == 0 ||
+              WidthC->getZExtValue() >= 8)
+            return false;
+          Max = (uint64_t(1) << WidthC->getZExtValue()) - 1;
+          return Max < Limit && Max < 128;
+        }
+        if (Id == Intrinsic::umin) {
+          uint64_t A = 0, B = 0;
+          if (!Structural(II->getArgOperand(0), A) ||
+              !Structural(II->getArgOperand(1), B))
+            return false;
+          Max = std::min(A, B);
+          return Max < Limit;
+        }
       }
       return false;
     }
@@ -4266,18 +4319,18 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
             Value *PeeledL = peelIntegerCastsForOffset(LHS);
             uint64_t TmpOff = 0;
             bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
-            LLVM_DEBUG(dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
-                              << "\n    PEEL-rhs: " << *PeeledR
-                              << "\n    PEEL-lhs: " << *PeeledL
-                              << "\n    base-lhs="
-                              << isCTAUniformFootprintBase(LHS, UI)
-                              << " off-rhs=" << OffOK);
+            bool BaseOK = isCTAUniformFootprintBase(LHS, UI);
+            // Use errs() so hipcc always surfaces this even if debug filtering
+            // drops mid-stream LLVM_DEBUG lines.
+            errs() << "  CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
             if (OffOK)
-              LLVM_DEBUG(dbgs() << " off-max=" << TmpOff);
-            LLVM_DEBUG(dbgs() << '\n');
+              errs() << " off-max=" << TmpOff;
+            errs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
             if (auto *PI = dyn_cast<Instruction>(PeeledR))
-              LLVM_DEBUG(dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName()
-                                << '\n');
+              errs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+            errs() << "    PEEL-lhs: " << *PeeledL << '\n';
+            LLVM_DEBUG(dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
+                              << '\n');
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
