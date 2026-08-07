@@ -56,6 +56,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 
@@ -96,13 +97,6 @@ static cl::opt<bool> ConvFootprintDiag(
     "amdgpu-interior-conv-diag",
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
     cl::init(false), cl::Hidden);
-
-/// Write each function's IR when the pass runs. Survives when -print-before
-/// matches neither the legacy nor new-PM pass id.
-static cl::opt<std::string> InteriorTileSplitDumpIR(
-    "amdgpu-interior-tile-split-dump-ir",
-    cl::desc("Append function IR to this path when interior-tile-split runs"),
-    cl::init(""), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
@@ -5046,17 +5040,22 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  if (!InteriorTileSplitDumpIR.empty()) {
-    std::error_code EC;
-    raw_fd_ostream OS(InteriorTileSplitDumpIR, EC,
-                      sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
-    if (!EC) {
-      OS << "; *** IR Dump Before amdgpu-interior-tile-split on "
-         << F.getName() << " ***\n";
-      F.print(OS);
-      OS << '\n';
-    } else {
-      errs() << "amdgpu-interior-tile-split-dump-ir: " << EC.message() << '\n';
+  // HIP forwards -mllvm to ld.lld; unknown options abort the link. Use an
+  // env var so device IR can be captured without a linker-visible cl::opt.
+  if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
+    if (DumpPath[0] != '\0') {
+      std::error_code EC;
+      raw_fd_ostream OS(DumpPath, EC,
+                        sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
+      if (!EC) {
+        OS << "; *** IR Dump Before amdgpu-interior-tile-split on "
+           << F.getName() << " ***\n";
+        F.print(OS);
+        OS << '\n';
+      } else {
+        errs() << "AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR: " << EC.message()
+               << '\n';
+      }
     }
   }
 
