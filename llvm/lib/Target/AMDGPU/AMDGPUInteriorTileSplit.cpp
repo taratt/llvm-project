@@ -3790,6 +3790,14 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     }
     if (auto *Fr = dyn_cast<FreezeInst>(V))
       return Structural(Fr->getOperand(0), Max);
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      uint64_t TMax = 0, FMax = 0;
+      if (!Structural(Sel->getTrueValue(), TMax) ||
+          !Structural(Sel->getFalseValue(), FMax))
+        return false;
+      Max = std::max(TMax, FMax);
+      return Max < Limit;
+    }
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO) {
       // PHI of structurally-bounded values (LSR/indvar forms of ix4).
@@ -4210,9 +4218,12 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
             LLVM_DEBUG(dbgs() << "    lhs: " << *BO->getOperand(0)
                               << "\n    rhs: " << *BO->getOperand(1) << '\n');
             Value *PeeledR = peelIntegerCastsForOffset(BO->getOperand(1));
-            LLVM_DEBUG(dbgs() << "    rhs.peeled: " << *PeeledR << '\n');
+            LLVM_DEBUG(dbgs() << "    PEEL-rhs: " << *PeeledR << '\n');
+            if (auto *PI = dyn_cast<Instruction>(PeeledR))
+              LLVM_DEBUG(dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName()
+                                << '\n');
             Value *PeeledL = peelIntegerCastsForOffset(BO->getOperand(0));
-            LLVM_DEBUG(dbgs() << "    lhs.peeled: " << *PeeledL << '\n');
+            LLVM_DEBUG(dbgs() << "    PEEL-lhs: " << *PeeledL << '\n');
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
