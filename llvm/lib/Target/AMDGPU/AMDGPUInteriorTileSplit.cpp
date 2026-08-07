@@ -4320,33 +4320,11 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   return true;
 }
 
-/// Dump peel chains for failed conv offsets. Narrow zext/trunc RHS failures
-/// always go to errs() so fanl sees them even when -debug-only is paired with
-/// a stale object, and when -print-before matches nothing.
+/// Dump peel chains for failed conv offsets. Always to errs() — fanl's HIP
+/// device compile can sandbox /tmp writes, and -print-before never matches.
 static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
                                Value *PeeledL, bool BaseOK, bool OffOK,
                                uint64_t TmpOff) {
-  auto IsNarrowCast = [](Value *V) {
-    auto *C = dyn_cast<CastInst>(V);
-    return C && (C->getOpcode() == Instruction::ZExt ||
-                 C->getOpcode() == Instruction::Trunc ||
-                 C->getOpcode() == Instruction::SExt);
-  };
-  const bool Force =
-      ConvFootprintDiag || IsNarrowCast(RHS) || IsNarrowCast(LHS);
-  if (!Force) {
-    LLVM_DEBUG({
-      dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
-             << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
-      if (OffOK)
-        dbgs() << " off-max=" << TmpOff;
-      dbgs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
-      if (auto *PI = dyn_cast<Instruction>(PeeledR))
-        dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
-      dbgs() << "    PEEL-lhs: " << *PeeledL << '\n';
-    });
-    return;
-  }
   raw_ostream &OS = errs();
   OS << "  CONV-OFFSET-FAIL\n    lhs: " << *LHS << "\n    rhs: " << *RHS
      << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
@@ -4355,16 +4333,27 @@ static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
   OS << "\n    PEEL-rhs: " << *PeeledR << '\n';
   if (auto *PI = dyn_cast<Instruction>(PeeledR)) {
     OS << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+    if (auto *PN = dyn_cast<PHINode>(PI)) {
+      for (unsigned I = 0, E = PN->getNumIncomingValues(); I < E; ++I)
+        OS << "      phi-in" << I << ": " << *PN->getIncomingValue(I) << '\n';
+    }
     unsigned N = 0;
     for (Value *Op : PI->operands()) {
       OS << "      peel-opnd" << N++ << ": " << *Op << '\n';
       if (auto *OI = dyn_cast<Instruction>(Op)) {
         OS << "        peel-opnd-def: " << OI->getOpcodeName();
-        unsigned M = 0;
-        for (Value *Op2 : OI->operands()) {
-          OS << "\n          op" << M++ << ": " << *Op2;
-          if (M >= 3)
-            break;
+        if (auto *OPN = dyn_cast<PHINode>(OI)) {
+          for (unsigned I = 0, E = OPN->getNumIncomingValues(); I < E; ++I)
+            OS << "\n          phi-in" << I << ": " << *OPN->getIncomingValue(I);
+        } else {
+          unsigned M = 0;
+          for (Value *Op2 : OI->operands()) {
+            OS << "\n          op" << M++ << ": " << *Op2;
+            if (auto *OI2 = dyn_cast<Instruction>(Op2))
+              OS << " [" << OI2->getOpcodeName() << "]";
+            if (M >= 4)
+              break;
+          }
         }
         OS << '\n';
       }
@@ -5040,24 +5029,31 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  // HIP forwards unknown -mllvm opts to ld.lld (abort). Capture IR via env.
-  // Always print a heartbeat when the env is set so a silent -c / LTO miss is
-  // obvious in the compile log.
+  // HIP may sandbox absolute /tmp writes during device compile. Prefer a
+  // relative path; fall back to printing a short note (peel dumps go to errs).
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
     if (DumpPath[0] != '\0') {
-      errs() << "ITS-DUMP: pass running on '" << F.getName()
-             << "' cc=" << F.getCallingConv() << " -> " << DumpPath << '\n';
-      std::error_code EC;
-      raw_fd_ostream OS(DumpPath, EC,
-                        sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
-      if (!EC) {
+      errs() << "ITS-DUMP: pass running on " << F.getName()
+             << " cc=" << F.getCallingConv() << " path=" << DumpPath << '\n';
+      auto TryWrite = [&](StringRef Path) -> bool {
+        std::error_code EC;
+        raw_fd_ostream OS(Path, EC, sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
+        if (EC) {
+          errs() << "ITS-DUMP: open failed path=" << Path
+                 << " ec=" << EC.value() << " msg=" << EC.message() << '\n';
+          return false;
+        }
         OS << "; *** IR Dump Before amdgpu-interior-tile-split on "
            << F.getName() << " ***\n";
         F.print(OS);
         OS << '\n';
         OS.flush();
-      } else {
-        errs() << "ITS-DUMP: open failed: " << EC.message() << '\n';
+        errs() << "ITS-DUMP: wrote " << Path << '\n';
+        return true;
+      };
+      if (!TryWrite(DumpPath)) {
+        // Sandbox often allows CWD.
+        TryWrite("amdgpu-its-before.ll");
       }
     }
   }
