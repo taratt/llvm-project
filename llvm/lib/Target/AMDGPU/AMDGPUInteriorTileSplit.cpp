@@ -3825,7 +3825,8 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       Max = Mask->getZExtValue();
       // Reject full-byte tid masks (255) that make H=224 selectors unreachable;
-      // real staging tiles use urem or small and-masks.
+      // real staging tiles use urem or small and-masks.  Also reject the
+      // identity-ish case Max==0.
       return Max >= 1 && Max < Limit && Max < 128;
     }
     case Instruction::UDiv: {
@@ -3871,6 +3872,17 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       if (OperandMaximum > ((Limit - 1) >> Shift))
         return false;
       Max = OperandMaximum << Shift;
+      return Max < Limit;
+    }
+    case Instruction::LShr: {
+      auto *Amount = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Amount || Amount->getZExtValue() >= 32)
+        return false;
+      uint64_t Shift = Amount->getZExtValue();
+      uint64_t OperandMaximum = 0;
+      if (!Structural(BO->getOperand(0), OperandMaximum))
+        return false;
+      Max = OperandMaximum >> Shift;
       return Max < Limit;
     }
     case Instruction::Sub: {
@@ -4025,6 +4037,9 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
       return Recurse(Fr->getOperand(0), Base, OffMax);
 
     if (UI.isUniformAtDef(V)) {
+      // Constants are uniform but are never a CTA footprint Base.
+      if (isa<Constant>(V))
+        return false;
       Base = peelTrivialBase(V);
       OffMax = 0;
       return true;
@@ -4042,8 +4057,8 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
         U = BO->getOperand(1);
         C = dyn_cast<ConstantInt>(BO->getOperand(0));
       }
-      if (C && UI.isUniformAtDef(U)) {
-        Base = peelTrivialBase(BO);
+      if (C && !isa<Constant>(U) && UI.isUniformAtDef(U)) {
+        Base = BO;
         OffMax = 0;
         return true;
       }
