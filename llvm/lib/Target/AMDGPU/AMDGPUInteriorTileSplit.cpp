@@ -3709,11 +3709,9 @@ static Value *peelTrivialBase(Value *V) {
         continue;
       }
     }
-    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
-      if (II->getIntrinsicID() == Intrinsic::freeze) {
-        V = II->getOperand(0);
-        continue;
-      }
+    if (auto *Fr = dyn_cast<FreezeInst>(V)) {
+      V = Fr->getOperand(0);
+      continue;
     }
     if (auto *BO = dyn_cast<BinaryOperator>(V)) {
       if (BO->getOpcode() == Instruction::Add ||
@@ -3764,11 +3762,8 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       return Structural(Cast->getOperand(0), Max);
     }
-    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
-      if (II->getIntrinsicID() == Intrinsic::freeze)
-        return Structural(II->getOperand(0), Max);
-      return false;
-    }
+    if (auto *Fr = dyn_cast<FreezeInst>(V))
+      return Structural(Fr->getOperand(0), Max);
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO) {
       // PHI of structurally-bounded values (LSR/indvar forms of ix4).
@@ -3946,9 +3941,8 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO || (BO->getOpcode() != Instruction::Add &&
                 BO->getOpcode() != Instruction::Or)) {
-      if (auto *II = dyn_cast<IntrinsicInst>(V))
-        if (II->getIntrinsicID() == Intrinsic::freeze)
-          return Recurse(II->getOperand(0), Base, OffMax);
+      if (auto *Fr = dyn_cast<FreezeInst>(V))
+        return Recurse(Fr->getOperand(0), Base, OffMax);
       return false;
     }
 
