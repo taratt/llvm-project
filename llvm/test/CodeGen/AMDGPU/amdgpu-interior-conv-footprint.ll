@@ -14,6 +14,7 @@ declare i32 @llvm.amdgcn.workgroup.id.y()
 declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier()
 
+; DBG: Conv footprint recovered {{[2-9]}} dims from {{[2-9]}} bases
 ; DBG: Cloned conv footprint interior staging in conv_footprint_staging
 
 define amdgpu_kernel void @conv_footprint_staging(ptr addrspace(1) %in,

@@ -127,6 +127,20 @@ static unsigned getIDDependencies(Value *V,
   return Dependencies;
 }
 
+/// CTA-uniform footprint bases are workgroup-tiled (`in_x0 = ox_tile*... - PAD`).
+/// UniformityAnalysis sometimes misses `add/sub` of those; accept values whose
+/// only ID dependency is workgroup.id (never workitem.id).
+static bool isCTAUniformFootprintBase(Value *V, UniformityInfo &UI) {
+  if (UI.isUniformAtDef(V))
+    return true;
+  if (!V->getType()->isIntegerTy() || isa<Constant>(V))
+    return false;
+  SmallPtrSet<Value *, 16> Visited;
+  unsigned Deps = getIDDependencies(V, Visited);
+  return (Deps & DependsOnWorkitemID) == 0 &&
+         (Deps & DependsOnWorkgroupID) != 0;
+}
+
 static bool isWorkgroupID(Value *V, unsigned Dimension) {
   auto *II = dyn_cast<IntrinsicInst>(V);
   if (!II)
@@ -401,7 +415,8 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
 
   if (auto *Cast = dyn_cast<CastInst>(Offset)) {
     if (Cast->getOpcode() != Instruction::ZExt &&
-        Cast->getOpcode() != Instruction::SExt)
+        Cast->getOpcode() != Instruction::SExt &&
+        Cast->getOpcode() != Instruction::Trunc)
       return false;
     uint64_t OperandMaximum;
     if (!getUnsignedOffsetMaximumBelow(Cast->getOperand(0), Limit, SE,
@@ -412,6 +427,16 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       if (Width > 64 ||
           OperandMaximum >= (uint64_t(1) << (Width - 1)))
         return false;
+    }
+    if (Cast->getOpcode() == Instruction::Trunc) {
+      // Hipcc often does `zext i16 (trunc (shl (urem ...)))`; prove through
+      // the narrow value so guard stripping matches footprint matching.
+      unsigned DestWidth = Cast->getType()->getIntegerBitWidth();
+      if (DestWidth >= 64)
+        return false;
+      uint64_t TruncCap = (uint64_t(1) << DestWidth) - 1;
+      Maximum = std::min(OperandMaximum, TruncCap);
+      return Maximum < Limit;
     }
     Maximum = OperandMaximum;
     return true;
@@ -432,6 +457,21 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       Maximum = OperandMaximum >> ShiftAmount;
       return true;
+    }
+    if (Shift->getOpcode() == Instruction::Shl) {
+      // Same shape as conv matching: `shl nuw nsw (urem %lane, C), 2`.
+      auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+      if (!Amount || Amount->getZExtValue() >= 10)
+        return false;
+      uint64_t ShiftAmount = Amount->getZExtValue();
+      uint64_t OperandMaximum = 0;
+      if (!getUnsignedOffsetMaximumBelow(Shift->getOperand(0), Limit, SE,
+                                         OperandMaximum))
+        return false;
+      if (OperandMaximum > ((Limit - 1) >> ShiftAmount))
+        return false;
+      Maximum = OperandMaximum << ShiftAmount;
+      return Maximum < Limit;
     }
     if (Shift->getOpcode() == Instruction::URem) {
       auto *Divisor = dyn_cast<ConstantInt>(Shift->getOperand(1));
@@ -620,8 +660,11 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
       return false;
     if (auto *Cast = dyn_cast<CastInst>(Cur))
       if (Cast->getOpcode() == Instruction::SExt ||
-          Cast->getOpcode() == Instruction::ZExt)
+          Cast->getOpcode() == Instruction::ZExt ||
+          Cast->getOpcode() == Instruction::Trunc)
         return MatchesBase(Cast->getOperand(0), OffMax);
+    if (auto *Fr = dyn_cast<FreezeInst>(Cur))
+      return MatchesBase(Fr->getOperand(0), OffMax);
     if (Cur == Full.Base) {
       OffMax = 0;
       return true;
@@ -631,6 +674,8 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
                  Add->getOpcode() != Instruction::Or))
       return false;
     uint64_t InnerOff = 0, SideOff = 0;
+    // Prefer the same structural offset proofs used by conv footprint matching
+    // (zext/trunc/shl/urem). Affine/SCEV remain as fallbacks for GEMM lanes.
     if (MatchesBase(Add->getOperand(0), InnerOff) &&
         ((getAffineLaneMaximum(Add->getOperand(1), SideOff) &&
           SideOff < Full.TileMN) ||
@@ -4044,7 +4089,7 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
     if (auto *Fr = dyn_cast<FreezeInst>(V))
       return Recurse(Fr->getOperand(0), Base, OffMax);
 
-    if (UI.isUniformAtDef(V)) {
+    if (isCTAUniformFootprintBase(V, UI)) {
       // Constants are uniform but are never a CTA footprint Base.
       if (isa<Constant>(V))
         return false;
@@ -4065,7 +4110,7 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
         U = BO->getOperand(1);
         C = dyn_cast<ConstantInt>(BO->getOperand(0));
       }
-      if (C && !isa<Constant>(U) && UI.isUniformAtDef(U)) {
+      if (C && !isa<Constant>(U) && isCTAUniformFootprintBase(U, UI)) {
         Base = BO;
         OffMax = 0;
         return true;
