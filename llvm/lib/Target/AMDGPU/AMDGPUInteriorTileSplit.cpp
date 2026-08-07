@@ -440,6 +440,44 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     return true;
   }
 
+  // Rem-induction PHIs (hipcc LSR of `ix4 = vid % C`): bound from urem/and
+  // init incomings; skip back-edges that reference the PHI.
+  if (auto *PN = dyn_cast<PHINode>(Offset)) {
+    auto UsesPN = [&](Value *In) -> bool {
+      SmallPtrSet<Value *, 8> Seen;
+      SmallVector<Value *, 4> Stack{In};
+      while (!Stack.empty()) {
+        Value *Cur = Stack.pop_back_val();
+        if (Cur == PN)
+          return true;
+        auto *I = dyn_cast<Instruction>(Cur);
+        if (!I || !Seen.insert(Cur).second)
+          continue;
+        if (!isa<BinaryOperator>(I) && !isa<SelectInst>(I) &&
+            !isa<CastInst>(I) && !isa<FreezeInst>(I))
+          continue;
+        for (Value *Op : I->operands())
+          Stack.push_back(Op);
+      }
+      return false;
+    };
+    uint64_t Worst = 0;
+    bool Any = false;
+    for (Value *In : PN->incoming_values()) {
+      if (UsesPN(In))
+        continue;
+      uint64_t Part = 0;
+      if (!getUnsignedOffsetMaximumBelow(In, Limit, SE, Part))
+        return false;
+      Worst = std::max(Worst, Part);
+      Any = true;
+    }
+    if (!Any)
+      return false;
+    Maximum = Worst;
+    return Maximum < Limit;
+  }
+
   if (auto *Shift = dyn_cast<BinaryOperator>(Offset)) {
     if (Shift->getOpcode() == Instruction::LShr) {
       auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
@@ -4320,17 +4358,17 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
             uint64_t TmpOff = 0;
             bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
             bool BaseOK = isCTAUniformFootprintBase(LHS, UI);
-            // Use errs() so hipcc always surfaces this even if debug filtering
-            // drops mid-stream LLVM_DEBUG lines.
-            errs() << "  CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
-            if (OffOK)
-              errs() << " off-max=" << TmpOff;
-            errs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
-            if (auto *PI = dyn_cast<Instruction>(PeeledR))
-              errs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
-            errs() << "    PEEL-lhs: " << *PeeledL << '\n';
-            LLVM_DEBUG(dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
-                              << '\n');
+            LLVM_DEBUG({
+              dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
+                     << "\n    CONV-DIAG base-lhs=" << BaseOK
+                     << " off-rhs=" << OffOK;
+              if (OffOK)
+                dbgs() << " off-max=" << TmpOff;
+              dbgs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
+              if (auto *PI = dyn_cast<Instruction>(PeeledR))
+                dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+              dbgs() << "    PEEL-lhs: " << *PeeledL << '\n';
+            });
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');

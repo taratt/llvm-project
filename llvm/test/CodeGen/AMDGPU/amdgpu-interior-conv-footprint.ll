@@ -165,11 +165,11 @@ compute2:
 ; CFG: br label %load.interior
 ; CFG-NOT: barrier.interior
 
-; Hipcc often LSR-rewrites `ix4 = vid % 18` into an inductive i16 PHI, then
-; zexts it. Matching must accept rem-induction inits, not only plain urem.
-; DBG: Cloned conv footprint interior staging in conv_footprint_inductive_ix4
+; Cooperative-loop form of the fanl zext-i16 W offset: ix4 from urem of an
+; inductive vid PHI, narrowed through i16 (not an i16 rem-induction PHI).
+; DBG: Cloned conv footprint interior staging in conv_footprint_loop_zext_i16
 
-define amdgpu_kernel void @conv_footprint_inductive_ix4(ptr addrspace(1) %in,
+define amdgpu_kernel void @conv_footprint_loop_zext_i16(ptr addrspace(1) %in,
                                                         ptr addrspace(3) %sIn,
                                                         i32 %H, i32 %W) {
 entry:
@@ -180,22 +180,22 @@ entry:
   %x.tile = mul i32 %wg.x, 64
   %y.base = add i32 %y.tile, -2
   %x.base = add i32 %x.tile, -2
-  %ix4.init = urem i32 %lane, 18
-  %ix4.init.t = trunc i32 %ix4.init to i16
   br label %loop
 
 loop:
-  %ix4 = phi i16 [ %ix4.init.t, %entry ], [ %ix4.next, %latch ]
   %vid = phi i32 [ %lane, %entry ], [ %vid.next, %latch ]
   %iy = urem i32 %vid, 42
-  %x.off32 = zext i16 %ix4 to i32
-  %x.off = shl nuw nsw i32 %x.off32, 2
+  %t1 = udiv i32 %vid, 42
+  %ix4 = urem i32 %t1, 18
+  %x.off32 = shl nuw nsw i32 %ix4, 2
+  %x.off16 = trunc i32 %x.off32 to i16
+  %xoff = zext i16 %x.off16 to i32
   %y = add i32 %y.base, %iy
   %y.ok = icmp ult i32 %y, %H
   br i1 %y.ok, label %x.check, label %latch
 
 x.check:
-  %x0 = add i32 %x.base, %x.off
+  %x0 = add i32 %x.base, %xoff
   %x1 = add i32 %x0, 1
   %x2 = add i32 %x0, 2
   %x3 = add i32 %x0, 3
@@ -215,12 +215,6 @@ load:
 
 latch:
   %vid.next = add i32 %vid, 128
-  %ix4.z = zext i16 %ix4 to i32
-  %ix4.add = add i32 %ix4.z, 2
-  %ix4.ge = icmp uge i32 %ix4.add, 18
-  %ix4.sub = sub i32 %ix4.add, 18
-  %ix4.sel = select i1 %ix4.ge, i32 %ix4.sub, i32 %ix4.add
-  %ix4.next = trunc i32 %ix4.sel to i16
   %cont = icmp ult i32 %vid.next, 756
   br i1 %cont, label %loop, label %barrier
 
