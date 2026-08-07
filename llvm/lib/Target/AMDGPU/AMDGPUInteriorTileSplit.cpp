@@ -3698,6 +3698,44 @@ static bool isSupportedConvFootprintExtent(uint64_t Extent) {
   return Extent >= 2 && Extent <= 256;
 }
 
+/// Strip casts/freeze/add-0 so `in_x0` copies share one Base key.
+static Value *peelTrivialBase(Value *V) {
+  while (V) {
+    if (auto *Cast = dyn_cast<CastInst>(V)) {
+      if (Cast->getOpcode() == Instruction::SExt ||
+          Cast->getOpcode() == Instruction::ZExt ||
+          Cast->getOpcode() == Instruction::Trunc) {
+        V = Cast->getOperand(0);
+        continue;
+      }
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      if (II->getIntrinsicID() == Intrinsic::freeze) {
+        V = II->getOperand(0);
+        continue;
+      }
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getOpcode() == Instruction::Add ||
+          BO->getOpcode() == Instruction::Or) {
+        if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+          if (C->isZero()) {
+            V = BO->getOperand(0);
+            continue;
+          }
+        } else if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
+          if (C->isZero()) {
+            V = BO->getOperand(1);
+            continue;
+          }
+        }
+      }
+    }
+    break;
+  }
+  return V;
+}
+
 /// Prove an unsigned maximum strictly below Limit for conv staging offsets.
 /// Prefer structural urem/and/mul/add bounds from Clang's
 /// `iy = tmp % IN_TILE_H` / `ix4*4` lowering. Do NOT use loose SCEV/workitem
@@ -3726,9 +3764,27 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       return Structural(Cast->getOperand(0), Max);
     }
-    auto *BO = dyn_cast<BinaryOperator>(V);
-    if (!BO)
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      if (II->getIntrinsicID() == Intrinsic::freeze)
+        return Structural(II->getOperand(0), Max);
       return false;
+    }
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO) {
+      // PHI of structurally-bounded values (LSR/indvar forms of ix4).
+      if (auto *PN = dyn_cast<PHINode>(V)) {
+        uint64_t Worst = 0;
+        for (Value *In : PN->incoming_values()) {
+          uint64_t Part = 0;
+          if (!Structural(In, Part))
+            return false;
+          Worst = std::max(Worst, Part);
+        }
+        Max = Worst;
+        return Max < Limit;
+      }
+      return false;
+    }
     switch (BO->getOpcode()) {
     case Instruction::URem: {
       auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
@@ -3741,15 +3797,11 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       return true;
     }
     case Instruction::And: {
-      Value *Other = BO->getOperand(0);
       auto *Mask = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!Mask) {
-        Other = BO->getOperand(1);
+      if (!Mask)
         Mask = dyn_cast<ConstantInt>(BO->getOperand(0));
-      }
       if (!Mask)
         return false;
-      (void)Other;
       Max = Mask->getZExtValue();
       // Reject full-byte tid masks (255) that make H=224 selectors unreachable;
       // real staging tiles use urem or small and-masks.
@@ -3818,6 +3870,11 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   if (Structural(Offset, Maximum))
     return true;
 
+  // Tight SCEV only — reject tid-wide ranges that make selectors unreachable.
+  if (getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) &&
+      Maximum < 128)
+    return true;
+
   // Loop-bounded shifted offsets (GEMM-style), still structural in the latch.
   return getLoopBoundedShiftedOffsetMaximum(Offset, Limit, LI, Maximum);
 }
@@ -3881,15 +3938,19 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
         return Recurse(Cast->getOperand(0), Base, OffMax);
 
     if (UI.isUniformAtDef(V)) {
-      Base = V;
+      Base = peelTrivialBase(V);
       OffMax = 0;
       return true;
     }
 
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO || (BO->getOpcode() != Instruction::Add &&
-                BO->getOpcode() != Instruction::Or))
+                BO->getOpcode() != Instruction::Or)) {
+      if (auto *II = dyn_cast<IntrinsicInst>(V))
+        if (II->getIntrinsicID() == Intrinsic::freeze)
+          return Recurse(II->getOperand(0), Base, OffMax);
       return false;
+    }
 
     Value *LHS = BO->getOperand(0);
     Value *RHS = BO->getOperand(1);
@@ -3963,6 +4024,7 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   if (!decomposeUniformBaseOffset(Index, UI, SE, LI, FootprintLimit, BaseOut,
                                   OffMaxOut))
     return false;
+  BaseOut = peelTrivialBase(BaseOut);
   if (Inclusive)
     ExtraOff += 1;
   if (OffMaxOut > FootprintLimit - 1 - ExtraOff)
@@ -4022,13 +4084,21 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
     Value *Bound = nullptr;
     uint64_t OffMax = 0;
     if (!matchConvFootprintLaneGuard(Cur, UI, SE, LI, Base, Bound, OffMax)) {
-      if (auto *Cmp = dyn_cast<ICmpInst>(Cur))
+      if (auto *Cmp = dyn_cast<ICmpInst>(Cur)) {
+        Value *IdxVal = Cmp->getOperand(0);
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
-                          << "\n    index: " << *Cmp->getOperand(0) << '\n');
-      else
+                          << "\n    index: " << *IdxVal << '\n');
+        if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
+          if (BO->getOpcode() == Instruction::Add ||
+              BO->getOpcode() == Instruction::Or)
+            LLVM_DEBUG(dbgs() << "    lhs: " << *BO->getOperand(0)
+                              << "\n    rhs: " << *BO->getOperand(1) << '\n');
+      } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
+      }
       continue;
     }
+    Base = peelTrivialBase(Base);
     uint64_t Extent = OffMax + 1;
     auto &Slot = ExtentByBase[Base];
     if (Extent > Slot) {
