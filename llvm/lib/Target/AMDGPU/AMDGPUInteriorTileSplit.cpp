@@ -44,6 +44,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -3734,6 +3735,27 @@ static Value *peelTrivialBase(Value *V) {
   return V;
 }
 
+/// Strip integer casts/freeze so SCEV/KnownBits see the narrow rem/shl, not a
+/// full-width `zext i16` range of 65535 (conv11: `%74 = zext i16 %73`).
+static Value *peelIntegerCastsForOffset(Value *V) {
+  while (V) {
+    if (auto *Cast = dyn_cast<CastInst>(V)) {
+      unsigned Op = Cast->getOpcode();
+      if (Op == Instruction::ZExt || Op == Instruction::SExt ||
+          Op == Instruction::Trunc) {
+        V = Cast->getOperand(0);
+        continue;
+      }
+    }
+    if (auto *Fr = dyn_cast<FreezeInst>(V)) {
+      V = Fr->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return V;
+}
+
 /// Prove an unsigned maximum strictly below Limit for conv staging offsets.
 /// Prefer structural urem/and/mul/add bounds from Clang's
 /// `iy = tmp % IN_TILE_H` / `ix4*4` lowering. Do NOT use loose SCEV/workitem
@@ -3743,6 +3765,9 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
                                       uint64_t &Maximum) {
   if (!Offset->getType()->isIntegerTy() || Limit < 2)
     return false;
+
+  // Hipcc narrows `ix4*4` / `iy` to i16/i8 then zexts back; prove the source.
+  Offset = peelIntegerCastsForOffset(Offset);
 
   SmallPtrSet<Value *, 16> Visited;
   std::function<bool(Value *, uint64_t &)> Structural =
@@ -3847,6 +3872,33 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       Max = OperandMaximum << Shift;
       return Max < Limit;
     }
+    case Instruction::Sub: {
+      // Clang often expands `x % C` as `x - (x/C)*C`.
+      auto *Mul = dyn_cast<BinaryOperator>(BO->getOperand(1));
+      if (!Mul || Mul->getOpcode() != Instruction::Mul)
+        return false;
+      Value *X = BO->getOperand(0);
+      Value *MulOp0 = Mul->getOperand(0);
+      Value *MulOp1 = Mul->getOperand(1);
+      ConstantInt *D = dyn_cast<ConstantInt>(MulOp1);
+      Value *Quot = MulOp0;
+      if (!D) {
+        D = dyn_cast<ConstantInt>(MulOp0);
+        Quot = MulOp1;
+      }
+      if (!D || D->isZero() || D->isNegative())
+        return false;
+      auto *UDiv = dyn_cast<BinaryOperator>(Quot);
+      if (!UDiv || UDiv->getOpcode() != Instruction::UDiv)
+        return false;
+      if (UDiv->getOperand(0) != X || UDiv->getOperand(1) != D)
+        return false;
+      uint64_t Divisor = D->getZExtValue();
+      if (Divisor < 2 || Divisor > Limit)
+        return false;
+      Max = Divisor - 1;
+      return true;
+    }
     case Instruction::Add:
     case Instruction::Or: {
       uint64_t LHSMaximum = 0, RHSMaximum = 0;
@@ -3865,10 +3917,23 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   if (Structural(Offset, Maximum))
     return true;
 
-  // Tight SCEV only — reject tid-wide ranges that make selectors unreachable.
+  // Tight SCEV on the peeled value — reject tid-wide ranges.
   if (getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) &&
       Maximum < 128)
     return true;
+
+  // KnownBits after narrowing (trunc/urem) often beats opaque SCEV.
+  {
+    const DataLayout &DL = SE.getDataLayout();
+    KnownBits KB = computeKnownBits(Offset, DL);
+    if (!KB.hasConflict()) {
+      APInt MaxAP = KB.getMaxValue();
+      if (MaxAP.isNonNegative() && MaxAP.ult(Limit) && MaxAP.ult(128)) {
+        Maximum = MaxAP.getZExtValue();
+        return true;
+      }
+    }
+  }
 
   // Loop-bounded shifted offsets (GEMM-style), still structural in the latch.
   return getLoopBoundedShiftedOffsetMaximum(Offset, Limit, LI, Maximum);
@@ -4084,9 +4149,16 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
                           << "\n    index: " << *IdxVal << '\n');
         if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
           if (BO->getOpcode() == Instruction::Add ||
-              BO->getOpcode() == Instruction::Or)
+              BO->getOpcode() == Instruction::Or) {
             LLVM_DEBUG(dbgs() << "    lhs: " << *BO->getOperand(0)
                               << "\n    rhs: " << *BO->getOperand(1) << '\n');
+            Value *Peeled = peelIntegerCastsForOffset(BO->getOperand(1));
+            if (Peeled != BO->getOperand(1))
+              LLVM_DEBUG(dbgs() << "    rhs.peeled: " << *Peeled << '\n');
+            Peeled = peelIntegerCastsForOffset(BO->getOperand(0));
+            if (Peeled != BO->getOperand(0))
+              LLVM_DEBUG(dbgs() << "    lhs.peeled: " << *Peeled << '\n');
+          }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       }

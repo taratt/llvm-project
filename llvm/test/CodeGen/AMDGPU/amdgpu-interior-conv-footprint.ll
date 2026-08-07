@@ -162,3 +162,66 @@ compute2:
 ; CFG-LABEL: x.check.interior:
 ; CFG: br label %load.interior
 ; CFG-NOT: barrier.interior
+
+; Fanl conv11 pattern: ix4*4 is narrowed to i16 then zexted back to i32.
+define amdgpu_kernel void @conv_footprint_zext_i16_offsets(ptr addrspace(1) %in,
+                                                           ptr addrspace(3) %sIn,
+                                                           i32 %H, i32 %W) {
+entry:
+  %wg.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %wg.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %y.tile = mul i32 %wg.y, 32
+  %x.tile = mul i32 %wg.x, 64
+  %y.base = add i32 %y.tile, -2
+  %x.base = add i32 %x.tile, -2
+  br label %staging
+
+staging:
+  %tmp = urem i32 %lane, 756
+  %iy8 = urem i32 %tmp, 42
+  %t1 = udiv i32 %tmp, 42
+  %ix4 = urem i32 %t1, 18
+  %x.off32 = shl i32 %ix4, 2
+  %x.off16 = trunc i32 %x.off32 to i16
+  %x.off = zext i16 %x.off16 to i32
+  %iy16 = trunc i32 %iy8 to i8
+  %iy = zext nneg i8 %iy16 to i32
+  %y = add i32 %y.base, %iy
+  %y.ok = icmp ult i32 %y, %H
+  br i1 %y.ok, label %x.check, label %barrier
+
+x.check:
+  %x0 = add i32 %x.base, %x.off
+  %x1 = or disjoint i32 %x0, 1
+  %x2 = add i32 %x0, 2
+  %x3 = add nsw i32 %x0, 3
+  %in0 = icmp ult i32 %x0, %W
+  %in1 = icmp ult i32 %x1, %W
+  %in2 = icmp ult i32 %x2, %W
+  %in3 = icmp ult i32 %x3, %W
+  %in01 = and i1 %in0, %in1
+  %in23 = and i1 %in2, %in3
+  %x.ok = and i1 %in01, %in23
+  br i1 %x.ok, label %load, label %barrier
+
+load:
+  %ptr = getelementptr float, ptr addrspace(1) %in, i32 %x0
+  %val = load float, ptr addrspace(1) %ptr, align 4
+  %sptr = getelementptr float, ptr addrspace(3) %sIn, i32 %lane
+  store float %val, ptr addrspace(3) %sptr, align 4
+  br label %barrier
+
+barrier:
+  call void @llvm.amdgcn.s.barrier()
+  ret void
+}
+
+; DBG: Cloned conv footprint interior staging in conv_footprint_zext_i16_offsets
+; CFG-LABEL: define amdgpu_kernel void @conv_footprint_zext_i16_offsets(
+; CFG: br i1 %{{interior.conv.full[0-9]*}}, label %staging.interior, label %staging
+; CFG-LABEL: staging.interior:
+; CFG: br label %x.check.interior
+; CFG-LABEL: x.check.interior:
+; CFG: br label %load.interior
+; CFG-NOT: barrier.interior
