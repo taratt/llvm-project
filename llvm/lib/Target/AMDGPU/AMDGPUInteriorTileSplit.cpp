@@ -3699,84 +3699,168 @@ static bool isSupportedConvFootprintExtent(uint64_t Extent) {
 }
 
 /// Prove an unsigned maximum strictly below Limit for conv staging offsets.
-/// Handles the urem/udiv/mul shapes Clang emits for `iy = tmp % IN_TILE_H`
-/// and `x_in = in_x0 + ix4 * 4`.
+/// Prefer structural urem/and/mul/add bounds from Clang's
+/// `iy = tmp % IN_TILE_H` / `ix4*4` lowering. Do NOT use loose SCEV/workitem
+/// ranges (those report 255 for a tid and make H=224 selectors unreachable).
 static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
                                       ScalarEvolution &SE, LoopInfo &LI,
                                       uint64_t &Maximum) {
   if (!Offset->getType()->isIntegerTy() || Limit < 2)
     return false;
-  if ((getAffineLaneMaximum(Offset, Maximum) && Maximum < Limit) ||
-      getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) ||
-      getLoopBoundedShiftedOffsetMaximum(Offset, Limit, LI, Maximum))
-    return true;
 
-  auto *BO = dyn_cast<BinaryOperator>(Offset);
-  if (!BO)
-    return false;
-
-  if (BO->getOpcode() == Instruction::URem) {
-    auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
-    if (!Divisor || Divisor->isZero())
+  SmallPtrSet<Value *, 16> Visited;
+  std::function<bool(Value *, uint64_t &)> Structural =
+      [&](Value *V, uint64_t &Max) -> bool {
+    if (!Visited.insert(V).second)
       return false;
-    uint64_t D = Divisor->getZExtValue();
-    if (D < 2 || D > Limit)
-      return false;
-    Maximum = D - 1;
-    return true;
-  }
-
-  if (BO->getOpcode() == Instruction::UDiv) {
-    auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
-    if (!Divisor || Divisor->isZero())
-      return false;
-    uint64_t D = Divisor->getZExtValue();
-    if (D < 2 || Limit > UINT64_MAX / D)
-      return false;
-    uint64_t OperandMaximum = 0;
-    if (!getConvOffsetMaximumBelow(BO->getOperand(0), Limit * D, SE, LI,
-                                   OperandMaximum))
-      return false;
-    Maximum = OperandMaximum / D;
-    return Maximum < Limit;
-  }
-
-  if (BO->getOpcode() == Instruction::Mul) {
-    Value *Var = BO->getOperand(0);
-    auto *FactorC = dyn_cast<ConstantInt>(BO->getOperand(1));
-    if (!FactorC) {
-      Var = BO->getOperand(1);
-      FactorC = dyn_cast<ConstantInt>(BO->getOperand(0));
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+      if (C->isNegative())
+        return false;
+      Max = C->getZExtValue();
+      return Max < Limit;
     }
-    if (!FactorC || FactorC->isZero())
+    if (auto *Cast = dyn_cast<CastInst>(V)) {
+      if (Cast->getOpcode() != Instruction::ZExt &&
+          Cast->getOpcode() != Instruction::SExt &&
+          Cast->getOpcode() != Instruction::Trunc)
+        return false;
+      return Structural(Cast->getOperand(0), Max);
+    }
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO)
       return false;
-    uint64_t Factor = FactorC->getZExtValue();
-    if (Factor > Limit - 1)
+    switch (BO->getOpcode()) {
+    case Instruction::URem: {
+      auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Divisor || Divisor->isZero())
+        return false;
+      uint64_t D = Divisor->getZExtValue();
+      if (D < 2 || D > Limit)
+        return false;
+      Max = D - 1;
+      return true;
+    }
+    case Instruction::And: {
+      Value *Other = BO->getOperand(0);
+      auto *Mask = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Mask) {
+        Other = BO->getOperand(1);
+        Mask = dyn_cast<ConstantInt>(BO->getOperand(0));
+      }
+      if (!Mask)
+        return false;
+      (void)Other;
+      Max = Mask->getZExtValue();
+      // Reject full-byte tid masks (255) that make H=224 selectors unreachable;
+      // real staging tiles use urem or small and-masks.
+      return Max >= 1 && Max < Limit && Max < 128;
+    }
+    case Instruction::UDiv: {
+      auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Divisor || Divisor->isZero())
+        return false;
+      uint64_t D = Divisor->getZExtValue();
+      if (D < 2)
+        return false;
+      uint64_t OperandMaximum = 0;
+      if (!Structural(BO->getOperand(0), OperandMaximum))
+        return false;
+      Max = OperandMaximum / D;
+      return Max < Limit;
+    }
+    case Instruction::Mul: {
+      Value *Var = BO->getOperand(0);
+      auto *FactorC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!FactorC) {
+        Var = BO->getOperand(1);
+        FactorC = dyn_cast<ConstantInt>(BO->getOperand(0));
+      }
+      if (!FactorC || FactorC->isZero() || FactorC->isNegative())
+        return false;
+      uint64_t Factor = FactorC->getZExtValue();
+      if (Factor > Limit - 1)
+        return false;
+      uint64_t OperandMaximum = 0;
+      if (!Structural(Var, OperandMaximum) ||
+          OperandMaximum > (Limit - 1) / Factor)
+        return false;
+      Max = OperandMaximum * Factor;
+      return true;
+    }
+    case Instruction::Shl: {
+      auto *Amount = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Amount || Amount->getZExtValue() >= 10)
+        return false;
+      uint64_t Shift = Amount->getZExtValue();
+      uint64_t OperandMaximum = 0;
+      if (!Structural(BO->getOperand(0), OperandMaximum))
+        return false;
+      if (OperandMaximum > ((Limit - 1) >> Shift))
+        return false;
+      Max = OperandMaximum << Shift;
+      return Max < Limit;
+    }
+    case Instruction::Add:
+    case Instruction::Or: {
+      uint64_t LHSMaximum = 0, RHSMaximum = 0;
+      if (!Structural(BO->getOperand(0), LHSMaximum) ||
+          !Structural(BO->getOperand(1), RHSMaximum) ||
+          LHSMaximum > Limit - 1 - RHSMaximum)
+        return false;
+      Max = LHSMaximum + RHSMaximum;
+      return true;
+    }
+    default:
       return false;
-    uint64_t OperandLimit = (Limit - 1) / Factor + 1;
-    uint64_t OperandMaximum = 0;
-    if (!getConvOffsetMaximumBelow(Var, OperandLimit, SE, LI, OperandMaximum))
-      return false;
-    if (OperandMaximum > (Limit - 1) / Factor)
-      return false;
-    Maximum = OperandMaximum * Factor;
-    return true;
-  }
+    }
+  };
 
-  if (BO->getOpcode() == Instruction::Add ||
-      BO->getOpcode() == Instruction::Or) {
-    uint64_t LHSMaximum = 0, RHSMaximum = 0;
-    if (!getConvOffsetMaximumBelow(BO->getOperand(0), Limit, SE, LI,
-                                   LHSMaximum) ||
-        !getConvOffsetMaximumBelow(BO->getOperand(1), Limit, SE, LI,
-                                   RHSMaximum) ||
-        LHSMaximum > Limit - 1 - RHSMaximum)
-      return false;
-    Maximum = LHSMaximum + RHSMaximum;
+  if (Structural(Offset, Maximum))
     return true;
-  }
 
-  return false;
+  // Loop-bounded shifted offsets (GEMM-style), still structural in the latch.
+  return getLoopBoundedShiftedOffsetMaximum(Offset, Limit, LI, Maximum);
+}
+
+/// Prove Index = Base + Off with Off < Limit, for a known CTA-uniform Base.
+static bool matchOffsetFromKnownBase(Value *Index, Value *Base, uint64_t Limit,
+                                     ScalarEvolution &SE, LoopInfo &LI,
+                                     uint64_t &OffMaxOut) {
+  SmallPtrSet<Value *, 8> Visited;
+  std::function<bool(Value *, uint64_t &)> Recurse =
+      [&](Value *V, uint64_t &OffMax) -> bool {
+    if (!Visited.insert(V).second)
+      return false;
+    if (auto *Cast = dyn_cast<CastInst>(V))
+      if (Cast->getOpcode() == Instruction::SExt ||
+          Cast->getOpcode() == Instruction::ZExt ||
+          Cast->getOpcode() == Instruction::Trunc)
+        return Recurse(Cast->getOperand(0), OffMax);
+    if (V == Base) {
+      OffMax = 0;
+      return true;
+    }
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO || (BO->getOpcode() != Instruction::Add &&
+                BO->getOpcode() != Instruction::Or))
+      return false;
+    uint64_t InnerOff = 0, SideOff = 0;
+    if (Recurse(BO->getOperand(0), InnerOff) &&
+        getConvOffsetMaximumBelow(BO->getOperand(1), Limit, SE, LI, SideOff) &&
+        InnerOff <= Limit - 1 - SideOff) {
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
+    Visited.erase(BO->getOperand(0));
+    if (Recurse(BO->getOperand(1), InnerOff) &&
+        getConvOffsetMaximumBelow(BO->getOperand(0), Limit, SE, LI, SideOff) &&
+        InnerOff <= Limit - 1 - SideOff) {
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
+    return false;
+  };
+  return Recurse(Index, OffMaxOut);
 }
 
 /// Decompose Index into a CTA-uniform Base plus a bounded nonnegative offset.
@@ -3938,7 +4022,11 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
     Value *Bound = nullptr;
     uint64_t OffMax = 0;
     if (!matchConvFootprintLaneGuard(Cur, UI, SE, LI, Base, Bound, OffMax)) {
-      LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
+      if (auto *Cmp = dyn_cast<ICmpInst>(Cur))
+        LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
+                          << "\n    index: " << *Cmp->getOperand(0) << '\n');
+      else
+        LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       continue;
     }
     uint64_t Extent = OffMax + 1;
@@ -3970,6 +4058,66 @@ collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
   }
 
   FullChecks.clear();
+  // Second pass: x0..x3 checks often share an already-matched W base
+  // (`icmp ult in_x0, W`) but use `in_x0 + off` that the first decompose
+  // missed when Off was not yet tied to that Base.
+  for (BasicBlock *BB : Region) {
+    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Branch || !Branch->isConditional())
+      continue;
+    SmallVector<Value *, 8> Conjuncts;
+    collectConjuncts(Branch->getCondition(), Conjuncts);
+    for (Value *Conjunct : Conjuncts) {
+      auto *Cmp = dyn_cast<ICmpInst>(Conjunct);
+      if (!Cmp)
+        continue;
+      ICmpInst::Predicate Pred = Cmp->getPredicate();
+      Value *Index = Cmp->getOperand(0);
+      Value *Bound = Cmp->getOperand(1);
+      if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT ||
+          Pred == ICmpInst::ICMP_UGE || Pred == ICmpInst::ICMP_SGE) {
+        Pred = ICmpInst::getSwappedPredicate(Pred);
+        std::swap(Index, Bound);
+      }
+      if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT &&
+          Pred != ICmpInst::ICMP_ULE && Pred != ICmpInst::ICMP_SLE)
+        continue;
+      uint64_t ExtraOff = Pred == ICmpInst::ICMP_ULE || Pred == ICmpInst::ICMP_SLE
+                              ? 1
+                              : 0;
+      Value *BoundRaw = Bound;
+      if (auto *Cast = dyn_cast<CastInst>(BoundRaw))
+        if (Cast->getOpcode() == Instruction::SExt ||
+            Cast->getOpcode() == Instruction::ZExt)
+          BoundRaw = Cast->getOperand(0);
+      if (auto *Sub = dyn_cast<BinaryOperator>(BoundRaw))
+        if (Sub->getOpcode() == Instruction::Sub)
+          if (auto *C = dyn_cast<ConstantInt>(Sub->getOperand(1)))
+            if (!C->isNegative() && UI.isUniformAtDef(Sub->getOperand(0))) {
+              ExtraOff += C->getZExtValue();
+              BoundRaw = Sub->getOperand(0);
+            }
+      constexpr uint64_t FootprintLimit = 256;
+      for (auto &BaseEntry : BoundByBase) {
+        if (BaseEntry.second != BoundRaw)
+          continue;
+        uint64_t OffMax = 0;
+        if (!matchOffsetFromKnownBase(Index, BaseEntry.first, FootprintLimit, SE,
+                                      LI, OffMax))
+          continue;
+        if (OffMax > FootprintLimit - 1 - ExtraOff)
+          continue;
+        uint64_t Extent = OffMax + ExtraOff + 1;
+        auto &Slot = ExtentByBase[BaseEntry.first];
+        if (Extent > Slot) {
+          Slot = Extent;
+          LLVM_DEBUG(dbgs() << "  conv-footprint known-base matched extent="
+                            << Extent << " from " << *Cmp << '\n');
+        }
+      }
+    }
+  }
+
   for (const auto &Entry : ExtentByBase) {
     if (!isSupportedConvFootprintExtent(Entry.second)) {
       LLVM_DEBUG(dbgs() << "  conv-footprint base " << Entry.first->getName()
