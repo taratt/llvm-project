@@ -222,3 +222,70 @@ barrier:
   call void @llvm.amdgcn.s.barrier()
   ret void
 }
+
+; Clang -O3 expands `ix4 = t1 % 18` to mul/lshr magic, then `shl`+`trunc`+`zext`
+; for the W offset (fanl conv11: `%74 = zext i16 %73`). The pass must prove the
+; expanded rem, not only the raw urem opcode.
+; DBG: Cloned conv footprint interior staging in conv_footprint_magic_urem_zext_i16
+
+define amdgpu_kernel void @conv_footprint_magic_urem_zext_i16(ptr addrspace(1) %in,
+                                                              ptr addrspace(3) %sIn,
+                                                              i32 %H, i32 %W) {
+entry:
+  %wg.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %wg.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %y.tile = mul i32 %wg.y, 32
+  %x.tile = mul i32 %wg.x, 64
+  %y.base = add i32 %y.tile, -2
+  %x.base = add i32 %x.tile, -2
+  br label %loop
+
+loop:
+  %vid = phi i32 [ %lane, %entry ], [ %vid.next, %latch ]
+  ; iy = vid % 42 (magic)
+  %y.mul = mul i32 %vid, 818089009
+  %y.q = lshr i32 %y.mul, 35
+  %y.q42 = mul i32 %y.q, 42
+  %iy = sub i32 %vid, %y.q42
+  ; t1 = vid / 42 (reuse magic quot); ix4 = t1 % 18 (magic)
+  %t1 = lshr i32 %y.mul, 35
+  %x.mul = mul i32 %t1, 954437177
+  %x.q = lshr i32 %x.mul, 34
+  %x.q18 = mul i32 %x.q, 18
+  %ix4 = sub i32 %t1, %x.q18
+  %x.off32 = shl nuw nsw i32 %ix4, 2
+  %x.off16 = trunc i32 %x.off32 to i16
+  %xoff = zext i16 %x.off16 to i32
+  %y = add i32 %y.base, %iy
+  %y.ok = icmp ult i32 %y, %H
+  br i1 %y.ok, label %x.check, label %latch
+
+x.check:
+  %x0 = add i32 %x.base, %xoff
+  %x1 = or disjoint i32 %x0, 1
+  %x2 = add i32 %x0, 2
+  %x3 = add nsw i32 %x0, 3
+  %in0 = icmp ult i32 %x0, %W
+  %in1 = icmp ult i32 %x1, %W
+  %in2 = icmp ult i32 %x2, %W
+  %in3 = icmp ult i32 %x3, %W
+  %in01 = and i1 %in0, %in1
+  %in23 = and i1 %in2, %in3
+  %x.ok = and i1 %in01, %in23
+  br i1 %x.ok, label %load, label %latch
+
+load:
+  %sptr = getelementptr float, ptr addrspace(3) %sIn, i32 %vid
+  store float 0.0, ptr addrspace(3) %sptr, align 4
+  br label %latch
+
+latch:
+  %vid.next = add i32 %vid, 128
+  %cont = icmp ult i32 %vid.next, 756
+  br i1 %cont, label %loop, label %barrier
+
+barrier:
+  call void @llvm.amdgcn.s.barrier()
+  ret void
+}

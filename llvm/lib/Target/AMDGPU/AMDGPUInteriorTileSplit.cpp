@@ -41,6 +41,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
@@ -90,13 +91,16 @@ static cl::opt<unsigned> MinConvFootprintStrippedBranches(
              "conv footprint interior staging region"),
     cl::init(2), cl::Hidden);
 
-/// Always-on (errs) peel/offset diagnostics for unmatched conv footprint
-/// guards. Independent of -debug-only and of -print-before (which often misses
-/// this pass under the AMDGPU codegen pipelines).
+/// Peel/offset diagnostics for unmatched conv footprint guards. Defaults on so
+/// fanl HIP device compiles show CONV-OFFSET-FAIL without -debug-only. Disable
+/// with -amdgpu-interior-conv-diag=0. Independent of -print-before.
 static cl::opt<bool> ConvFootprintDiag(
     "amdgpu-interior-conv-diag",
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
-    cl::init(false), cl::Hidden);
+    cl::init(true), cl::Hidden);
+
+/// Visible in `strings bin/clang` after a real clang relink — proves tip is live.
+constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260807";
 
 constexpr unsigned VectorWidth = 4;
 
@@ -401,11 +405,63 @@ static bool isUnsignedOffsetBelow(Value *Offset, uint64_t Limit,
   return Maximum.ult(APInt(Maximum.getBitWidth(), Limit));
 }
 
-/// Return a proven unsigned maximum below Limit.  The SCEV range is normally
-/// enough, but the real N staging index is a signed extension of an affine
-/// sum for which SCEV can lose the range.  Reconstruct only that lossless
-/// shape: nonnegative bounded terms, casts preserving their small value, and
-/// additions whose mathematical sum remains below Limit.
+/// Match Clang/InstCombine's expanded `X % D` as either:
+///   X - (udiv X, D) * D
+///   X - ((X * Magic) >> S) * D   (possibly through zext/trunc of the mul/lshr)
+/// Returns Max = D-1 when Divisor is in [2, min(Limit,128)].
+static bool matchExpandedURemMaximum(Value *V, uint64_t Limit,
+                                     uint64_t &Maximum) {
+  using namespace llvm::PatternMatch;
+  Value *X = nullptr;
+  Value *Quot = nullptr;
+  const APInt *D = nullptr;
+  if (!match(V, m_Sub(m_Value(X),
+                      m_c_Mul(m_Value(Quot), m_APInt(D)))))
+    return false;
+  if (!D || D->isZero() || D->isNegative())
+    return false;
+  uint64_t Divisor = D->getZExtValue();
+  if (Divisor < 2 || Divisor > Limit || Divisor > 128)
+    return false;
+
+  auto StripCasts = [](Value *Op) -> Value * {
+    while (auto *Cast = dyn_cast<CastInst>(Op)) {
+      unsigned OpCode = Cast->getOpcode();
+      if (OpCode != Instruction::ZExt && OpCode != Instruction::SExt &&
+          OpCode != Instruction::Trunc)
+        break;
+      Op = Cast->getOperand(0);
+    }
+    return Op;
+  };
+
+  Value *Q = StripCasts(Quot);
+  // Exact: quot = udiv X, D
+  if (match(Q, m_UDiv(m_Specific(X), m_SpecificInt(Divisor))) ||
+      match(Q, m_UDiv(m_Specific(StripCasts(X)), m_SpecificInt(Divisor)))) {
+    Maximum = Divisor - 1;
+    return true;
+  }
+
+  // Magic: quot = lshr (mul X, Magic), S  (X may be zext'd inside the mul).
+  Value *ShiftOp = nullptr;
+  if (!match(Q, m_LShr(m_Value(ShiftOp), m_ConstantInt())) &&
+      !match(Q, m_AShr(m_Value(ShiftOp), m_ConstantInt())))
+    return false;
+  ShiftOp = StripCasts(ShiftOp);
+  Value *MulLHS = nullptr;
+  Value *MulRHS = nullptr;
+  if (!match(ShiftOp, m_Mul(m_Value(MulLHS), m_Value(MulRHS))))
+    return false;
+  Value *XS = StripCasts(X);
+  Value *A = StripCasts(MulLHS);
+  Value *B = StripCasts(MulRHS);
+  if (A != XS && B != XS && A != X && B != X)
+    return false;
+  Maximum = Divisor - 1;
+  return true;
+}
+
 static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
                                           ScalarEvolution &SE,
                                           uint64_t &Maximum) {
@@ -560,6 +616,11 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       Maximum = OperandMaximum * Factor;
       return true;
+    }
+    if (Shift->getOpcode() == Instruction::Sub) {
+      // Clang expands `x % C` to mul/lshr magic or udiv; accept both.
+      if (matchExpandedURemMaximum(Shift, Limit, Maximum))
+        return true;
     }
   }
 
@@ -4059,31 +4120,10 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       return Max < Limit;
     }
     case Instruction::Sub: {
-      // Clang often expands `x % C` as `x - (x/C)*C`.
-      auto *Mul = dyn_cast<BinaryOperator>(BO->getOperand(1));
-      if (!Mul || Mul->getOpcode() != Instruction::Mul)
-        return false;
-      Value *X = BO->getOperand(0);
-      Value *MulOp0 = Mul->getOperand(0);
-      Value *MulOp1 = Mul->getOperand(1);
-      ConstantInt *D = dyn_cast<ConstantInt>(MulOp1);
-      Value *Quot = MulOp0;
-      if (!D) {
-        D = dyn_cast<ConstantInt>(MulOp0);
-        Quot = MulOp1;
-      }
-      if (!D || D->isZero() || D->isNegative())
-        return false;
-      auto *UDiv = dyn_cast<BinaryOperator>(Quot);
-      if (!UDiv || UDiv->getOpcode() != Instruction::UDiv)
-        return false;
-      if (UDiv->getOperand(0) != X || UDiv->getOperand(1) != D)
-        return false;
-      uint64_t Divisor = D->getZExtValue();
-      if (Divisor < 2 || Divisor > Limit)
-        return false;
-      Max = Divisor - 1;
-      return true;
+      // Clang expands `x % C` as `x - (x/C)*C` or mul/lshr magic.
+      if (matchExpandedURemMaximum(BO, Limit, Max))
+        return true;
+      return false;
     }
     case Instruction::Add:
     case Instruction::Or: {
@@ -4320,48 +4360,55 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   return true;
 }
 
-/// Dump peel chains for failed conv offsets. Always to errs() — fanl's HIP
-/// device compile can sandbox /tmp writes, and -print-before never matches.
+/// Dump peel chains for failed conv offsets. errs() always reaches HIP device
+/// compile logs when -amdgpu-interior-conv-diag is on (default). Also mirror to
+/// dbgs() so -debug-only captures the same blocks.
 static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
                                Value *PeeledL, bool BaseOK, bool OffOK,
                                uint64_t TmpOff) {
-  raw_ostream &OS = errs();
-  OS << "  CONV-OFFSET-FAIL\n    lhs: " << *LHS << "\n    rhs: " << *RHS
-     << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
-  if (OffOK)
-    OS << " off-max=" << TmpOff;
-  OS << "\n    PEEL-rhs: " << *PeeledR << '\n';
-  if (auto *PI = dyn_cast<Instruction>(PeeledR)) {
-    OS << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
-    if (auto *PN = dyn_cast<PHINode>(PI)) {
-      for (unsigned I = 0, E = PN->getNumIncomingValues(); I < E; ++I)
-        OS << "      phi-in" << I << ": " << *PN->getIncomingValue(I) << '\n';
-    }
-    unsigned N = 0;
-    for (Value *Op : PI->operands()) {
-      OS << "      peel-opnd" << N++ << ": " << *Op << '\n';
-      if (auto *OI = dyn_cast<Instruction>(Op)) {
-        OS << "        peel-opnd-def: " << OI->getOpcodeName();
-        if (auto *OPN = dyn_cast<PHINode>(OI)) {
-          for (unsigned I = 0, E = OPN->getNumIncomingValues(); I < E; ++I)
-            OS << "\n          phi-in" << I << ": " << *OPN->getIncomingValue(I);
-        } else {
-          unsigned M = 0;
-          for (Value *Op2 : OI->operands()) {
-            OS << "\n          op" << M++ << ": " << *Op2;
-            if (auto *OI2 = dyn_cast<Instruction>(Op2))
-              OS << " [" << OI2->getOpcodeName() << "]";
-            if (M >= 4)
-              break;
-          }
-        }
-        OS << '\n';
+  if (!ConvFootprintDiag)
+    return;
+  auto Emit = [&](raw_ostream &OS) {
+    OS << "  CONV-OFFSET-FAIL\n    lhs: " << *LHS << "\n    rhs: " << *RHS
+       << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
+    if (OffOK)
+      OS << " off-max=" << TmpOff;
+    OS << "\n    PEEL-rhs: " << *PeeledR << '\n';
+    if (auto *PI = dyn_cast<Instruction>(PeeledR)) {
+      OS << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+      if (auto *PN = dyn_cast<PHINode>(PI)) {
+        for (unsigned I = 0, E = PN->getNumIncomingValues(); I < E; ++I)
+          OS << "      phi-in" << I << ": " << *PN->getIncomingValue(I) << '\n';
       }
-      if (N >= 4)
-        break;
+      unsigned N = 0;
+      for (Value *Op : PI->operands()) {
+        OS << "      peel-opnd" << N++ << ": " << *Op << '\n';
+        if (auto *OI = dyn_cast<Instruction>(Op)) {
+          OS << "        peel-opnd-def: " << OI->getOpcodeName();
+          if (auto *OPN = dyn_cast<PHINode>(OI)) {
+            for (unsigned I = 0, E = OPN->getNumIncomingValues(); I < E; ++I)
+              OS << "\n          phi-in" << I << ": "
+                 << *OPN->getIncomingValue(I);
+          } else {
+            unsigned M = 0;
+            for (Value *Op2 : OI->operands()) {
+              OS << "\n          op" << M++ << ": " << *Op2;
+              if (auto *OI2 = dyn_cast<Instruction>(Op2))
+                OS << " [" << OI2->getOpcodeName() << "]";
+              if (M >= 4)
+                break;
+            }
+          }
+          OS << '\n';
+        }
+        if (N >= 4)
+          break;
+      }
     }
-  }
-  OS << "    PEEL-lhs: " << *PeeledL << '\n';
+    OS << "    PEEL-lhs: " << *PeeledL << '\n';
+  };
+  Emit(errs());
+  LLVM_DEBUG(Emit(dbgs()));
 }
 
 static void
@@ -5029,6 +5076,14 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
+  // One-time stamp so fanl can prove clang actually linked this .cpp tip.
+  // `strings $LLVM/bin/clang | grep ITS-ACTIVE` must show this after rebuild.
+  static bool PrintedStamp = false;
+  if (!PrintedStamp) {
+    errs() << ITSBuildStamp << '\n';
+    PrintedStamp = true;
+  }
+
   // HIP may sandbox absolute /tmp writes during device compile. Prefer a
   // relative path; fall back to printing a short note (peel dumps go to errs).
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
