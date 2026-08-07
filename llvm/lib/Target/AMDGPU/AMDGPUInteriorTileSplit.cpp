@@ -75,7 +75,7 @@ namespace {
 static cl::opt<unsigned> MaxStagingCloneBlocks(
     "amdgpu-interior-tile-max-staging-blocks",
     cl::desc("Max blocks allowed when cloning an interior staging region"),
-    cl::init(96), cl::Hidden);
+    cl::init(192), cl::Hidden);
 
 static cl::opt<unsigned> MinConvFootprintStrippedBranches(
     "amdgpu-interior-conv-min-stripped-branches",
@@ -431,6 +431,34 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
       Maximum = OperandMaximum >> ShiftAmount;
       return true;
     }
+    if (Shift->getOpcode() == Instruction::URem) {
+      auto *Divisor = dyn_cast<ConstantInt>(Shift->getOperand(1));
+      if (!Divisor || Divisor->isZero())
+        return false;
+      uint64_t D = Divisor->getZExtValue();
+      if (D < 2 || D > Limit)
+        return false;
+      Maximum = D - 1;
+      return true;
+    }
+    if (Shift->getOpcode() == Instruction::Mul) {
+      Value *Var = Shift->getOperand(0);
+      auto *FactorC = dyn_cast<ConstantInt>(Shift->getOperand(1));
+      if (!FactorC) {
+        Var = Shift->getOperand(1);
+        FactorC = dyn_cast<ConstantInt>(Shift->getOperand(0));
+      }
+      if (!FactorC || FactorC->isZero() || FactorC->getZExtValue() > Limit - 1)
+        return false;
+      uint64_t Factor = FactorC->getZExtValue();
+      uint64_t OperandLimit = (Limit - 1) / Factor + 1;
+      uint64_t OperandMaximum = 0;
+      if (!getUnsignedOffsetMaximumBelow(Var, OperandLimit, SE, OperandMaximum) ||
+          OperandMaximum > (Limit - 1) / Factor)
+        return false;
+      Maximum = OperandMaximum * Factor;
+      return true;
+    }
   }
 
   auto *Add = dyn_cast<BinaryOperator>(Offset);
@@ -567,31 +595,50 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_ULT)
     return false;
 
-  // Peel widening casts so `zext/sext(base + off) < bound` still matches.
-  if (auto *Cast = dyn_cast<CastInst>(Index))
-    if (Cast->getOpcode() == Instruction::SExt ||
-        Cast->getOpcode() == Instruction::ZExt)
-      Index = Cast->getOperand(0);
-
-  // Offset 0: `base < bound` is covered by a full-tile Base + Extent proof.
-  if (Index == Full.Base)
-    return true;
-
-  auto *Add = dyn_cast<BinaryOperator>(Index);
-  if (!Add || (Add->getOpcode() != Instruction::Add &&
-               Add->getOpcode() != Instruction::Or))
+  // Peel nested add/or/casts toward Full.Base so conv footprints like
+  // `in_x0 + (ix4*4 + 3) < W` strip correctly.
+  SmallPtrSet<Value *, 8> Visited;
+  std::function<bool(Value *, uint64_t &)> MatchesBase =
+      [&](Value *Cur, uint64_t &OffMax) -> bool {
+    if (!Visited.insert(Cur).second)
+      return false;
+    if (auto *Cast = dyn_cast<CastInst>(Cur))
+      if (Cast->getOpcode() == Instruction::SExt ||
+          Cast->getOpcode() == Instruction::ZExt)
+        return MatchesBase(Cast->getOperand(0), OffMax);
+    if (Cur == Full.Base) {
+      OffMax = 0;
+      return true;
+    }
+    auto *Add = dyn_cast<BinaryOperator>(Cur);
+    if (!Add || (Add->getOpcode() != Instruction::Add &&
+                 Add->getOpcode() != Instruction::Or))
+      return false;
+    uint64_t InnerOff = 0, SideOff = 0;
+    if (MatchesBase(Add->getOperand(0), InnerOff) &&
+        ((getAffineLaneMaximum(Add->getOperand(1), SideOff) &&
+          SideOff < Full.TileMN) ||
+         getUnsignedOffsetMaximumBelow(Add->getOperand(1), Full.TileMN, SE,
+                                       SideOff)) &&
+        InnerOff <= Full.TileMN - 1 - SideOff) {
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
+    Visited.erase(Add->getOperand(0));
+    if (MatchesBase(Add->getOperand(1), InnerOff) &&
+        ((getAffineLaneMaximum(Add->getOperand(0), SideOff) &&
+          SideOff < Full.TileMN) ||
+         getUnsignedOffsetMaximumBelow(Add->getOperand(0), Full.TileMN, SE,
+                                       SideOff)) &&
+        InnerOff <= Full.TileMN - 1 - SideOff) {
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
     return false;
-
-  Value *LHS = Add->getOperand(0);
-  Value *RHS = Add->getOperand(1);
-  auto IsBoundedOffset = [&](Value *Offset) {
-    uint64_t Maximum;
-    return (getAffineLaneMaximum(Offset, Maximum) &&
-            Maximum < Full.TileMN) ||
-           getUnsignedOffsetMaximumBelow(Offset, Full.TileMN, SE, Maximum);
   };
-  return (LHS == Full.Base && IsBoundedOffset(RHS)) ||
-         (RHS == Full.Base && IsBoundedOffset(LHS));
+
+  uint64_t OffMax = 0;
+  return MatchesBase(Index, OffMax) && OffMax < Full.TileMN;
 }
 
 /// Recover a full-tile M/N proof directly from a per-lane guard.  Some HIP
@@ -3633,6 +3680,141 @@ static bool isSupportedConvFootprintExtent(uint64_t Extent) {
   return Extent >= 2 && Extent <= 256;
 }
 
+/// Prove an unsigned maximum strictly below Limit for conv staging offsets.
+/// Handles the urem/udiv/mul shapes Clang emits for `iy = tmp % IN_TILE_H`
+/// and `x_in = in_x0 + ix4 * 4`.
+static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
+                                      ScalarEvolution &SE, LoopInfo &LI,
+                                      uint64_t &Maximum) {
+  if (!Offset->getType()->isIntegerTy() || Limit < 2)
+    return false;
+  if ((getAffineLaneMaximum(Offset, Maximum) && Maximum < Limit) ||
+      getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) ||
+      getLoopBoundedShiftedOffsetMaximum(Offset, Limit, LI, Maximum))
+    return true;
+
+  auto *BO = dyn_cast<BinaryOperator>(Offset);
+  if (!BO)
+    return false;
+
+  if (BO->getOpcode() == Instruction::URem) {
+    auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!Divisor || Divisor->isZero())
+      return false;
+    uint64_t D = Divisor->getZExtValue();
+    if (D < 2 || D > Limit)
+      return false;
+    Maximum = D - 1;
+    return true;
+  }
+
+  if (BO->getOpcode() == Instruction::UDiv) {
+    auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!Divisor || Divisor->isZero())
+      return false;
+    uint64_t D = Divisor->getZExtValue();
+    if (D < 2 || Limit > UINT64_MAX / D)
+      return false;
+    uint64_t OperandMaximum = 0;
+    if (!getConvOffsetMaximumBelow(BO->getOperand(0), Limit * D, SE, LI,
+                                   OperandMaximum))
+      return false;
+    Maximum = OperandMaximum / D;
+    return Maximum < Limit;
+  }
+
+  if (BO->getOpcode() == Instruction::Mul) {
+    Value *Var = BO->getOperand(0);
+    auto *FactorC = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!FactorC) {
+      Var = BO->getOperand(1);
+      FactorC = dyn_cast<ConstantInt>(BO->getOperand(0));
+    }
+    if (!FactorC || FactorC->isZero())
+      return false;
+    uint64_t Factor = FactorC->getZExtValue();
+    if (Factor > Limit - 1)
+      return false;
+    uint64_t OperandLimit = (Limit - 1) / Factor + 1;
+    uint64_t OperandMaximum = 0;
+    if (!getConvOffsetMaximumBelow(Var, OperandLimit, SE, LI, OperandMaximum))
+      return false;
+    if (OperandMaximum > (Limit - 1) / Factor)
+      return false;
+    Maximum = OperandMaximum * Factor;
+    return true;
+  }
+
+  if (BO->getOpcode() == Instruction::Add ||
+      BO->getOpcode() == Instruction::Or) {
+    uint64_t LHSMaximum = 0, RHSMaximum = 0;
+    if (!getConvOffsetMaximumBelow(BO->getOperand(0), Limit, SE, LI,
+                                   LHSMaximum) ||
+        !getConvOffsetMaximumBelow(BO->getOperand(1), Limit, SE, LI,
+                                   RHSMaximum) ||
+        LHSMaximum > Limit - 1 - RHSMaximum)
+      return false;
+    Maximum = LHSMaximum + RHSMaximum;
+    return true;
+  }
+
+  return false;
+}
+
+/// Decompose Index into a CTA-uniform Base plus a bounded nonnegative offset.
+/// Peels nested `add`/`or` and widening casts so
+/// `in_x0 + (ix4*4 + 3)` still recovers Base=`in_x0`.
+static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
+                                       ScalarEvolution &SE, LoopInfo &LI,
+                                       uint64_t Limit, Value *&BaseOut,
+                                       uint64_t &OffMaxOut) {
+  SmallPtrSet<Value *, 8> Visited;
+  std::function<bool(Value *, Value *&, uint64_t &)> Recurse =
+      [&](Value *V, Value *&Base, uint64_t &OffMax) -> bool {
+    if (!Visited.insert(V).second)
+      return false;
+    if (auto *Cast = dyn_cast<CastInst>(V))
+      if (Cast->getOpcode() == Instruction::SExt ||
+          Cast->getOpcode() == Instruction::ZExt)
+        return Recurse(Cast->getOperand(0), Base, OffMax);
+
+    if (UI.isUniformAtDef(V)) {
+      Base = V;
+      OffMax = 0;
+      return true;
+    }
+
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO || (BO->getOpcode() != Instruction::Add &&
+                BO->getOpcode() != Instruction::Or))
+      return false;
+
+    Value *LHS = BO->getOperand(0);
+    Value *RHS = BO->getOperand(1);
+    Value *InnerBase = nullptr;
+    uint64_t InnerOff = 0;
+    uint64_t SideOff = 0;
+    if (Recurse(LHS, InnerBase, InnerOff) &&
+        getConvOffsetMaximumBelow(RHS, Limit, SE, LI, SideOff) &&
+        InnerOff <= Limit - 1 - SideOff) {
+      Base = InnerBase;
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
+    Visited.erase(LHS);
+    if (Recurse(RHS, InnerBase, InnerOff) &&
+        getConvOffsetMaximumBelow(LHS, Limit, SE, LI, SideOff) &&
+        InnerOff <= Limit - 1 - SideOff) {
+      Base = InnerBase;
+      OffMax = InnerOff + SideOff;
+      return true;
+    }
+    return false;
+  };
+
+  return Recurse(Index, BaseOut, OffMaxOut);
+}
+
 /// Match a CTA-uniform footprint lane guard `Base(+Off) < Bound`.
 static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
                                         ScalarEvolution &SE, LoopInfo &LI,
@@ -3650,49 +3832,21 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   }
   if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
     return false;
-  if (!Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(Bound))
-    return false;
 
-  if (auto *Cast = dyn_cast<CastInst>(Index))
+  // Peel widening casts on the bound so zext(H_in) still counts as uniform.
+  Value *BoundRaw = Bound;
+  if (auto *Cast = dyn_cast<CastInst>(Bound))
     if (Cast->getOpcode() == Instruction::SExt ||
         Cast->getOpcode() == Instruction::ZExt)
-      Index = Cast->getOperand(0);
+      BoundRaw = Cast->getOperand(0);
+  if (!Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(BoundRaw))
+    return false;
 
   constexpr uint64_t FootprintLimit = 256;
-  if (UI.isUniformAtDef(Index)) {
-    BaseOut = Index;
-    BoundOut = Bound;
-    OffMaxOut = 0;
-    return true;
-  }
-
-  auto *Add = dyn_cast<BinaryOperator>(Index);
-  if (!Add || (Add->getOpcode() != Instruction::Add &&
-               Add->getOpcode() != Instruction::Or))
+  if (!decomposeUniformBaseOffset(Index, UI, SE, LI, FootprintLimit, BaseOut,
+                                  OffMaxOut))
     return false;
-  Value *LHS = Add->getOperand(0);
-  Value *RHS = Add->getOperand(1);
-  Value *Base = nullptr;
-  Value *Offset = nullptr;
-  if (UI.isUniformAtDef(LHS)) {
-    Base = LHS;
-    Offset = RHS;
-  } else if (UI.isUniformAtDef(RHS)) {
-    Base = RHS;
-    Offset = LHS;
-  } else {
-    return false;
-  }
-
-  uint64_t Maximum = 0;
-  if (!((getAffineLaneMaximum(Offset, Maximum) && Maximum < FootprintLimit) ||
-        getUnsignedOffsetMaximumBelow(Offset, FootprintLimit, SE, Maximum) ||
-        getLoopBoundedShiftedOffsetMaximum(Offset, FootprintLimit, LI,
-                                           Maximum)))
-    return false;
-  BaseOut = Base;
   BoundOut = Bound;
-  OffMaxOut = Maximum;
   return true;
 }
 
@@ -3818,34 +3972,26 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   unsigned BestStripped = 0;
   unsigned BestScore = 0;
 
-  for (BasicBlock &BBRef : F) {
-    BasicBlock *BB = &BBRef;
-    const bool IsEntry = BB == &F.getEntryBlock();
-    BasicBlock *Dispatch = IsEntry ? nullptr : BB->getSinglePredecessor();
-    if (!IsEntry && !Dispatch)
-      continue;
-
+  auto Consider = [&](BasicBlock *BB, BasicBlock *Dispatch, bool AllowExternal,
+                      bool SplitAtTerminator) {
     SmallPtrSet<BasicBlock *, 8> Candidate;
     BasicBlock *CandidateBarrier = nullptr;
     bool CandidateHasLoop = false;
     if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
                                  /*AllowNestedLoops=*/true, &CandidateHasLoop,
-                                 /*AllowEntryExternalPredecessors=*/IsEntry)) {
-      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
-                        << BB->getName() << ": no closed staging region\n");
-      continue;
-    }
+                                 AllowExternal))
+      return;
     if (!hasOnlySharedBarrierExitsOutsideRegion(Candidate, CandidateBarrier)) {
       LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
                         << BB->getName()
                         << ": barrier re-enters staging region\n");
-      continue;
+      return;
     }
     if (Candidate.size() > MaxStagingCloneBlocks) {
       LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
                         << BB->getName() << ": " << Candidate.size()
                         << " blocks exceeds clone limit\n");
-      continue;
+      return;
     }
 
     SmallVector<FullTileBoundCheck, 4> CandidateChecks;
@@ -3853,15 +3999,15 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
       LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
                         << BB->getName()
                         << ": need >=2 CTA-uniform footprint dims\n");
-      continue;
+      return;
     }
     if (!canCloneStagingRegion(BB, Candidate, CandidateBarrier, CandidateChecks,
                                /*DirectGuards=*/{}, /*Alignments=*/{},
                                /*IV=*/nullptr, /*Bound=*/nullptr, SE,
-                               /*IgnoreEntryInstructions=*/IsEntry)) {
+                               /*IgnoreEntryInstructions=*/SplitAtTerminator)) {
       LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
                         << BB->getName() << ": clone preflight failed\n");
-      continue;
+      return;
     }
 
     unsigned Stripped =
@@ -3871,21 +4017,43 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
                         << BB->getName() << ": only " << Stripped
                         << " removable branches (min "
                         << MinConvFootprintStrippedBranches << ")\n");
-      continue;
+      return;
     }
-    // Prefer more stripped guards, then nested load loops, then non-entry
-    // headers (entry splits insert an extra fallthrough block).
-    unsigned Score = Stripped * 4 + (CandidateHasLoop ? 2 : 0) + (IsEntry ? 0 : 1);
+    const bool IsEntry = BB == &F.getEntryBlock();
+    unsigned Score =
+        Stripped * 4 + (CandidateHasLoop ? 2 : 0) + (IsEntry ? 0 : 1);
     if (StagingEntry && Score <= BestScore)
-      continue;
+      return;
 
     StagingEntry = BB;
     StagingPredecessor = Dispatch;
     Barrier = CandidateBarrier;
-    SplitEntryForDispatch = IsEntry;
+    SplitEntryForDispatch = SplitAtTerminator;
     FullChecks = std::move(CandidateChecks);
     BestStripped = Stripped;
     BestScore = Score;
+  };
+
+  for (BasicBlock &BBRef : F) {
+    BasicBlock *BB = &BBRef;
+    const bool IsEntry = BB == &F.getEntryBlock();
+    BasicBlock *Dispatch = IsEntry ? nullptr : BB->getSinglePredecessor();
+    if (!IsEntry && !Dispatch)
+      continue;
+    Consider(BB, Dispatch, /*AllowExternal=*/IsEntry,
+             /*SplitAtTerminator=*/IsEntry);
+  }
+
+  // Cooperative staging lives in loops whose headers have a latch + preheader.
+  // Split the preheader edge (not the header terminator) so the latch can keep
+  // jumping to the shared header while the interior path clones the loop.
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Header || !Preheader)
+      continue;
+    Consider(Header, Preheader, /*AllowExternal=*/true,
+             /*SplitAtTerminator=*/false);
   }
 
   if (!StagingEntry) {
@@ -3909,8 +4077,11 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
   BasicBlock *SharedBarrier = nullptr;
+  // Loop-header staging keeps the latch→header backedge, so the entry may have
+  // non-dispatch predecessors that lie inside the region.
   const bool RegionOk = findClosedStagingRegion(
-      StagingEntry, Dispatch, Region, SharedBarrier, /*AllowNestedLoops=*/true);
+      StagingEntry, Dispatch, Region, SharedBarrier, /*AllowNestedLoops=*/true,
+      nullptr, /*AllowEntryExternalPredecessors=*/true);
   const bool BarrierOk = RegionOk && SharedBarrier == Barrier;
   const bool ExitsOk =
       BarrierOk &&
@@ -3921,7 +4092,9 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
                             {}, nullptr, nullptr, SE);
   if (!CloneOk) {
     LLVM_DEBUG(dbgs() << "Conv footprint aborted after dispatch split at "
-                      << StagingEntry->getName() << '\n');
+                      << StagingEntry->getName() << " region=" << RegionOk
+                      << " barrier=" << BarrierOk << " exits=" << ExitsOk
+                      << " clone=" << CloneOk << '\n');
     if (StagingEntry->getSinglePredecessor() == Dispatch &&
         Dispatch->getSingleSuccessor() == StagingEntry)
       MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,
@@ -3935,6 +4108,8 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   if (!collectConvFootprintChecks(Region, UI, SE, LI, FullChecks) ||
       countRemovableFootprintBranches(Region, FullChecks, SE) <
           MinConvFootprintStrippedBranches) {
+    LLVM_DEBUG(dbgs() << "Conv footprint aborted after recollect at "
+                      << StagingEntry->getName() << '\n');
     if (StagingEntry->getSinglePredecessor() == Dispatch &&
         Dispatch->getSingleSuccessor() == StagingEntry)
       MergeBlockIntoPredecessor(StagingEntry, /*DTU=*/nullptr, &LI,

@@ -93,3 +93,72 @@ compute:
 ; CFG: br label %barrier
 ; CFG-NOT: barrier.interior
 ; CFG-NOT: compute.interior
+
+define amdgpu_kernel void @conv_footprint_urem_offsets(ptr addrspace(1) %in,
+                                                       ptr addrspace(3) %sIn,
+                                                       i32 %H, i32 %W) {
+entry:
+  %wg.y = call i32 @llvm.amdgcn.workgroup.id.y()
+  %wg.x = call i32 @llvm.amdgcn.workgroup.id.x()
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %y.tile = mul i32 %wg.y, 32
+  %x.tile = mul i32 %wg.x, 64
+  %y.base = sub i32 %y.tile, 2
+  %x.base = sub i32 %x.tile, 2
+  br label %loop
+
+loop:
+  %vid = phi i32 [ %lane, %entry ], [ %vid.next, %latch ]
+  %iy = urem i32 %vid, 42
+  %t1 = udiv i32 %vid, 42
+  %ix4 = urem i32 %t1, 18
+  %x.off = mul i32 %ix4, 4
+  %y = add i32 %y.base, %iy
+  %y.ok = icmp ult i32 %y, %H
+  br i1 %y.ok, label %x.check, label %latch
+
+x.check:
+  %x0 = add i32 %x.base, %x.off
+  %x1.off = add i32 %x.off, 1
+  %x1 = add i32 %x.base, %x1.off
+  %x2.off = add i32 %x.off, 2
+  %x2 = add i32 %x.base, %x2.off
+  %x3.off = add i32 %x.off, 3
+  %x3 = add i32 %x.base, %x3.off
+  %in0 = icmp ult i32 %x0, %W
+  %in1 = icmp ult i32 %x1, %W
+  %in2 = icmp ult i32 %x2, %W
+  %in3 = icmp ult i32 %x3, %W
+  %in01 = and i1 %in0, %in1
+  %in23 = and i1 %in2, %in3
+  %x.ok = and i1 %in01, %in23
+  br i1 %x.ok, label %load, label %latch
+
+load:
+  %ptr = getelementptr float, ptr addrspace(1) %in, i32 %x0
+  %val = load float, ptr addrspace(1) %ptr, align 4
+  %sptr = getelementptr float, ptr addrspace(3) %sIn, i32 %lane
+  store float %val, ptr addrspace(3) %sptr, align 4
+  br label %latch
+
+latch:
+  %vid.next = add i32 %vid, 128
+  %more = icmp ult i32 %vid.next, 2048
+  br i1 %more, label %loop, label %barrier
+
+barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %compute2
+
+compute2:
+  ret void
+}
+
+; DBG: Cloned conv footprint interior staging in conv_footprint_urem_offsets
+; CFG-LABEL: define amdgpu_kernel void @conv_footprint_urem_offsets(
+; CFG: br i1 %{{interior.conv.full[0-9]*}}, label %loop.interior, label %loop
+; CFG-LABEL: loop.interior:
+; CFG: br label %x.check.interior
+; CFG-LABEL: x.check.interior:
+; CFG: br label %load.interior
+; CFG-NOT: barrier.interior
