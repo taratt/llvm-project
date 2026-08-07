@@ -5040,10 +5040,13 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  // HIP forwards -mllvm to ld.lld; unknown options abort the link. Use an
-  // env var so device IR can be captured without a linker-visible cl::opt.
+  // HIP forwards unknown -mllvm opts to ld.lld (abort). Capture IR via env.
+  // Always print a heartbeat when the env is set so a silent -c / LTO miss is
+  // obvious in the compile log.
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
     if (DumpPath[0] != '\0') {
+      errs() << "ITS-DUMP: pass running on '" << F.getName()
+             << "' cc=" << F.getCallingConv() << " -> " << DumpPath << '\n';
       std::error_code EC;
       raw_fd_ostream OS(DumpPath, EC,
                         sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
@@ -5052,9 +5055,9 @@ static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
            << F.getName() << " ***\n";
         F.print(OS);
         OS << '\n';
+        OS.flush();
       } else {
-        errs() << "AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR: " << EC.message()
-               << '\n';
+        errs() << "ITS-DUMP: open failed: " << EC.message() << '\n';
       }
     }
   }
