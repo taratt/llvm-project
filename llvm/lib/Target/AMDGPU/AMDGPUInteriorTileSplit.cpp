@@ -45,7 +45,9 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/KnownBits.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -84,6 +86,21 @@ static cl::opt<unsigned> MinConvFootprintStrippedBranches(
     cl::desc("Minimum removable bounds branches required before cloning a "
              "conv footprint interior staging region"),
     cl::init(2), cl::Hidden);
+
+/// Always-on (errs) peel/offset diagnostics for unmatched conv footprint
+/// guards. Independent of -debug-only and of -print-before (which often misses
+/// this pass under the AMDGPU codegen pipelines).
+static cl::opt<bool> ConvFootprintDiag(
+    "amdgpu-interior-conv-diag",
+    cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
+    cl::init(false), cl::Hidden);
+
+/// Write each function's IR when the pass runs. Survives when -print-before
+/// matches neither the legacy nor new-PM pass id.
+static cl::opt<std::string> InteriorTileSplitDumpIR(
+    "amdgpu-interior-tile-split-dump-ir",
+    cl::desc("Append function IR to this path when interior-tile-split runs"),
+    cl::init(""), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
@@ -518,6 +535,17 @@ static bool getUnsignedOffsetMaximumBelow(Value *Offset, uint64_t Limit,
         return false;
       Maximum = D - 1;
       return true;
+    }
+    if (Shift->getOpcode() == Instruction::And) {
+      // Hipcc often does `ix = vid & (C-1)` for power-of-two tile dims; also
+      // appears after InstCombine of `urem` by a power of two.
+      auto *Mask = dyn_cast<ConstantInt>(Shift->getOperand(1));
+      if (!Mask)
+        Mask = dyn_cast<ConstantInt>(Shift->getOperand(0));
+      if (!Mask)
+        return false;
+      Maximum = Mask->getZExtValue();
+      return Maximum >= 1 && Maximum < Limit && Maximum < 128;
     }
     if (Shift->getOpcode() == Instruction::Mul) {
       Value *Var = Shift->getOperand(0);
@@ -4296,6 +4324,61 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   return true;
 }
 
+/// Dump peel chains for failed conv offsets. Narrow zext/trunc RHS failures
+/// always go to errs() so fanl sees them even when -debug-only is paired with
+/// a stale object, and when -print-before matches nothing.
+static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
+                               Value *PeeledL, bool BaseOK, bool OffOK,
+                               uint64_t TmpOff) {
+  auto IsNarrowCast = [](Value *V) {
+    auto *C = dyn_cast<CastInst>(V);
+    return C && (C->getOpcode() == Instruction::ZExt ||
+                 C->getOpcode() == Instruction::Trunc ||
+                 C->getOpcode() == Instruction::SExt);
+  };
+  const bool Force =
+      ConvFootprintDiag || IsNarrowCast(RHS) || IsNarrowCast(LHS);
+  if (!Force) {
+    LLVM_DEBUG({
+      dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
+             << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
+      if (OffOK)
+        dbgs() << " off-max=" << TmpOff;
+      dbgs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
+      if (auto *PI = dyn_cast<Instruction>(PeeledR))
+        dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+      dbgs() << "    PEEL-lhs: " << *PeeledL << '\n';
+    });
+    return;
+  }
+  raw_ostream &OS = errs();
+  OS << "  CONV-OFFSET-FAIL\n    lhs: " << *LHS << "\n    rhs: " << *RHS
+     << "\n    CONV-DIAG base-lhs=" << BaseOK << " off-rhs=" << OffOK;
+  if (OffOK)
+    OS << " off-max=" << TmpOff;
+  OS << "\n    PEEL-rhs: " << *PeeledR << '\n';
+  if (auto *PI = dyn_cast<Instruction>(PeeledR)) {
+    OS << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
+    unsigned N = 0;
+    for (Value *Op : PI->operands()) {
+      OS << "      peel-opnd" << N++ << ": " << *Op << '\n';
+      if (auto *OI = dyn_cast<Instruction>(Op)) {
+        OS << "        peel-opnd-def: " << OI->getOpcodeName();
+        unsigned M = 0;
+        for (Value *Op2 : OI->operands()) {
+          OS << "\n          op" << M++ << ": " << *Op2;
+          if (M >= 3)
+            break;
+        }
+        OS << '\n';
+      }
+      if (N >= 4)
+        break;
+    }
+  }
+  OS << "    PEEL-lhs: " << *PeeledL << '\n';
+}
+
 static void
 recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
                          LoopInfo &LI,
@@ -4358,17 +4441,18 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
             uint64_t TmpOff = 0;
             bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
             bool BaseOK = isCTAUniformFootprintBase(LHS, UI);
-            LLVM_DEBUG({
-              dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
-                     << "\n    CONV-DIAG base-lhs=" << BaseOK
-                     << " off-rhs=" << OffOK;
-              if (OffOK)
-                dbgs() << " off-max=" << TmpOff;
-              dbgs() << "\n    PEEL-rhs: " << *PeeledR << '\n';
-              if (auto *PI = dyn_cast<Instruction>(PeeledR))
-                dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName() << '\n';
-              dbgs() << "    PEEL-lhs: " << *PeeledL << '\n';
-            });
+            if (!OffOK && !BaseOK) {
+              uint64_t Tmp2 = 0;
+              if (getConvOffsetMaximumBelow(LHS, 256, SE, LI, Tmp2) &&
+                  isCTAUniformFootprintBase(RHS, UI)) {
+                OffOK = true;
+                TmpOff = Tmp2;
+                BaseOK = true;
+                std::swap(PeeledL, PeeledR);
+              }
+            }
+            dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
+                               TmpOff);
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
@@ -4960,6 +5044,20 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
+  if (!InteriorTileSplitDumpIR.empty()) {
+    std::error_code EC;
+    raw_fd_ostream OS(InteriorTileSplitDumpIR, EC,
+                      sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
+    if (!EC) {
+      OS << "; *** IR Dump Before amdgpu-interior-tile-split on "
+         << F.getName() << " ***\n";
+      F.print(OS);
+      OS << '\n';
+    } else {
+      errs() << "amdgpu-interior-tile-split-dump-ir: " << EC.message() << '\n';
+    }
+  }
+
   if (!AMDGPU::isEntryFunctionCC(F.getCallingConv()))
     return false;
 
