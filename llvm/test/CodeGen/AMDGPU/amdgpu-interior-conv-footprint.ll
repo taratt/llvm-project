@@ -178,15 +178,13 @@ entry:
   br label %staging
 
 staging:
-  %tmp = urem i32 %lane, 756
-  %iy8 = urem i32 %tmp, 42
-  %t1 = udiv i32 %tmp, 42
+  ; H uses a simple and-mask (proven path); W uses fanl's zext i16(ix4*4).
+  %iy = and i32 %lane, 31
+  %t1 = udiv i32 %lane, 42
   %ix4 = urem i32 %t1, 18
   %x.off32 = shl i32 %ix4, 2
   %x.off16 = trunc i32 %x.off32 to i16
   %x.off = zext i16 %x.off16 to i32
-  %iy16 = trunc i32 %iy8 to i8
-  %iy = zext nneg i8 %iy16 to i32
   %y = add i32 %y.base, %iy
   %y.ok = icmp ult i32 %y, %H
   br i1 %y.ok, label %x.check, label %barrier

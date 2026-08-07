@@ -40,6 +40,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
@@ -3928,8 +3929,20 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     KnownBits KB = computeKnownBits(Offset, DL);
     if (!KB.hasConflict()) {
       APInt MaxAP = KB.getMaxValue();
-      if (MaxAP.isNonNegative() && MaxAP.ult(Limit) && MaxAP.ult(128)) {
+      if (MaxAP.ult(Limit) && MaxAP.ult(128)) {
         Maximum = MaxAP.getZExtValue();
+        return true;
+      }
+    }
+  }
+
+  // ConstantRange (incl. !range metadata / trunc of urem) after peel.
+  {
+    ConstantRange CR = computeConstantRange(Offset, /*ForSigned=*/false);
+    if (!CR.isFullSet() && !CR.isWrappedSet()) {
+      const APInt &UMax = CR.getUnsignedMax();
+      if (UMax.ult(Limit) && UMax.ult(128)) {
+        Maximum = UMax.getZExtValue();
         return true;
       }
     }
@@ -3943,6 +3956,13 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
 static bool matchOffsetFromKnownBase(Value *Index, Value *Base, uint64_t Limit,
                                      ScalarEvolution &SE, LoopInfo &LI,
                                      uint64_t &OffMaxOut) {
+  auto SameBase = [&](Value *V) -> bool {
+    if (V == Base || peelTrivialBase(V) == peelTrivialBase(Base))
+      return true;
+    if (!SE.isSCEVable(V->getType()) || !SE.isSCEVable(Base->getType()))
+      return false;
+    return SE.getSCEV(V) == SE.getSCEV(Base);
+  };
   SmallPtrSet<Value *, 8> Visited;
   std::function<bool(Value *, uint64_t &)> Recurse =
       [&](Value *V, uint64_t &OffMax) -> bool {
@@ -3953,7 +3973,9 @@ static bool matchOffsetFromKnownBase(Value *Index, Value *Base, uint64_t Limit,
           Cast->getOpcode() == Instruction::ZExt ||
           Cast->getOpcode() == Instruction::Trunc)
         return Recurse(Cast->getOperand(0), OffMax);
-    if (V == Base) {
+    if (auto *Fr = dyn_cast<FreezeInst>(V))
+      return Recurse(Fr->getOperand(0), OffMax);
+    if (SameBase(V)) {
       OffMax = 0;
       return true;
     }
@@ -3994,8 +4016,11 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
       return false;
     if (auto *Cast = dyn_cast<CastInst>(V))
       if (Cast->getOpcode() == Instruction::SExt ||
-          Cast->getOpcode() == Instruction::ZExt)
+          Cast->getOpcode() == Instruction::ZExt ||
+          Cast->getOpcode() == Instruction::Trunc)
         return Recurse(Cast->getOperand(0), Base, OffMax);
+    if (auto *Fr = dyn_cast<FreezeInst>(V))
+      return Recurse(Fr->getOperand(0), Base, OffMax);
 
     if (UI.isUniformAtDef(V)) {
       Base = peelTrivialBase(V);
@@ -4004,12 +4029,27 @@ static bool decomposeUniformBaseOffset(Value *Index, UniformityInfo &UI,
     }
 
     auto *BO = dyn_cast<BinaryOperator>(V);
-    if (!BO || (BO->getOpcode() != Instruction::Add &&
-                BO->getOpcode() != Instruction::Or)) {
-      if (auto *Fr = dyn_cast<FreezeInst>(V))
-        return Recurse(Fr->getOperand(0), Base, OffMax);
-      return false;
+    // Pad bases look like `add/sub %tile, C` (C may be negative). UI sometimes
+    // fails to mark the whole add uniform even when both inputs are; treat
+    // uniform±const as a CTA-uniform Base so `Base + zext(ix*4)` still matches.
+    if (BO && (BO->getOpcode() == Instruction::Add ||
+               BO->getOpcode() == Instruction::Sub)) {
+      Value *U = BO->getOperand(0);
+      auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!C && BO->getOpcode() == Instruction::Add) {
+        U = BO->getOperand(1);
+        C = dyn_cast<ConstantInt>(BO->getOperand(0));
+      }
+      if (C && UI.isUniformAtDef(U)) {
+        Base = peelTrivialBase(BO);
+        OffMax = 0;
+        return true;
+      }
     }
+
+    if (!BO || (BO->getOpcode() != Instruction::Add &&
+                BO->getOpcode() != Instruction::Or))
+      return false;
 
     Value *LHS = BO->getOperand(0);
     Value *RHS = BO->getOperand(1);
@@ -4152,12 +4192,10 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
               BO->getOpcode() == Instruction::Or) {
             LLVM_DEBUG(dbgs() << "    lhs: " << *BO->getOperand(0)
                               << "\n    rhs: " << *BO->getOperand(1) << '\n');
-            Value *Peeled = peelIntegerCastsForOffset(BO->getOperand(1));
-            if (Peeled != BO->getOperand(1))
-              LLVM_DEBUG(dbgs() << "    rhs.peeled: " << *Peeled << '\n');
-            Peeled = peelIntegerCastsForOffset(BO->getOperand(0));
-            if (Peeled != BO->getOperand(0))
-              LLVM_DEBUG(dbgs() << "    lhs.peeled: " << *Peeled << '\n');
+            Value *PeeledR = peelIntegerCastsForOffset(BO->getOperand(1));
+            LLVM_DEBUG(dbgs() << "    rhs.peeled: " << *PeeledR << '\n');
+            Value *PeeledL = peelIntegerCastsForOffset(BO->getOperand(0));
+            LLVM_DEBUG(dbgs() << "    lhs.peeled: " << *PeeledL << '\n');
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
