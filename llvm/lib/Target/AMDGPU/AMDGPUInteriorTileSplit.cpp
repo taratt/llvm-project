@@ -27,6 +27,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/SimplifyQuery.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
@@ -40,7 +41,6 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
-#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
@@ -3938,7 +3938,9 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
 
   // ConstantRange (incl. !range metadata / trunc of urem) after peel.
   {
-    ConstantRange CR = computeConstantRange(Offset, /*ForSigned=*/false);
+    const DataLayout &DL = SE.getDataLayout();
+    SimplifyQuery SQ(DL);
+    ConstantRange CR = computeConstantRange(Offset, /*ForSigned=*/false, SQ);
     if (!CR.isFullSet() && !CR.isWrappedSet()) {
       const APInt &UMax = CR.getUnsignedMax();
       if (UMax.ult(Limit) && UMax.ult(128)) {
