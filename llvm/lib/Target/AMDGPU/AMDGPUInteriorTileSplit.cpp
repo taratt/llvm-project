@@ -3816,6 +3816,7 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   bool SplitEntryForDispatch = false;
   SmallVector<FullTileBoundCheck, 4> FullChecks;
   unsigned BestStripped = 0;
+  unsigned BestScore = 0;
 
   for (BasicBlock &BBRef : F) {
     BasicBlock *BB = &BBRef;
@@ -3872,9 +3873,10 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
                         << MinConvFootprintStrippedBranches << ")\n");
       continue;
     }
-    // Prefer nested cooperative load loops with more removable guards.
-    if (Stripped < BestStripped ||
-        (Stripped == BestStripped && StagingEntry && !CandidateHasLoop))
+    // Prefer more stripped guards, then nested load loops, then non-entry
+    // headers (entry splits insert an extra fallthrough block).
+    unsigned Score = Stripped * 4 + (CandidateHasLoop ? 2 : 0) + (IsEntry ? 0 : 1);
+    if (StagingEntry && Score <= BestScore)
       continue;
 
     StagingEntry = BB;
@@ -3883,6 +3885,7 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
     SplitEntryForDispatch = IsEntry;
     FullChecks = std::move(CandidateChecks);
     BestStripped = Stripped;
+    BestScore = Score;
   }
 
   if (!StagingEntry) {

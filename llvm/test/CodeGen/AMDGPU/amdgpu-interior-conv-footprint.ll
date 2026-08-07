@@ -73,7 +73,8 @@ compute:
 }
 
 ; CFG-LABEL: define amdgpu_kernel void @conv_footprint_staging(
-; CFG: br i1 %interior.conv.full, label %staging.interior, label %staging
+; Selector may be SSA-numbered (%interior.conv.full or %interior.conv.fullN).
+; CFG: br i1 %{{interior.conv.full[0-9]*}}, label %staging.interior, label %staging
 ; CFG-LABEL: staging:
 ; CFG: br i1 %y.ok, label %x.check, label %barrier
 ; CFG-LABEL: x.check:
@@ -81,6 +82,8 @@ compute:
 ; CFG-LABEL: barrier:
 ; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
 ; CFG: br label %compute
+; CFG-LABEL: compute:
+; CFG: ret void
 ; CFG-LABEL: staging.interior:
 ; Proven H/W guards are folded away on the interior clone.
 ; CFG: br label %x.check.interior
@@ -90,5 +93,3 @@ compute:
 ; CFG: br label %barrier
 ; CFG-NOT: barrier.interior
 ; CFG-NOT: compute.interior
-; CFG-LABEL: compute:
-; CFG: ret void
