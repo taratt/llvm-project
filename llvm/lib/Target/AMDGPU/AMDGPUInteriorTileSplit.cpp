@@ -3793,15 +3793,15 @@ synthesizeConvFootprintSelector(BasicBlock *InsertBB,
 }
 
 /// Barrier exits must leave the cloned staging region (compute / epilogue).
+/// A barrier block that returns directly is also fine: there is simply no
+/// post-barrier CFG inside the clone.
 static bool hasOnlySharedBarrierExitsOutsideRegion(
     const SmallPtrSetImpl<BasicBlock *> &Region, const BasicBlock *Barrier) {
-  bool HasSuccessor = false;
   for (const BasicBlock *Successor : successors(Barrier)) {
-    HasSuccessor = true;
     if (Region.contains(Successor))
       return false;
   }
-  return HasSuccessor;
+  return true;
 }
 
 /// Specialize conv (and similar) cooperative staging: insert a CTA-uniform
@@ -3829,24 +3829,49 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
     bool CandidateHasLoop = false;
     if (!findClosedStagingRegion(BB, Dispatch, Candidate, CandidateBarrier,
                                  /*AllowNestedLoops=*/true, &CandidateHasLoop,
-                                 /*AllowEntryExternalPredecessors=*/IsEntry) ||
-        !hasOnlySharedBarrierExitsOutsideRegion(Candidate, CandidateBarrier) ||
-        Candidate.size() > MaxStagingCloneBlocks)
+                                 /*AllowEntryExternalPredecessors=*/IsEntry)) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName() << ": no closed staging region\n");
       continue;
+    }
+    if (!hasOnlySharedBarrierExitsOutsideRegion(Candidate, CandidateBarrier)) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName()
+                        << ": barrier re-enters staging region\n");
+      continue;
+    }
+    if (Candidate.size() > MaxStagingCloneBlocks) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName() << ": " << Candidate.size()
+                        << " blocks exceeds clone limit\n");
+      continue;
+    }
 
     SmallVector<FullTileBoundCheck, 4> CandidateChecks;
-    if (!collectConvFootprintChecks(Candidate, UI, SE, LI, CandidateChecks))
+    if (!collectConvFootprintChecks(Candidate, UI, SE, LI, CandidateChecks)) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName()
+                        << ": need >=2 CTA-uniform footprint dims\n");
       continue;
+    }
     if (!canCloneStagingRegion(BB, Candidate, CandidateBarrier, CandidateChecks,
                                /*DirectGuards=*/{}, /*Alignments=*/{},
                                /*IV=*/nullptr, /*Bound=*/nullptr, SE,
-                               /*IgnoreEntryInstructions=*/IsEntry))
+                               /*IgnoreEntryInstructions=*/IsEntry)) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName() << ": clone preflight failed\n");
       continue;
+    }
 
     unsigned Stripped =
         countRemovableFootprintBranches(Candidate, CandidateChecks, SE);
-    if (Stripped < MinConvFootprintStrippedBranches)
+    if (Stripped < MinConvFootprintStrippedBranches) {
+      LLVM_DEBUG(dbgs() << "Conv footprint candidate rejected at "
+                        << BB->getName() << ": only " << Stripped
+                        << " removable branches (min "
+                        << MinConvFootprintStrippedBranches << ")\n");
       continue;
+    }
     // Prefer nested cooperative load loops with more removable guards.
     if (Stripped < BestStripped ||
         (Stripped == BestStripped && StagingEntry && !CandidateHasLoop))

@@ -65,6 +65,10 @@ load:
 
 barrier:
   call void @llvm.amdgcn.s.barrier()
+  br label %compute
+
+compute:
+  ; Post-barrier work stays shared (not cloned).
   ret void
 }
 
@@ -76,6 +80,7 @@ barrier:
 ; CFG: br i1 %x.ok, label %load, label %barrier
 ; CFG-LABEL: barrier:
 ; CFG-COUNT-1: call void @llvm.amdgcn.s.barrier()
+; CFG: br label %compute
 ; CFG-LABEL: staging.interior:
 ; Proven H/W guards are folded away on the interior clone.
 ; CFG: br label %x.check.interior
@@ -84,3 +89,6 @@ barrier:
 ; CFG-LABEL: load.interior:
 ; CFG: br label %barrier
 ; CFG-NOT: barrier.interior
+; CFG-NOT: compute.interior
+; CFG-LABEL: compute:
+; CFG: ret void
