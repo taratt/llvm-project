@@ -128,17 +128,15 @@ static unsigned getIDDependencies(Value *V,
 }
 
 /// CTA-uniform footprint bases are workgroup-tiled (`in_x0 = ox_tile*... - PAD`).
-/// UniformityAnalysis sometimes misses `add/sub` of those; accept values whose
-/// only ID dependency is workgroup.id (never workitem.id).
+/// UniformityAnalysis often misses `add/sub` of those; accept any integer that
+/// does not depend on workitem.id (kernel args / workgroup ids / pure affine).
 static bool isCTAUniformFootprintBase(Value *V, UniformityInfo &UI) {
   if (UI.isUniformAtDef(V))
     return true;
   if (!V->getType()->isIntegerTy() || isa<Constant>(V))
     return false;
   SmallPtrSet<Value *, 16> Visited;
-  unsigned Deps = getIDDependencies(V, Visited);
-  return (Deps & DependsOnWorkitemID) == 0 &&
-         (Deps & DependsOnWorkgroupID) != 0;
+  return (getIDDependencies(V, Visited) & DependsOnWorkitemID) == 0;
 }
 
 static bool isWorkgroupID(Value *V, unsigned Dimension) {
@@ -3815,6 +3813,12 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   // Hipcc narrows `ix4*4` / `iy` to i16/i8 then zexts back; prove the source.
   Offset = peelIntegerCastsForOffset(Offset);
 
+  // Prefer SCEV/range on the peeled value first. Inductive ix4 PHIs and many
+  // urem forms are opaque to structural Visited recursion but tight in SCEV.
+  if (getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) &&
+      Maximum < 128)
+    return true;
+
   SmallPtrSet<Value *, 16> Visited;
   std::function<bool(Value *, uint64_t &)> Structural =
       [&](Value *V, uint64_t &Max) -> bool {
@@ -3845,24 +3849,25 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
     }
     auto *BO = dyn_cast<BinaryOperator>(V);
     if (!BO) {
-      // PHI of structurally-bounded values (LSR/indvar forms of ix4).
+      // Inductive ix4 PHIs are self-referential; Visited recursion always fails.
+      // SCEV often still sees a tight unsigned range from rem-style updates.
       if (auto *PN = dyn_cast<PHINode>(V)) {
-        uint64_t Worst = 0;
-        for (Value *In : PN->incoming_values()) {
-          uint64_t Part = 0;
-          if (!Structural(In, Part))
-            return false;
-          Worst = std::max(Worst, Part);
+        if (!SE.isSCEVable(PN->getType()))
+          return false;
+        APInt UMax = SE.getUnsignedRangeMax(SE.getSCEV(PN));
+        if (UMax.getBitWidth() <= 64 && UMax.ult(Limit) && UMax.ult(128)) {
+          Max = UMax.getZExtValue();
+          return true;
         }
-        Max = Worst;
-        return Max < Limit;
+        return false;
       }
       return false;
     }
     switch (BO->getOpcode()) {
-    case Instruction::URem: {
+    case Instruction::URem:
+    case Instruction::SRem: {
       auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!Divisor || Divisor->isZero())
+      if (!Divisor || Divisor->isZero() || Divisor->isNegative())
         return false;
       uint64_t D = Divisor->getZExtValue();
       if (D < 2 || D > Limit)
@@ -3981,11 +3986,6 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   };
 
   if (Structural(Offset, Maximum))
-    return true;
-
-  // Tight SCEV on the peeled value — reject tid-wide ranges.
-  if (getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) &&
-      Maximum < 128)
     return true;
 
   // KnownBits after narrowing (trunc/urem) often beats opaque SCEV.
@@ -4260,15 +4260,24 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
         if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
           if (BO->getOpcode() == Instruction::Add ||
               BO->getOpcode() == Instruction::Or) {
-            LLVM_DEBUG(dbgs() << "    lhs: " << *BO->getOperand(0)
-                              << "\n    rhs: " << *BO->getOperand(1) << '\n');
-            Value *PeeledR = peelIntegerCastsForOffset(BO->getOperand(1));
-            LLVM_DEBUG(dbgs() << "    PEEL-rhs: " << *PeeledR << '\n');
+            Value *LHS = BO->getOperand(0);
+            Value *RHS = BO->getOperand(1);
+            Value *PeeledR = peelIntegerCastsForOffset(RHS);
+            Value *PeeledL = peelIntegerCastsForOffset(LHS);
+            uint64_t TmpOff = 0;
+            bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
+            LLVM_DEBUG(dbgs() << "    lhs: " << *LHS << "\n    rhs: " << *RHS
+                              << "\n    PEEL-rhs: " << *PeeledR
+                              << "\n    PEEL-lhs: " << *PeeledL
+                              << "\n    base-lhs="
+                              << isCTAUniformFootprintBase(LHS, UI)
+                              << " off-rhs=" << OffOK);
+            if (OffOK)
+              LLVM_DEBUG(dbgs() << " off-max=" << TmpOff);
+            LLVM_DEBUG(dbgs() << '\n');
             if (auto *PI = dyn_cast<Instruction>(PeeledR))
               LLVM_DEBUG(dbgs() << "    PEEL-rhs-op: " << PI->getOpcodeName()
                                 << '\n');
-            Value *PeeledL = peelIntegerCastsForOffset(BO->getOperand(0));
-            LLVM_DEBUG(dbgs() << "    PEEL-lhs: " << *PeeledL << '\n');
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
