@@ -583,17 +583,31 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   ICmpInst::Predicate Pred = Cmp->getPredicate();
   Value *Index = Cmp->getOperand(0);
   Value *Bound = Cmp->getOperand(1);
-  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT) {
+  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT ||
+      Pred == ICmpInst::ICMP_UGE || Pred == ICmpInst::ICMP_SGE) {
     Pred = ICmpInst::getSwappedPredicate(Pred);
     std::swap(Index, Bound);
   }
-  if (Bound != Full.Bound)
+  bool Inclusive = Pred == ICmpInst::ICMP_ULE || Pred == ICmpInst::ICMP_SLE;
+  if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_ULT && !Inclusive)
     return false;
-  // Staging guards are sometimes emitted unsigned even when the CTA selector
-  // was synthesized with signed arithmetic (and the reverse). Accept either
-  // less-than spelling against the same Bound/Base pair.
-  if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_ULT)
-    return false;
+
+  // InstCombine rewrites `ult (base+off+c), W` into `ult (base+off), (W-c)`.
+  // The CTA selector uses the peeled Bound=W, so accept either spelling.
+  uint64_t BoundExtra = Inclusive ? 1 : 0;
+  if (auto *Cast = dyn_cast<CastInst>(Bound))
+    if (Cast->getOpcode() == Instruction::SExt ||
+        Cast->getOpcode() == Instruction::ZExt)
+      Bound = Cast->getOperand(0);
+  if (Bound != Full.Bound) {
+    auto *Sub = dyn_cast<BinaryOperator>(Bound);
+    auto *C = Sub && Sub->getOpcode() == Instruction::Sub
+                 ? dyn_cast<ConstantInt>(Sub->getOperand(1))
+                 : nullptr;
+    if (!Sub || !C || C->isNegative() || Sub->getOperand(0) != Full.Bound)
+      return false;
+    BoundExtra += C->getZExtValue();
+  }
 
   // Peel nested add/or/casts toward Full.Base so conv footprints like
   // `in_x0 + (ix4*4 + 3) < W` strip correctly.
@@ -638,7 +652,11 @@ static bool isPerLaneTileBoundCheck(Value *V, const FullTileBoundCheck &Full,
   };
 
   uint64_t OffMax = 0;
-  return MatchesBase(Index, OffMax) && OffMax < Full.TileMN;
+  if (!MatchesBase(Index, OffMax))
+    return false;
+  if (OffMax > Full.TileMN - 1 - BoundExtra)
+    return false;
+  return OffMax + BoundExtra < Full.TileMN;
 }
 
 /// Recover a full-tile M/N proof directly from a per-lane guard.  Some HIP
@@ -3826,51 +3844,112 @@ static bool matchConvFootprintLaneGuard(Value *V, UniformityInfo &UI,
   ICmpInst::Predicate Pred = Cmp->getPredicate();
   Value *Index = Cmp->getOperand(0);
   Value *Bound = Cmp->getOperand(1);
-  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT) {
+  if (Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_SGT ||
+      Pred == ICmpInst::ICMP_UGE || Pred == ICmpInst::ICMP_SGE) {
     Pred = ICmpInst::getSwappedPredicate(Pred);
     std::swap(Index, Bound);
   }
-  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT)
+  // ule/sle Index, Bound ≡ ult/slt Index, Bound+1 when Bound is rewritten as
+  // W-c by InstCombine; handle the additive form via ExtraOff below.
+  bool Inclusive = Pred == ICmpInst::ICMP_ULE || Pred == ICmpInst::ICMP_SLE;
+  if (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_SLT && !Inclusive)
     return false;
 
-  // Peel widening casts on the bound so zext(H_in) still counts as uniform.
+  // Peel widening casts and InstCombine's `ult (base+off), (W-c)`.
+  uint64_t ExtraOff = 0;
   Value *BoundRaw = Bound;
-  if (auto *Cast = dyn_cast<CastInst>(Bound))
+  if (auto *Cast = dyn_cast<CastInst>(BoundRaw))
     if (Cast->getOpcode() == Instruction::SExt ||
         Cast->getOpcode() == Instruction::ZExt)
       BoundRaw = Cast->getOperand(0);
-  if (!Bound->getType()->isIntegerTy() || !UI.isUniformAtDef(BoundRaw))
+  if (auto *Sub = dyn_cast<BinaryOperator>(BoundRaw)) {
+    if (Sub->getOpcode() == Instruction::Sub) {
+      if (auto *C = dyn_cast<ConstantInt>(Sub->getOperand(1))) {
+        if (UI.isUniformAtDef(Sub->getOperand(0)) && !C->isNegative()) {
+          ExtraOff = C->getZExtValue();
+          BoundRaw = Sub->getOperand(0);
+        }
+      }
+    }
+  }
+  if (!BoundRaw->getType()->isIntegerTy() || !UI.isUniformAtDef(BoundRaw))
     return false;
 
   constexpr uint64_t FootprintLimit = 256;
   if (!decomposeUniformBaseOffset(Index, UI, SE, LI, FootprintLimit, BaseOut,
                                   OffMaxOut))
     return false;
-  BoundOut = Bound;
+  if (Inclusive)
+    ExtraOff += 1;
+  if (OffMaxOut > FootprintLimit - 1 - ExtraOff)
+    return false;
+  OffMaxOut += ExtraOff;
+  // Prefer the peeled uniform extent (W) so H/W checks share one Bound SSA
+  // after InstCombine rewrites per-lane `+c` into `W-c`.
+  BoundOut = BoundRaw;
   return true;
 }
 
 static void
 recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
                          LoopInfo &LI,
-                         DenseMap<std::pair<Value *, Value *>, uint64_t> &Extents) {
-  SmallVector<Value *, 8> Conjuncts;
-  collectConjuncts(V, Conjuncts);
-  for (Value *Conjunct : Conjuncts) {
-    // InstCombine: select guard, true-ish, false — peel the true arm.
-    if (auto *Select = dyn_cast<SelectInst>(Conjunct)) {
-      auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
-      if (False && False->isZero())
-        Conjunct = Select->getTrueValue();
+                         DenseMap<Value *, uint64_t> &ExtentByBase,
+                         DenseMap<Value *, Value *> &BoundByBase) {
+  // Peel trivial inversions / select-form conjunctions down to icmps.
+  SmallVector<Value *, 8> Worklist{V};
+  SmallPtrSet<Value *, 16> Seen;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (!Seen.insert(Cur).second)
+      continue;
+    if (auto *Xor = dyn_cast<BinaryOperator>(Cur)) {
+      if (Xor->getOpcode() == Instruction::Xor &&
+          Xor->getType()->isIntegerTy(1)) {
+        if (auto *C = dyn_cast<ConstantInt>(Xor->getOperand(1))) {
+          if (C->isOne()) {
+            Worklist.push_back(Xor->getOperand(0));
+            continue;
+          }
+        } else if (auto *C = dyn_cast<ConstantInt>(Xor->getOperand(0))) {
+          if (C->isOne()) {
+            Worklist.push_back(Xor->getOperand(1));
+            continue;
+          }
+        }
+      }
     }
+    if (auto *Select = dyn_cast<SelectInst>(Cur)) {
+      auto *False = dyn_cast<ConstantInt>(Select->getFalseValue());
+      if (False && False->isZero()) {
+        Worklist.push_back(Select->getCondition());
+        Worklist.push_back(Select->getTrueValue());
+        continue;
+      }
+    }
+    SmallVector<Value *, 8> Conjuncts;
+    collectConjuncts(Cur, Conjuncts);
+    if (Conjuncts.size() > 1) {
+      for (Value *Conjunct : Conjuncts)
+        Worklist.push_back(Conjunct);
+      continue;
+    }
+
     Value *Base = nullptr;
     Value *Bound = nullptr;
     uint64_t OffMax = 0;
-    if (!matchConvFootprintLaneGuard(Conjunct, UI, SE, LI, Base, Bound, OffMax))
+    if (!matchConvFootprintLaneGuard(Cur, UI, SE, LI, Base, Bound, OffMax)) {
+      LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       continue;
+    }
     uint64_t Extent = OffMax + 1;
-    auto &Slot = Extents[{Base, Bound}];
-    Slot = std::max(Slot, Extent);
+    auto &Slot = ExtentByBase[Base];
+    if (Extent > Slot) {
+      Slot = Extent;
+      BoundByBase[Base] = Bound;
+    }
+    LLVM_DEBUG(dbgs() << "  conv-footprint matched base=" << Base->getName()
+                      << " bound=" << Bound->getName() << " extent=" << Extent
+                      << " from " << *Cur << '\n');
   }
 }
 
@@ -3878,22 +3957,34 @@ static bool
 collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
                            UniformityInfo &UI, ScalarEvolution &SE, LoopInfo &LI,
                            SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
-  DenseMap<std::pair<Value *, Value *>, uint64_t> Extents;
+  DenseMap<Value *, uint64_t> ExtentByBase;
+  DenseMap<Value *, Value *> BoundByBase;
+  LLVM_DEBUG(dbgs() << "Conv footprint scanning " << Region.size()
+                    << " staging blocks\n");
   for (BasicBlock *BB : Region) {
-    auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
-    if (!Branch || !Branch->isConditional())
-      continue;
-    recordConvFootprintGuard(Branch->getCondition(), UI, SE, LI, Extents);
+    // Branch conditions (including nested ANDs / selects / xor-not).
+    if (auto *Branch = dyn_cast<BranchInst>(BB->getTerminator()))
+      if (Branch->isConditional())
+        recordConvFootprintGuard(Branch->getCondition(), UI, SE, LI,
+                                 ExtentByBase, BoundByBase);
   }
 
   FullChecks.clear();
-  for (const auto &Entry : Extents) {
-    if (!isSupportedConvFootprintExtent(Entry.second))
+  for (const auto &Entry : ExtentByBase) {
+    if (!isSupportedConvFootprintExtent(Entry.second)) {
+      LLVM_DEBUG(dbgs() << "  conv-footprint base " << Entry.first->getName()
+                        << " extent " << Entry.second
+                        << " outside supported range\n");
       continue;
-    // Entry: (Base, Bound) -> Extent
-    FullChecks.push_back({/*Dimension=*/0, Entry.first.second, Entry.first.first,
+    }
+    Value *Bound = BoundByBase.lookup(Entry.first);
+    if (!Bound)
+      continue;
+    FullChecks.push_back({/*Dimension=*/0, Bound, Entry.first,
                           /*IsSigned=*/true, Entry.second});
   }
+  LLVM_DEBUG(dbgs() << "Conv footprint recovered " << FullChecks.size()
+                    << " dims from " << ExtentByBase.size() << " bases\n");
   // Need independent H and W (or analogous) footprint proofs.
   if (FullChecks.size() < 2)
     return false;
