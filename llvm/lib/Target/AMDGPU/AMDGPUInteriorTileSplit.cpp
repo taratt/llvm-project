@@ -100,7 +100,7 @@ static cl::opt<bool> ConvFootprintDiag(
     cl::init(true), cl::Hidden);
 
 /// Visible in `strings bin/clang` after a real clang relink — proves tip is live.
-constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260808";
+constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260808c";
 
 constexpr unsigned VectorWidth = 4;
 
@@ -2792,14 +2792,6 @@ static LoadInst *findUniqueFloatLoad(Value *V) {
   return Found;
 }
 
-static bool pointerAvailableAt(Value *Ptr, Instruction *At, DominatorTree &DT) {
-  if (!Ptr || isa<Argument>(Ptr) || isa<Constant>(Ptr) || isa<GlobalValue>(Ptr))
-    return true;
-  if (auto *I = dyn_cast<Instruction>(Ptr))
-    return DT.dominates(I, At);
-  return false;
-}
-
 /// Clone address math that does not dominate Before into Before's block, then
 /// emit a new load there. Needed for the HIP diamond:
 ///   load_bb: ptr = gep ...; v = load ptr; br merge
@@ -3933,14 +3925,19 @@ static bool getConvOffsetMaximumBelow(Value *Offset, uint64_t Limit,
   if (!Offset->getType()->isIntegerTy() || Limit < 2)
     return false;
 
-  // Hipcc narrows `ix4*4` / `iy` to i16/i8 then zexts back; prove the source.
-  Offset = peelIntegerCastsForOffset(Offset);
-
-  // Prefer SCEV/range on the peeled value first. Inductive ix4 PHIs and many
-  // urem forms are opaque to structural Visited recursion but tight in SCEV.
+  // Try the unpeeled value first (zext nneg / !range on the cast itself).
   if (getUnsignedOffsetMaximumBelow(Offset, Limit, SE, Maximum) &&
       Maximum < 128)
     return true;
+
+  // Hipcc narrows `ix4*4` / `iy` to i16/i8 then zexts back; prove the source.
+  Value *Peeled = peelIntegerCastsForOffset(Offset);
+  if (Peeled != Offset) {
+    if (getUnsignedOffsetMaximumBelow(Peeled, Limit, SE, Maximum) &&
+        Maximum < 128)
+      return true;
+  }
+  Offset = Peeled;
 
   SmallPtrSet<Value *, 16> Visited;
   std::function<bool(Value *, uint64_t &)> Structural =
@@ -4461,8 +4458,8 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
     if (!matchConvFootprintLaneGuard(Cur, UI, SE, LI, Base, Bound, OffMax)) {
       if (auto *Cmp = dyn_cast<ICmpInst>(Cur)) {
         Value *IdxVal = Cmp->getOperand(0);
-        LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
-                          << "\n    index: " << *IdxVal << '\n');
+        // Everything below goes to dbgs() so -debug-only pastes include it even
+        // when device-cc1 errs() is dropped by hipcc/linker-wrapper.
         if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
           if (BO->getOpcode() == Instruction::Add ||
               BO->getOpcode() == Instruction::Or) {
@@ -4483,39 +4480,46 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
                 std::swap(PeeledL, PeeledR);
               }
             }
-            dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
-                               TmpOff);
-            // Emit narrow zext/trunc source even when pastes drop errs()-only
-            // CONV-OFFSET-FAIL blocks (common with -debug-only greps).
-            if (auto *Z = dyn_cast<CastInst>(RHS)) {
-              if (Z->getOpcode() == Instruction::ZExt ||
-                  Z->getOpcode() == Instruction::SExt) {
-                Value *Src = Z->getOperand(0);
-                errs() << "  ITS-ZEXT-SRC: " << *Src << '\n';
-                LLVM_DEBUG(dbgs() << "  ITS-ZEXT-SRC: " << *Src << '\n');
-                if (auto *SI = dyn_cast<Instruction>(Src)) {
-                  unsigned K = 0;
-                  for (Value *Op : SI->operands()) {
-                    errs() << "    ITS-ZEXT-OP" << K << ": " << *Op << '\n';
-                    LLVM_DEBUG(dbgs() << "    ITS-ZEXT-OP" << K << ": " << *Op
-                                      << '\n');
-                    if (auto *OI = dyn_cast<Instruction>(Op)) {
-                      errs() << "      ITS-ZEXT-OPDEF: " << OI->getOpcodeName()
+            LLVM_DEBUG({
+              dbgs() << "  conv-footprint unmatched: " << *Cmp
+                     << "\n    index: " << *IdxVal << "\n    lhs: " << *LHS
+                     << "\n    rhs: " << *RHS << "\n    PEEL-rhs: " << *PeeledR
+                     << "\n    CONV-DIAG base-lhs=" << BaseOK
+                     << " off-rhs=" << OffOK;
+              if (OffOK)
+                dbgs() << " off-max=" << TmpOff;
+              dbgs() << '\n';
+              if (auto *Z = dyn_cast<CastInst>(RHS)) {
+                if (Z->getOpcode() == Instruction::ZExt ||
+                    Z->getOpcode() == Instruction::SExt) {
+                  Value *Src = Z->getOperand(0);
+                  dbgs() << "    ITS-ZEXT-SRC: " << *Src << '\n';
+                  if (auto *SI = dyn_cast<Instruction>(Src)) {
+                    unsigned K = 0;
+                    for (Value *Op : SI->operands()) {
+                      dbgs() << "      ITS-ZEXT-OP" << K++ << ": " << *Op
                              << '\n';
-                      unsigned M = 0;
-                      for (Value *Op2 : OI->operands()) {
-                        errs() << "        op" << M++ << ": " << *Op2 << '\n';
-                        if (M >= 4)
-                          break;
+                      if (auto *OI = dyn_cast<Instruction>(Op)) {
+                        unsigned M = 0;
+                        for (Value *Op2 : OI->operands()) {
+                          dbgs() << "        op" << M++ << ": " << *Op2 << '\n';
+                          if (M >= 4)
+                            break;
+                        }
                       }
+                      if (K >= 4)
+                        break;
                     }
-                    if (++K >= 4)
-                      break;
                   }
                 }
               }
-            }
+            });
+            dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
+                               TmpOff);
+            continue;
           }
+        LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
+                          << "\n    index: " << *IdxVal << '\n');
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       }
@@ -4540,9 +4544,10 @@ collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
                            SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
   DenseMap<Value *, uint64_t> ExtentByBase;
   DenseMap<Value *, Value *> BoundByBase;
-  LLVM_DEBUG(dbgs() << ITSBuildStamp
-                    << "\nConv footprint scanning " << Region.size()
-                    << " staging blocks\n");
+  // Stamp is embedded IN this line so pastes prove tip even when errs() from
+  // the device cc1 child never reaches tee (common hipcc failure mode).
+  LLVM_DEBUG(dbgs() << "Conv footprint scanning stamp=magic-urem-20260808c "
+                    << Region.size() << " staging blocks\n");
   for (BasicBlock *BB : Region) {
     // Branch conditions (including nested ANDs / selects / xor-not).
     if (auto *Branch = dyn_cast<BranchInst>(BB->getTerminator()))
