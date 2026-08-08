@@ -100,7 +100,7 @@ static cl::opt<bool> ConvFootprintDiag(
     cl::init(true), cl::Hidden);
 
 /// Visible in `strings bin/clang` after a real clang relink — proves tip is live.
-constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260807";
+constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260808";
 
 constexpr unsigned VectorWidth = 4;
 
@@ -4485,6 +4485,36 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
             }
             dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
                                TmpOff);
+            // Emit narrow zext/trunc source even when pastes drop errs()-only
+            // CONV-OFFSET-FAIL blocks (common with -debug-only greps).
+            if (auto *Z = dyn_cast<CastInst>(RHS)) {
+              if (Z->getOpcode() == Instruction::ZExt ||
+                  Z->getOpcode() == Instruction::SExt) {
+                Value *Src = Z->getOperand(0);
+                errs() << "  ITS-ZEXT-SRC: " << *Src << '\n';
+                LLVM_DEBUG(dbgs() << "  ITS-ZEXT-SRC: " << *Src << '\n');
+                if (auto *SI = dyn_cast<Instruction>(Src)) {
+                  unsigned K = 0;
+                  for (Value *Op : SI->operands()) {
+                    errs() << "    ITS-ZEXT-OP" << K << ": " << *Op << '\n';
+                    LLVM_DEBUG(dbgs() << "    ITS-ZEXT-OP" << K << ": " << *Op
+                                      << '\n');
+                    if (auto *OI = dyn_cast<Instruction>(Op)) {
+                      errs() << "      ITS-ZEXT-OPDEF: " << OI->getOpcodeName()
+                             << '\n';
+                      unsigned M = 0;
+                      for (Value *Op2 : OI->operands()) {
+                        errs() << "        op" << M++ << ": " << *Op2 << '\n';
+                        if (M >= 4)
+                          break;
+                      }
+                    }
+                    if (++K >= 4)
+                      break;
+                  }
+                }
+              }
+            }
           }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
@@ -4510,7 +4540,8 @@ collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
                            SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
   DenseMap<Value *, uint64_t> ExtentByBase;
   DenseMap<Value *, Value *> BoundByBase;
-  LLVM_DEBUG(dbgs() << "Conv footprint scanning " << Region.size()
+  LLVM_DEBUG(dbgs() << ITSBuildStamp
+                    << "\nConv footprint scanning " << Region.size()
                     << " staging blocks\n");
   for (BasicBlock *BB : Region) {
     // Branch conditions (including nested ANDs / selects / xor-not).
@@ -5076,13 +5107,14 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  // One-time stamp so fanl can prove clang actually linked this .cpp tip.
-  // `strings $LLVM/bin/clang | grep ITS-ACTIVE` must show this after rebuild.
+  // Stamp to errs + dbgs. If your paste has "Conv footprint scanning" but NOT
+  // ITS-ACTIVE, device clang is stale (lit/opt rebuilt, clang not relinked).
   static bool PrintedStamp = false;
   if (!PrintedStamp) {
     errs() << ITSBuildStamp << '\n';
     PrintedStamp = true;
   }
+  LLVM_DEBUG(dbgs() << ITSBuildStamp << " fn=" << F.getName() << '\n');
 
   // HIP may sandbox absolute /tmp writes during device compile. Prefer a
   // relative path; fall back to printing a short note (peel dumps go to errs).
