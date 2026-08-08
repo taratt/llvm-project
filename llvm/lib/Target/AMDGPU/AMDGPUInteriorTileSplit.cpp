@@ -91,16 +91,13 @@ static cl::opt<unsigned> MinConvFootprintStrippedBranches(
              "conv footprint interior staging region"),
     cl::init(2), cl::Hidden);
 
-/// Peel/offset diagnostics for unmatched conv footprint guards. Defaults on so
-/// fanl HIP device compiles show CONV-OFFSET-FAIL without -debug-only. Disable
-/// with -amdgpu-interior-conv-diag=0. Independent of -print-before.
+/// Optional peel/offset diagnostics for unmatched conv footprint guards.
+/// Off by default — enabling this on huge HIP kernels floods stderr and can
+/// OOM remote sessions. Use -amdgpu-interior-conv-diag with -debug-only.
 static cl::opt<bool> ConvFootprintDiag(
     "amdgpu-interior-conv-diag",
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
-    cl::init(true), cl::Hidden);
-
-/// Visible in `strings bin/clang` after a real clang relink — proves tip is live.
-constexpr char ITSBuildStamp[] = "ITS-ACTIVE stamp=magic-urem-20260808c";
+    cl::init(false), cl::Hidden);
 
 constexpr unsigned VectorWidth = 4;
 
@@ -4458,68 +4455,33 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
     if (!matchConvFootprintLaneGuard(Cur, UI, SE, LI, Base, Bound, OffMax)) {
       if (auto *Cmp = dyn_cast<ICmpInst>(Cur)) {
         Value *IdxVal = Cmp->getOperand(0);
-        // Everything below goes to dbgs() so -debug-only pastes include it even
-        // when device-cc1 errs() is dropped by hipcc/linker-wrapper.
-        if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
-          if (BO->getOpcode() == Instruction::Add ||
-              BO->getOpcode() == Instruction::Or) {
-            Value *LHS = BO->getOperand(0);
-            Value *RHS = BO->getOperand(1);
-            Value *PeeledR = peelIntegerCastsForOffset(RHS);
-            Value *PeeledL = peelIntegerCastsForOffset(LHS);
-            uint64_t TmpOff = 0;
-            bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
-            bool BaseOK = isCTAUniformFootprintBase(LHS, UI);
-            if (!OffOK && !BaseOK) {
-              uint64_t Tmp2 = 0;
-              if (getConvOffsetMaximumBelow(LHS, 256, SE, LI, Tmp2) &&
-                  isCTAUniformFootprintBase(RHS, UI)) {
-                OffOK = true;
-                TmpOff = Tmp2;
-                BaseOK = true;
-                std::swap(PeeledL, PeeledR);
-              }
-            }
-            LLVM_DEBUG({
-              dbgs() << "  conv-footprint unmatched: " << *Cmp
-                     << "\n    index: " << *IdxVal << "\n    lhs: " << *LHS
-                     << "\n    rhs: " << *RHS << "\n    PEEL-rhs: " << *PeeledR
-                     << "\n    CONV-DIAG base-lhs=" << BaseOK
-                     << " off-rhs=" << OffOK;
-              if (OffOK)
-                dbgs() << " off-max=" << TmpOff;
-              dbgs() << '\n';
-              if (auto *Z = dyn_cast<CastInst>(RHS)) {
-                if (Z->getOpcode() == Instruction::ZExt ||
-                    Z->getOpcode() == Instruction::SExt) {
-                  Value *Src = Z->getOperand(0);
-                  dbgs() << "    ITS-ZEXT-SRC: " << *Src << '\n';
-                  if (auto *SI = dyn_cast<Instruction>(Src)) {
-                    unsigned K = 0;
-                    for (Value *Op : SI->operands()) {
-                      dbgs() << "      ITS-ZEXT-OP" << K++ << ": " << *Op
-                             << '\n';
-                      if (auto *OI = dyn_cast<Instruction>(Op)) {
-                        unsigned M = 0;
-                        for (Value *Op2 : OI->operands()) {
-                          dbgs() << "        op" << M++ << ": " << *Op2 << '\n';
-                          if (M >= 4)
-                            break;
-                        }
-                      }
-                      if (K >= 4)
-                        break;
-                    }
-                  }
-                }
-              }
-            });
-            dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
-                               TmpOff);
-            continue;
-          }
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
                           << "\n    index: " << *IdxVal << '\n');
+        if (ConvFootprintDiag) {
+          if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
+            if (BO->getOpcode() == Instruction::Add ||
+                BO->getOpcode() == Instruction::Or) {
+              Value *LHS = BO->getOperand(0);
+              Value *RHS = BO->getOperand(1);
+              Value *PeeledR = peelIntegerCastsForOffset(RHS);
+              Value *PeeledL = peelIntegerCastsForOffset(LHS);
+              uint64_t TmpOff = 0;
+              bool OffOK = getConvOffsetMaximumBelow(RHS, 256, SE, LI, TmpOff);
+              bool BaseOK = isCTAUniformFootprintBase(LHS, UI);
+              if (!OffOK && !BaseOK) {
+                uint64_t Tmp2 = 0;
+                if (getConvOffsetMaximumBelow(LHS, 256, SE, LI, Tmp2) &&
+                    isCTAUniformFootprintBase(RHS, UI)) {
+                  OffOK = true;
+                  TmpOff = Tmp2;
+                  BaseOK = true;
+                  std::swap(PeeledL, PeeledR);
+                }
+              }
+              dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
+                                 TmpOff);
+            }
+        }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       }
@@ -4544,10 +4506,8 @@ collectConvFootprintChecks(const SmallPtrSetImpl<BasicBlock *> &Region,
                            SmallVectorImpl<FullTileBoundCheck> &FullChecks) {
   DenseMap<Value *, uint64_t> ExtentByBase;
   DenseMap<Value *, Value *> BoundByBase;
-  // Stamp is embedded IN this line so pastes prove tip even when errs() from
-  // the device cc1 child never reaches tee (common hipcc failure mode).
-  LLVM_DEBUG(dbgs() << "Conv footprint scanning stamp=magic-urem-20260808c "
-                    << Region.size() << " staging blocks\n");
+  LLVM_DEBUG(dbgs() << "Conv footprint scanning " << Region.size()
+                    << " staging blocks\n");
   for (BasicBlock *BB : Region) {
     // Branch conditions (including nested ANDs / selects / xor-not).
     if (auto *Branch = dyn_cast<BranchInst>(BB->getTerminator()))
@@ -5112,15 +5072,6 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  // Stamp to errs + dbgs. If your paste has "Conv footprint scanning" but NOT
-  // ITS-ACTIVE, device clang is stale (lit/opt rebuilt, clang not relinked).
-  static bool PrintedStamp = false;
-  if (!PrintedStamp) {
-    errs() << ITSBuildStamp << '\n';
-    PrintedStamp = true;
-  }
-  LLVM_DEBUG(dbgs() << ITSBuildStamp << " fn=" << F.getName() << '\n');
-
   // HIP may sandbox absolute /tmp writes during device compile. Prefer a
   // relative path; fall back to printing a short note (peel dumps go to errs).
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
