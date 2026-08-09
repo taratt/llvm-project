@@ -4405,6 +4405,68 @@ static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
   LLVM_DEBUG(Emit(dbgs()));
 }
 
+/// Quiet file dump of failing zext/trunc offset chains (conv11 `%73`).
+/// Env AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT=path or `1` →
+/// `amdgpu-its-zext-fail.txt`. Bounded — safe on fanl.
+static void dumpZextOffsetFailFile(Value *Offset) {
+  const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT");
+  if (!Env || Env[0] == '\0')
+    return;
+  std::string Path = Env;
+  if (Path == "1")
+    Path = "amdgpu-its-zext-fail.txt";
+
+  Value *V = peelIntegerCastsForOffset(Offset);
+  auto *Ty = dyn_cast<IntegerType>(V->getType());
+  if (!Ty || Ty->getBitWidth() > 16) {
+    if (auto *Z = dyn_cast<CastInst>(Offset)) {
+      if (Z->getOpcode() == Instruction::ZExt ||
+          Z->getOpcode() == Instruction::SExt)
+        V = Z->getOperand(0);
+      else
+        return;
+    } else {
+      return;
+    }
+  }
+
+  std::error_code EC;
+  raw_fd_ostream OS(Path, EC, sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
+  if (EC)
+    return;
+
+  static unsigned Dumps = 0;
+  if (Dumps >= 8)
+    return;
+  ++Dumps;
+
+  OS << "=== zext-offset-fail #" << Dumps << " ===\n";
+  OS << "offset: " << *Offset << '\n';
+  OS << "peeled: " << *V << '\n';
+  SmallVector<Value *, 8> Queue{V};
+  SmallPtrSet<Value *, 16> Seen;
+  unsigned Lines = 0;
+  for (unsigned Depth = 0; Depth < 4 && !Queue.empty() && Lines < 32; ++Depth) {
+    SmallVector<Value *, 8> Next;
+    for (Value *Cur : Queue) {
+      if (!Seen.insert(Cur).second)
+        continue;
+      OS << "  d" << Depth << ": " << *Cur << '\n';
+      ++Lines;
+      auto *I = dyn_cast<Instruction>(Cur);
+      if (!I)
+        continue;
+      for (Value *Op : I->operands()) {
+        if (isa<Instruction>(Op) || isa<Argument>(Op))
+          Next.push_back(Op);
+      }
+    }
+    Queue.swap(Next);
+  }
+  OS << '\n';
+  OS.flush();
+}
+
 static void
 recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
                          LoopInfo &LI,
@@ -4457,12 +4519,17 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
         Value *IdxVal = Cmp->getOperand(0);
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cmp
                           << "\n    index: " << *IdxVal << '\n');
-        if (ConvFootprintDiag) {
-          if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
-            if (BO->getOpcode() == Instruction::Add ||
-                BO->getOpcode() == Instruction::Or) {
-              Value *LHS = BO->getOperand(0);
-              Value *RHS = BO->getOperand(1);
+        if (auto *BO = dyn_cast<BinaryOperator>(IdxVal))
+          if (BO->getOpcode() == Instruction::Add ||
+              BO->getOpcode() == Instruction::Or) {
+            Value *LHS = BO->getOperand(0);
+            Value *RHS = BO->getOperand(1);
+            // Quiet file dump for pad+zext failures (conv11 %74/%58).
+            if (isa<CastInst>(RHS))
+              dumpZextOffsetFailFile(RHS);
+            else if (isa<CastInst>(LHS))
+              dumpZextOffsetFailFile(LHS);
+            if (ConvFootprintDiag) {
               Value *PeeledR = peelIntegerCastsForOffset(RHS);
               Value *PeeledL = peelIntegerCastsForOffset(LHS);
               uint64_t TmpOff = 0;
@@ -4481,7 +4548,7 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
               dumpConvOffsetFail(LHS, RHS, PeeledR, PeeledL, BaseOK, OffOK,
                                  TmpOff);
             }
-        }
+          }
       } else {
         LLVM_DEBUG(dbgs() << "  conv-footprint unmatched: " << *Cur << '\n');
       }
