@@ -99,10 +99,6 @@ static cl::opt<bool> ConvFootprintDiag(
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
     cl::init(false), cl::Hidden);
 
-// NOTE: Do NOT add a -mllvm cl::opt for the zext dump path. HIP forwards
-// -mllvm to ld.lld and unknown options abort the device link. Use env
-// AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT instead (absolute /tmp path).
-
 constexpr unsigned VectorWidth = 4;
 
 static cl::opt<bool> EnableInteriorTileVectorize(
@@ -4409,77 +4405,43 @@ static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
   LLVM_DEBUG(Emit(dbgs()));
 }
 
-/// Quiet file dump of failing zext/trunc offset chains (conv11 `%73`).
-/// Env only (HIP must not get a -mllvm dump opt — ld.lld rejects it):
-///   AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT=/tmp/amdgpu-its-zext-fail.txt
-/// or `=1` for that same /tmp path.
-static void dumpZextOffsetFailFile(Value *Offset) {
-  const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT");
-  if (!Env || Env[0] == '\0')
+/// Print one bounded definition chain for the first failing i16 offset.
+/// HIP device cc1 does not reliably inherit dump env vars, and forwarding a
+/// custom -mllvm path to ld.lld aborts the link. A single small stderr record
+/// is reliable and cannot create the earlier debug flood.
+static void dumpFirstI16OffsetFail(Value *Offset) {
+  static bool Dumped = false;
+  if (Dumped)
     return;
-  std::string Path = Env;
-  if (Path == "1")
-    Path = "/tmp/amdgpu-its-zext-fail.txt";
-
   Value *V = peelIntegerCastsForOffset(Offset);
   auto *Ty = dyn_cast<IntegerType>(V->getType());
-  if (!Ty || Ty->getBitWidth() > 16) {
-    if (auto *Z = dyn_cast<CastInst>(Offset)) {
-      if (Z->getOpcode() == Instruction::ZExt ||
-          Z->getOpcode() == Instruction::SExt)
-        V = Z->getOperand(0);
-      else
-        return;
-    } else {
-      return;
+  if (!Ty || Ty->getBitWidth() != 16)
+    return;
+  Dumped = true;
+
+  raw_ostream &OS = errs();
+  OS << "ITS-I16-OFFSET-FAIL\n  offset: " << *Offset
+     << "\n  peeled: " << *V << '\n';
+  SmallVector<Value *, 8> Queue{V};
+  SmallPtrSet<Value *, 16> Seen;
+  unsigned Lines = 0;
+  for (unsigned Depth = 0; Depth < 5 && !Queue.empty() && Lines < 40; ++Depth) {
+    SmallVector<Value *, 8> Next;
+    for (Value *Cur : Queue) {
+      if (!Seen.insert(Cur).second)
+        continue;
+      OS << "  d" << Depth << ": " << *Cur << '\n';
+      ++Lines;
+      auto *I = dyn_cast<Instruction>(Cur);
+      if (!I)
+        continue;
+      for (Value *Op : I->operands())
+        if (isa<Instruction>(Op) || isa<Argument>(Op))
+          Next.push_back(Op);
     }
+    Queue.swap(Next);
   }
-
-  auto WriteTo = [&](StringRef P) -> bool {
-    std::error_code EC;
-    raw_fd_ostream Out(P, EC, sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
-    if (EC) {
-      errs() << "ITS-ZEXT-DUMP: open failed path=" << P
-             << " msg=" << EC.message() << '\n';
-      return false;
-    }
-    static unsigned Dumps = 0;
-    if (Dumps >= 8)
-      return true;
-    ++Dumps;
-    Out << "=== zext-offset-fail #" << Dumps << " ===\n";
-    Out << "offset: " << *Offset << '\n';
-    Out << "peeled: " << *V << '\n';
-    SmallVector<Value *, 8> Queue{V};
-    SmallPtrSet<Value *, 16> Seen;
-    unsigned Lines = 0;
-    for (unsigned Depth = 0; Depth < 4 && !Queue.empty() && Lines < 32;
-         ++Depth) {
-      SmallVector<Value *, 8> Next;
-      for (Value *Cur : Queue) {
-        if (!Seen.insert(Cur).second)
-          continue;
-        Out << "  d" << Depth << ": " << *Cur << '\n';
-        ++Lines;
-        auto *I = dyn_cast<Instruction>(Cur);
-        if (!I)
-          continue;
-        for (Value *Op : I->operands()) {
-          if (isa<Instruction>(Op) || isa<Argument>(Op))
-            Next.push_back(Op);
-        }
-      }
-      Queue.swap(Next);
-    }
-    Out << '\n';
-    Out.flush();
-    if (Dumps == 1)
-      errs() << "ITS-ZEXT-DUMP: wrote " << P << '\n';
-    return true;
-  };
-
-  if (!WriteTo(Path) && Path != "/tmp/amdgpu-its-zext-fail.txt")
-    WriteTo("/tmp/amdgpu-its-zext-fail.txt");
+  OS << "ITS-I16-OFFSET-END\n";
 }
 
 static void
@@ -4539,11 +4501,11 @@ recordConvFootprintGuard(Value *V, UniformityInfo &UI, ScalarEvolution &SE,
               BO->getOpcode() == Instruction::Or) {
             Value *LHS = BO->getOperand(0);
             Value *RHS = BO->getOperand(1);
-            // Quiet file dump for pad+zext failures (conv11 %74/%58).
+            // One bounded stderr dump for the first failing i16 offset.
             if (isa<CastInst>(RHS))
-              dumpZextOffsetFailFile(RHS);
+              dumpFirstI16OffsetFail(RHS);
             else if (isa<CastInst>(LHS))
-              dumpZextOffsetFailFile(LHS);
+              dumpFirstI16OffsetFail(LHS);
             if (ConvFootprintDiag) {
               Value *PeeledR = peelIntegerCastsForOffset(RHS);
               Value *PeeledL = peelIntegerCastsForOffset(LHS);
@@ -5154,18 +5116,6 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
-  // Heartbeat when zext-dump env is set (proves device cc1 sees the env).
-  if (const char *ZEnv = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT")) {
-    if (ZEnv[0] != '\0') {
-      static bool Armed = false;
-      if (!Armed) {
-        errs() << "ITS-ZEXT-DUMP: armed env=" << ZEnv << " fn=" << F.getName()
-               << '\n';
-        Armed = true;
-      }
-    }
-  }
-
   // HIP may sandbox absolute /tmp writes during device compile. Prefer a
   // relative path; fall back to printing a short note (peel dumps go to errs).
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
