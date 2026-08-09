@@ -99,13 +99,9 @@ static cl::opt<bool> ConvFootprintDiag(
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
     cl::init(false), cl::Hidden);
 
-/// Quiet bounded dump of failing zext/trunc conv offsets (conv11 `%73`).
-/// Prefer -mllvm (reaches device cc1); env is a fallback. Default path when
-/// set to "1": /tmp/amdgpu-its-zext-fail.txt (HIP device CWD is not KernelTwin).
-static cl::opt<std::string> DumpZextOffsetFailPath(
-    "amdgpu-interior-dump-zext-fail",
-    cl::desc("Append failing zext offset peel chains to this file"),
-    cl::init(""), cl::Hidden);
+// NOTE: Do NOT add a -mllvm cl::opt for the zext dump path. HIP forwards
+// -mllvm to ld.lld and unknown options abort the device link. Use env
+// AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT instead (absolute /tmp path).
 
 constexpr unsigned VectorWidth = 4;
 
@@ -4414,18 +4410,14 @@ static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
 }
 
 /// Quiet file dump of failing zext/trunc offset chains (conv11 `%73`).
-/// Uses -amdgpu-interior-dump-zext-fail=PATH, or env
-/// AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT (PATH or "1" → /tmp/...).
+/// Env only (HIP must not get a -mllvm dump opt — ld.lld rejects it):
+///   AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT=/tmp/amdgpu-its-zext-fail.txt
+/// or `=1` for that same /tmp path.
 static void dumpZextOffsetFailFile(Value *Offset) {
-  std::string Path = DumpZextOffsetFailPath;
-  if (Path.empty()) {
-    if (const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT")) {
-      if (Env[0] != '\0')
-        Path = Env;
-    }
-  }
-  if (Path.empty())
+  const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT");
+  if (!Env || Env[0] == '\0')
     return;
+  std::string Path = Env;
   if (Path == "1")
     Path = "/tmp/amdgpu-its-zext-fail.txt";
 
@@ -5162,6 +5154,18 @@ static bool splitCanonicalInteriorTile(Function &F, UniformityInfo &UI,
 static bool findInteriorTileCandidates(Function &F, UniformityInfo &UI,
                                        LoopInfo &LI, DominatorTree &DT,
                                        ScalarEvolution &SE) {
+  // Heartbeat when zext-dump env is set (proves device cc1 sees the env).
+  if (const char *ZEnv = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT")) {
+    if (ZEnv[0] != '\0') {
+      static bool Armed = false;
+      if (!Armed) {
+        errs() << "ITS-ZEXT-DUMP: armed env=" << ZEnv << " fn=" << F.getName()
+               << '\n';
+        Armed = true;
+      }
+    }
+  }
+
   // HIP may sandbox absolute /tmp writes during device compile. Prefer a
   // relative path; fall back to printing a short note (peel dumps go to errs).
   if (const char *DumpPath = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_IR")) {
