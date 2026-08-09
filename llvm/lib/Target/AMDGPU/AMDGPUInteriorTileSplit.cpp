@@ -4413,7 +4413,13 @@ static void dumpFirstI16OffsetFail(Value *Offset) {
   static bool Dumped = false;
   if (Dumped)
     return;
-  Value *V = peelIntegerCastsForOffset(Offset);
+  auto *Outer = dyn_cast<CastInst>(Offset);
+  if (!Outer || (Outer->getOpcode() != Instruction::ZExt &&
+                 Outer->getOpcode() != Instruction::SExt))
+    return;
+  // Stop at the immediate narrow source (`%73`), rather than peeling its
+  // trunc too and accidentally reaching the original i32 expression.
+  Value *V = Outer->getOperand(0);
   auto *Ty = dyn_cast<IntegerType>(V->getType());
   if (!Ty || Ty->getBitWidth() != 16)
     return;
