@@ -4425,7 +4425,8 @@ static void dumpFirstI16OffsetFail(Value *Offset) {
     return;
   Dumped = true;
 
-  raw_ostream &OS = errs();
+  std::string Record;
+  raw_string_ostream OS(Record);
   OS << "ITS-I16-OFFSET-FAIL\n  offset: " << *Offset
      << "\n  peeled: " << *V << '\n';
   SmallVector<Value *, 8> Queue{V};
@@ -4448,6 +4449,11 @@ static void dumpFirstI16OffsetFail(Value *Offset) {
     Queue.swap(Next);
   }
   OS << "ITS-I16-OFFSET-END\n";
+  OS.flush();
+  errs() << Record;
+  // HIP reliably forwards DEBUG_TYPE output when -debug-only is requested,
+  // unlike arbitrary errs() from its device cc1 child.
+  LLVM_DEBUG(dbgs() << Record);
 }
 
 static void
