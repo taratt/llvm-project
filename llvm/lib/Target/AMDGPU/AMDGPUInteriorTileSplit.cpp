@@ -3594,10 +3594,18 @@ static bool cloneStagingRegion(Function &F, BranchInst *Dispatch,
 
     auto *ClonedBranch =
         cast<BranchInst>(cast<BasicBlock>(VMap[BB])->getTerminator());
-    BranchInst::Create(
-        ClonedBranch->getSuccessor(static_cast<unsigned>(Outcome)),
-        ClonedBranch);
+    BasicBlock *ClonedBB = ClonedBranch->getParent();
+    unsigned TakenIndex = static_cast<unsigned>(Outcome);
+    BasicBlock *Taken = ClonedBranch->getSuccessor(TakenIndex);
+    BasicBlock *Untaken = ClonedBranch->getSuccessor(1 - TakenIndex);
+    BranchInst::Create(Taken, ClonedBranch);
     ClonedBranch->eraseFromParent();
+    // Removing the untaken CFG edge must also remove ClonedBB from every PHI
+    // in that successor. Leaving stale incoming entries creates invalid IR in
+    // real conv staging diamonds (v0..v3 merge PHIs) and later presents as a
+    // seemingly unrelated DominatorTree assertion in CodeSink.
+    if (Taken != Untaken)
+      Untaken->removePredecessor(ClonedBB);
     ++RemovedSafetyBranches;
   }
 
