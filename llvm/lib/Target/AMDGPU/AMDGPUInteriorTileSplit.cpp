@@ -4900,11 +4900,22 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   bool Changed = cloneStagingRegion(
       F, cast<BranchInst>(Dispatch->getTerminator()), StagingEntry, Region,
       SharedBarrier, FullChecks, {}, {}, nullptr, nullptr, SE);
-  if (Changed)
+  if (Changed) {
+#ifndef NDEBUG
+    if (verifyFunction(F, &dbgs()))
+      report_fatal_error(
+          "AMDGPUInteriorTileSplit: conv staging clone produced invalid IR");
+#endif
+    // SplitEdge/SplitBlock updated DT for the dispatch insertion, but
+    // cloneStagingRegion then appended blocks and redirected an edge without
+    // a DomTreeUpdater. Legacy LTO may reuse the required DT analysis in the
+    // following CodeSink pass, so leave it internally consistent.
+    DT.recalculate(F);
     LLVM_DEBUG(dbgs() << "Cloned conv footprint interior staging in "
                       << F.getName() << "; footprint dims " << FullChecks.size()
                       << "; preflight stripped-branch estimate " << BestStripped
                       << '\n');
+  }
   return Changed;
 }
 
