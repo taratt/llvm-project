@@ -99,6 +99,14 @@ static cl::opt<bool> ConvFootprintDiag(
     cl::desc("Print peel chains for unmatched conv footprint offsets to errs()"),
     cl::init(false), cl::Hidden);
 
+/// Quiet bounded dump of failing zext/trunc conv offsets (conv11 `%73`).
+/// Prefer -mllvm (reaches device cc1); env is a fallback. Default path when
+/// set to "1": /tmp/amdgpu-its-zext-fail.txt (HIP device CWD is not KernelTwin).
+static cl::opt<std::string> DumpZextOffsetFailPath(
+    "amdgpu-interior-dump-zext-fail",
+    cl::desc("Append failing zext offset peel chains to this file"),
+    cl::init(""), cl::Hidden);
+
 constexpr unsigned VectorWidth = 4;
 
 static cl::opt<bool> EnableInteriorTileVectorize(
@@ -4406,15 +4414,20 @@ static void dumpConvOffsetFail(Value *LHS, Value *RHS, Value *PeeledR,
 }
 
 /// Quiet file dump of failing zext/trunc offset chains (conv11 `%73`).
-/// Env AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT=path or `1` →
-/// `amdgpu-its-zext-fail.txt`. Bounded — safe on fanl.
+/// Uses -amdgpu-interior-dump-zext-fail=PATH, or env
+/// AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT (PATH or "1" → /tmp/...).
 static void dumpZextOffsetFailFile(Value *Offset) {
-  const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT");
-  if (!Env || Env[0] == '\0')
+  std::string Path = DumpZextOffsetFailPath;
+  if (Path.empty()) {
+    if (const char *Env = std::getenv("AMDGPU_INTERIOR_TILE_SPLIT_DUMP_ZEXT")) {
+      if (Env[0] != '\0')
+        Path = Env;
+    }
+  }
+  if (Path.empty())
     return;
-  std::string Path = Env;
   if (Path == "1")
-    Path = "amdgpu-its-zext-fail.txt";
+    Path = "/tmp/amdgpu-its-zext-fail.txt";
 
   Value *V = peelIntegerCastsForOffset(Offset);
   auto *Ty = dyn_cast<IntegerType>(V->getType());
@@ -4430,41 +4443,51 @@ static void dumpZextOffsetFailFile(Value *Offset) {
     }
   }
 
-  std::error_code EC;
-  raw_fd_ostream OS(Path, EC, sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
-  if (EC)
-    return;
-
-  static unsigned Dumps = 0;
-  if (Dumps >= 8)
-    return;
-  ++Dumps;
-
-  OS << "=== zext-offset-fail #" << Dumps << " ===\n";
-  OS << "offset: " << *Offset << '\n';
-  OS << "peeled: " << *V << '\n';
-  SmallVector<Value *, 8> Queue{V};
-  SmallPtrSet<Value *, 16> Seen;
-  unsigned Lines = 0;
-  for (unsigned Depth = 0; Depth < 4 && !Queue.empty() && Lines < 32; ++Depth) {
-    SmallVector<Value *, 8> Next;
-    for (Value *Cur : Queue) {
-      if (!Seen.insert(Cur).second)
-        continue;
-      OS << "  d" << Depth << ": " << *Cur << '\n';
-      ++Lines;
-      auto *I = dyn_cast<Instruction>(Cur);
-      if (!I)
-        continue;
-      for (Value *Op : I->operands()) {
-        if (isa<Instruction>(Op) || isa<Argument>(Op))
-          Next.push_back(Op);
-      }
+  auto WriteTo = [&](StringRef P) -> bool {
+    std::error_code EC;
+    raw_fd_ostream Out(P, EC, sys::fs::OF_TextWithCRLF | sys::fs::OF_Append);
+    if (EC) {
+      errs() << "ITS-ZEXT-DUMP: open failed path=" << P
+             << " msg=" << EC.message() << '\n';
+      return false;
     }
-    Queue.swap(Next);
-  }
-  OS << '\n';
-  OS.flush();
+    static unsigned Dumps = 0;
+    if (Dumps >= 8)
+      return true;
+    ++Dumps;
+    Out << "=== zext-offset-fail #" << Dumps << " ===\n";
+    Out << "offset: " << *Offset << '\n';
+    Out << "peeled: " << *V << '\n';
+    SmallVector<Value *, 8> Queue{V};
+    SmallPtrSet<Value *, 16> Seen;
+    unsigned Lines = 0;
+    for (unsigned Depth = 0; Depth < 4 && !Queue.empty() && Lines < 32;
+         ++Depth) {
+      SmallVector<Value *, 8> Next;
+      for (Value *Cur : Queue) {
+        if (!Seen.insert(Cur).second)
+          continue;
+        Out << "  d" << Depth << ": " << *Cur << '\n';
+        ++Lines;
+        auto *I = dyn_cast<Instruction>(Cur);
+        if (!I)
+          continue;
+        for (Value *Op : I->operands()) {
+          if (isa<Instruction>(Op) || isa<Argument>(Op))
+            Next.push_back(Op);
+        }
+      }
+      Queue.swap(Next);
+    }
+    Out << '\n';
+    Out.flush();
+    if (Dumps == 1)
+      errs() << "ITS-ZEXT-DUMP: wrote " << P << '\n';
+    return true;
+  };
+
+  if (!WriteTo(Path) && Path != "/tmp/amdgpu-its-zext-fail.txt")
+    WriteTo("/tmp/amdgpu-its-zext-fail.txt");
 }
 
 static void
