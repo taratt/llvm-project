@@ -4723,6 +4723,7 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   BasicBlock *Barrier = nullptr;
   bool SplitEntryForDispatch = false;
   SmallVector<FullTileBoundCheck, 4> FullChecks;
+  SmallPtrSet<BasicBlock *, 8> SelectedRegion;
   unsigned BestStripped = 0;
   unsigned BestScore = 0;
 
@@ -4784,6 +4785,8 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
     Barrier = CandidateBarrier;
     SplitEntryForDispatch = SplitAtTerminator;
     FullChecks = std::move(CandidateChecks);
+    SelectedRegion.clear();
+    SelectedRegion.insert_range(Candidate);
     BestStripped = Stripped;
     BestScore = Score;
   };
@@ -4817,6 +4820,7 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
   }
 
   BasicBlock *Dispatch = nullptr;
+  BasicBlock *OriginalEntry = StagingEntry;
   if (SplitEntryForDispatch) {
     Dispatch = StagingEntry;
     StagingEntry = SplitBlock(Dispatch, Dispatch->getTerminator(), &DT, &LI,
@@ -4830,12 +4834,20 @@ static bool splitInteriorConvFootprint(Function &F, UniformityInfo &UI,
 
   auto *DispatchBranch = cast<BranchInst>(Dispatch->getTerminator());
   SmallPtrSet<BasicBlock *, 8> Region;
-  BasicBlock *SharedBarrier = nullptr;
-  // Loop-header staging keeps the latch→header backedge, so the entry may have
-  // non-dispatch predecessors that lie inside the region.
-  const bool RegionOk = findClosedStagingRegion(
-      StagingEntry, Dispatch, Region, SharedBarrier, /*AllowNestedLoops=*/true,
-      nullptr, /*AllowEntryExternalPredecessors=*/true);
+  Region.insert_range(SelectedRegion);
+  if (SplitEntryForDispatch) {
+    // SplitBlock leaves setup instructions in the shared dispatch and moves
+    // the old terminator to the new staging entry. The preflight region
+    // therefore changes only by replacing the original entry with that block.
+    Region.erase(OriginalEntry);
+    Region.insert(StagingEntry);
+  }
+  BasicBlock *SharedBarrier = Barrier;
+  // The selected region already passed the complete closure/reachability
+  // proof. SplitEdge only replaces its external preheader edge; SplitBlock
+  // performs the entry substitution above. Re-running graph discovery here
+  // incorrectly walks through the new dispatch shape on real HIP loop headers.
+  const bool RegionOk = !Region.empty();
   const bool BarrierOk = RegionOk && SharedBarrier == Barrier;
   const bool ExitsOk =
       BarrierOk &&
